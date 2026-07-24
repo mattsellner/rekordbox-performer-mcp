@@ -1,0 +1,51 @@
+rekordbox_target,action,deck,midi_channel,message,number,server_value
+PLAY/PAUSE,play_pause,1,1,note,0,trigger
+CUE,cue,1,1,note,1,trigger
+BEAT SYNC,sync,1,1,note,2,trigger
+MASTER,master,1,1,note,3,trigger
+LOAD,load,1,1,note,4,trigger
+LOOP ACTIVE,loop_toggle,1,1,note,5,trigger
+LOOP HALF,loop_half,1,1,note,6,trigger
+LOOP DOUBLE,loop_double,1,1,note,7,trigger
+4 BEAT LOOP,loop_4,1,1,note,8,trigger
+8 BEAT LOOP,loop_8,1,1,note,9,trigger
+16 BEAT LOOP,loop_16,1,1,note,10,trigger
+HOT CUE A..H,hot_cue,1,1,note,16..23,cue 1..8
+CHANNEL FADER,channel_fader,1,1,cc,0,0..1
+TRIM/gain,gain,1,1,cc,1,-1..1
+HIGH EQ,eq_high,1,1,cc,2,-1..1
+MID EQ,eq_mid,1,1,cc,3,-1..1
+LOW EQ,eq_low,1,1,cc,4,-1..1
+FILTER,filter,1,1,cc,5,-1..1
+TEMPO,tempo,1,1,cc,6,-1..1
+FX ON,fx_toggle,1,1,note,32,trigger
+FX WET/DRY,fx_wet_dry,1,1,cc,32,0..1
+PLAY/PAUSE,play_pause,2,2,note,0,trigger
+CUE,cue,2,2,note,1,trigger
+BEAT SYNC,sync,2,2,note,2,trigger
+MASTER,master,2,2,note,3,trigger
+LOAD,load,2,2,note,4,trigger
+LOOP ACTIVE,loop_toggle,2,2,note,5,trigger
+LOOP HALF,loop_half,2,2,note,6,trigger
+LOOP DOUBLE,loop_double,2,2,note,7,trigger
+4 BEAT LOOP,loop_4,2,2,note,8,trigger
+8 BEAT LOOP,loop_8,2,2,note,9,trigger
+16 BEAT LOOP,loop_16,2,2,note,10,trigger
+HOT CUE A..H,hot_cue,2,2,note,16..23,cue 1..8
+CHANNEL FADER,channel_fader,2,2,cc,0,0..1
+TRIM/gain,gain,2,2,cc,1,-1..1
+HIGH EQ,eq_high,2,2,cc,2,-1..1
+MID EQ,eq_mid,2,2,cc,3,-1..1
+LOW EQ,eq_low,2,2,cc,4,-1..1
+FILTER,filter,2,2,cc,5,-1..1
+TEMPO,tempo,2,2,cc,6,-1..1
+FX ON,fx_toggle,2,2,note,32,trigger
+FX WET/DRY,fx_wet_dry,2,2,cc,32,0..1
+BROWSE UP,browse_up,,3,note,0,trigger
+BROWSE DOWN,browse_down,,3,note,1,trigger
+LOAD DECK 1,load_deck_1,,3,note,2,trigger
+LOAD DECK 2,load_deck_2,,3,note,3,trigger
+BROWSER BACK,browser_back,,3,note,4,trigger
+BROWSER FORWARD,browser_forward,,3,note,5,trigger
+CROSSFADER,crossfader,,4,cc,0,-1..1
+

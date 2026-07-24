@@ -1,0 +1,36 @@
+@file,1,Codex Rekordbox Performer,,,,,,,,,,,,
+#name,function,type,input,deck1,deck2,deck3,deck4,output,deck1,deck2,deck3,deck4,option,comment
+BrowseUp,BrowseUp,Button,9200,,,,,,,,,,,Browse one item up
+BrowseDown,BrowseDown,Button,9201,,,,,,,,,,,Browse one item down
+Forward,Forward,Button,9205,,,,,,,,,,,Open selected folder
+Back,Back,Button,9204,,,,,,,,,,,Close current folder
+Load,Load,Button,,9202,9203,,,,,,,,,Load selected track to Deck 1 or Deck 2
+PlayPause,PlayPause,Button,9000,0,1,,,,,,,,Fast;Priority=50,Play or pause
+Cue,Cue,Button,9001,0,1,,,,,,,,Fast;Priority=50,Cue
+Sync,Sync,Button,9002,0,1,,,,,,,,Blink=600,Beat sync
+Master,Master,Button,9003,0,1,,,,,,,,,Master deck
+AutoLoop,AutoLoop,Button,9005,0,1,,,,,,,,,Toggle auto loop
+LoopHalf,LoopHalf,Button,9006,0,1,,,,,,,,Fast,Halve loop length
+LoopDouble,LoopDouble,Button,9007,0,1,,,,,,,,Fast,Double loop length
+AutoLoop,4BeatLoop,Button,9008,0,1,,,,,,,,,Set or toggle 4-beat loop
+ChannelFader,ChannelFader,KnobSlider,B000,0,1,,,,,,,,,Channel fader
+Gain,Gain,KnobSlider,B001,0,1,,,,,,,,Fast,Channel gain
+EQHigh,EQHigh,KnobSlider,B002,0,1,,,,,,,,Fast,High EQ
+EQMid,EQMid,KnobSlider,B003,0,1,,,,,,,,Fast,Mid EQ
+EQLow,EQLow,KnobSlider,B004,0,1,,,,,,,,Fast,Low EQ
+TempoSlider,TempoSlider,KnobSlider,B006,0,1,,,,,,,,Fast,Tempo control
+CFXParameterCH1,CFXParameterCH1,KnobSlider,B005,,,,,,,,,,Fast,Deck 1 filter
+CFXParameterCH2,CFXParameterCH2,KnobSlider,B105,,,,,,,,,,Fast,Deck 2 filter
+CrossFader,CrossFader,KnobSlider,B300,,,,,,,,,,Fast,Crossfader
+FX1-1On,FX1-1On,Button,9020,,,,,,,,,,,Deck 1 FX on or off
+FX2-1On,FX2-1On,Button,9120,,,,,,,,,,,Deck 2 FX on or off
+FX1-1,FX1-1,KnobSlider,B020,,,,,,,,,,Fast,Deck 1 FX wet dry
+FX2-1,FX2-1,KnobSlider,B120,,,,,,,,,,Fast,Deck 2 FX wet dry
+PAD1_HotCue,PAD1_HotCue,Pad,9010,0,1,,,,,,,,Fast,Hot Cue 1
+PAD2_HotCue,PAD2_HotCue,Pad,9011,0,1,,,,,,,,Fast,Hot Cue 2
+PAD3_HotCue,PAD3_HotCue,Pad,9012,0,1,,,,,,,,Fast,Hot Cue 3
+PAD4_HotCue,PAD4_HotCue,Pad,9013,0,1,,,,,,,,Fast,Hot Cue 4
+PAD5_HotCue,PAD5_HotCue,Pad,9014,0,1,,,,,,,,Fast,Hot Cue 5
+PAD6_HotCue,PAD6_HotCue,Pad,9015,0,1,,,,,,,,Fast,Hot Cue 6
+PAD7_HotCue,PAD7_HotCue,Pad,9016,0,1,,,,,,,,Fast,Hot Cue 7
+PAD8_HotCue,PAD8_HotCue,Pad,9017,0,1,,,,,,,,Fast,Hot Cue 8
