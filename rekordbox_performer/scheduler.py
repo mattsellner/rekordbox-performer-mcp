@@ -27,9 +27,15 @@ class TransitionJob:
     finished_at: float | None = None
     completed_events: int = 0
     error: str | None = None
+    event_lateness_ms: list[float] = field(default_factory=list, repr=False)
     task: asyncio.Task | None = field(default=None, repr=False)
 
     def public(self) -> dict[str, Any]:
+        average_lateness = (
+            sum(self.event_lateness_ms) / len(self.event_lateness_ms)
+            if self.event_lateness_ms
+            else 0.0
+        )
         return {
             "id": self.id,
             "name": self.name,
@@ -39,6 +45,11 @@ class TransitionJob:
             "finished_at": self.finished_at,
             "event_count": len(self.events),
             "completed_events": self.completed_events,
+            "average_event_lateness_ms": round(average_lateness, 2),
+            "max_event_lateness_ms": round(
+                max(self.event_lateness_ms, default=0.0),
+                2,
+            ),
             "error": self.error,
         }
 
@@ -107,17 +118,36 @@ class TransitionScheduler:
         job.started_at = time.time()
         started = time.monotonic()
         try:
-            for event in job.events:
-                target = started + event["at_ms"] / 1000
+            index = 0
+            while index < len(job.events):
+                at_ms = job.events[index]["at_ms"]
+                group = []
+                while (
+                    index < len(job.events)
+                    and job.events[index]["at_ms"] == at_ms
+                ):
+                    group.append(job.events[index])
+                    index += 1
+                target = started + at_ms / 1000
                 delay = target - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)
                 if not self.engine.is_armed():
                     raise RuntimeError("Live MIDI control became disarmed")
-                await self.engine.send_action(
-                    event["action"], event["parameters"]
-                )
-                job.completed_events += 1
+
+                async def dispatch(event: dict[str, Any]) -> None:
+                    job.event_lateness_ms.append(
+                        max(0.0, (time.monotonic() - target) * 1000)
+                    )
+                    await self.engine.send_action(
+                        event["action"], event["parameters"]
+                    )
+                    job.completed_events += 1
+
+                # Events sharing a musical timestamp must reach MIDI together.
+                # Serial button holds otherwise skew simultaneous Hot Cues and
+                # two-deck bass swaps by the note-hold duration.
+                await asyncio.gather(*(dispatch(event) for event in group))
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -148,4 +178,3 @@ class TransitionScheduler:
                 job.task.cancel()
                 cancelled.append(job.public())
         return cancelled
-

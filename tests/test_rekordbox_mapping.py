@@ -22,7 +22,12 @@ def test_mapping_has_rekordbox_shape() -> None:
     assert all(len(row) == 15 for row in rows)
 
     functions = {row[1] for row in rows[2:]}
+    names = {row[0] for row in rows[2:]}
     assert {
         "PlayPause", "Cue", "Sync", "ChannelFader", "Gain",
         "EQHigh", "EQMid", "EQLow", "TempoSlider", "CrossFader",
+        "Quantize",
     } <= functions
+    assert {
+        "MixPointSelectPrev", "MixPointSelectNext", "MixPointLink",
+    } <= names

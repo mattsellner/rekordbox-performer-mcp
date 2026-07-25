@@ -30,7 +30,11 @@ DECK_NOTES = {
     "loop_4": 8,
     "loop_8": 9,
     "loop_16": 10,
+    "quantize": 11,
     "fx_toggle": 32,
+    "mix_point_previous": 96,
+    "mix_point_next": 97,
+    "mix_point_set": 98,
 }
 
 DECK_CONTROLS = {
