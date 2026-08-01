@@ -61,9 +61,9 @@ def test_flx4_load_buttons_are_global_and_deck_specific() -> None:
 
 
 def test_full_fx_actions_have_stable_controls() -> None:
-    echo = encode_action("fx_select_echo", {"deck": 1})[0].message
-    reverb = encode_action("fx_select_reverb", {"deck": 2})[0].message
-    beat = encode_action("fx_beat", {"deck": 1, "value": 7})[0].message
-    assert (echo.channel, echo.note) == (0, 33)
-    assert (reverb.channel, reverb.note) == (1, 34)
-    assert (beat.control, beat.value) == (33, 127)
+    select_next = encode_action("fx_select_next", {"deck": 1})[0].message
+    select_back = encode_action("fx_select_back", {"deck": 2})[0].message
+    beat_up = encode_action("fx_beat_up", {"deck": 1})[0].message
+    assert (select_next.channel, select_next.note) == (0, 40)
+    assert (select_back.channel, select_back.note) == (1, 41)
+    assert (beat_up.channel, beat_up.note) == (0, 42)

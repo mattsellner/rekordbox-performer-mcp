@@ -232,8 +232,10 @@ handoffs:
 3. Use `plan_vocal_handoff` or the vocal-aware candidate ranker to choose a
    vocal owner without treating overlap as a hard failure.
 4. Call `recommend_transition_fx` for Echo, Reverb, Spiral, or Vinyl Brake
-   events. Every recipe includes effect selection, beat length, wet/dry, and a
-   mandatory off/reset tail. Map the added controls from
+   recommendations. Every recipe includes wet/dry and a mandatory off/reset
+   tail. Rekordbox exposes Select Next/Back and Beat Up/Down through MIDI Learn,
+   not fixed-effect selectors, so observe the current effect before cycling to
+   the recommendation. Map those controls from
    `mapping/rekordbox-midi-learn.csv` before using them live.
 5. Stage and schedule with `stage_and_schedule_transition_card`. The scheduler
    now reserves the existing user authorization for the complete job, so a

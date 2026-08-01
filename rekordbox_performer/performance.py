@@ -165,21 +165,24 @@ def sync_report(
 
 def fx_recipe(card: TransitionCard) -> dict[str, Any]:
     recipes = {
-        "echo_exit": ("fx_select_echo", 0.5, 1),
-        "breakdown_handoff": ("fx_select_reverb", 0.4, 2),
-        "loop_bridge": ("fx_select_spiral", 0.35, 1),
-        "phrase_cut": ("fx_select_vinyl_brake", 0.65, 1),
-        "bass_swap": ("fx_select_echo", 0.3, 1),
-        "long_blend": ("fx_select_reverb", 0.25, 2),
-        "double_drop": ("fx_select_echo", 0.2, 1),
+        "echo_exit": ("echo", 0.5),
+        "breakdown_handoff": ("reverb", 0.4),
+        "loop_bridge": ("spiral", 0.35),
+        "phrase_cut": ("vinyl_brake", 0.65),
+        "bass_swap": ("echo", 0.3),
+        "long_blend": ("reverb", 0.25),
+        "double_drop": ("echo", 0.2),
     }
-    selector, wet, beat_value = recipes[card.transition_family]
+    effect, wet = recipes[card.transition_family]
     return {
         "deck": card.outgoing_deck,
-        "effect": selector.removeprefix("fx_select_"),
+        "effect": effect,
+        "selection": {
+            "actions": ["fx_select_next", "fx_select_back"],
+            "requires_observed_current_effect": True,
+            "note": "Cycle from the observed current FX; Rekordbox MIDI Learn has no fixed-effect selector.",
+        },
         "events": [
-            {"bar_offset": max(0, card.critical_bar_offset - 1), "beat_offset": 0, "action": selector, "parameters": {"deck": card.outgoing_deck}},
-            {"bar_offset": max(0, card.critical_bar_offset - 1), "beat_offset": 0, "action": "fx_beat", "parameters": {"deck": card.outgoing_deck, "value": beat_value}},
             {"bar_offset": max(0, card.critical_bar_offset - 1), "beat_offset": 0, "action": "fx_wet_dry", "parameters": {"deck": card.outgoing_deck, "value": wet}},
             {"bar_offset": max(0, card.critical_bar_offset - 1), "beat_offset": 0, "action": "fx_toggle", "parameters": {"deck": card.outgoing_deck}},
             {"bar_offset": card.critical_bar_offset + 1, "beat_offset": 0, "action": "fx_wet_dry", "parameters": {"deck": card.outgoing_deck, "value": 0}},

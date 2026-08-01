@@ -15,8 +15,16 @@ EQLow,EQLow,KnobSlider,,B004,B104,,,,,,,,Fast;,Low EQ
 EQMid,EQMid,KnobSlider,,B003,B103,,,,,,,,Fast;,Mid EQ
 FX1-1,FX1-1,KnobSlider,B020,,,,,,,,,,Fast;,Deck 1 FX wet dry
 FX1-1On,FX1-1On,Button,9020,,,,,,,,,,,Deck 1 FX on or off
+FX1-1BeatDown,,Button,902B,,,,,902B,,,,,,Deck 1 FX beat down
+FX1-1BeatUp,,Button,902A,,,,,902A,,,,,,Deck 1 FX beat up
+FX1-1Select,,Button,9028,,,,,9028,,,,,,Deck 1 FX select next
+FX1-1SelectBack,,Button,9029,,,,,9029,,,,,,Deck 1 FX select back
 FX2-1,FX2-1,KnobSlider,B120,,,,,,,,,,Fast;,Deck 2 FX wet dry
 FX2-1On,FX2-1On,Button,9120,,,,,,,,,,,Deck 2 FX on or off
+FX2-1BeatDown,,Button,912B,,,,,912B,,,,,,Deck 2 FX beat down
+FX2-1BeatUp,,Button,912A,,,,,912A,,,,,,Deck 2 FX beat up
+FX2-1Select,,Button,9128,,,,,9128,,,,,,Deck 2 FX select next
+FX2-1SelectBack,,Button,9129,,,,,9129,,,,,,Deck 2 FX select back
 Forward,Forward,Button,9205,,,,,,,,,,,Open selected folder
 Gain,Gain,KnobSlider,,B001,B101,,,,,,,,Fast;,Channel gain
 Load,Load,Button,,9202,9203,,,,,,,,,Load selected track to Deck 1 or Deck 2

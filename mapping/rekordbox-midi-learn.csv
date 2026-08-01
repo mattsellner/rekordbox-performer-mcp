@@ -19,12 +19,11 @@ LOW EQ,eq_low,1,1,cc,4,-1..1
 FILTER,filter,1,1,cc,5,-1..1
 TEMPO,tempo,1,1,cc,6,-1..1
 FX ON,fx_toggle,1,1,note,32,trigger
-FX SELECT ECHO,fx_select_echo,1,1,note,33,trigger
-FX SELECT REVERB,fx_select_reverb,1,1,note,34,trigger
-FX SELECT SPIRAL,fx_select_spiral,1,1,note,35,trigger
-FX SELECT VINYL BRAKE,fx_select_vinyl_brake,1,1,note,36,trigger
+FX SELECT NEXT,fx_select_next,1,1,note,40,trigger
+FX SELECT BACK,fx_select_back,1,1,note,41,trigger
+FX BEAT UP,fx_beat_up,1,1,note,42,trigger
+FX BEAT DOWN,fx_beat_down,1,1,note,43,trigger
 FX WET/DRY,fx_wet_dry,1,1,cc,32,0..1
-FX BEAT,fx_beat,1,1,cc,33,0..7
 PLAY/PAUSE,play_pause,2,2,note,0,trigger
 CUE,cue,2,2,note,1,trigger
 BEAT SYNC,sync,2,2,note,2,trigger
@@ -45,12 +44,11 @@ LOW EQ,eq_low,2,2,cc,4,-1..1
 FILTER,filter,2,2,cc,5,-1..1
 TEMPO,tempo,2,2,cc,6,-1..1
 FX ON,fx_toggle,2,2,note,32,trigger
-FX SELECT ECHO,fx_select_echo,2,2,note,33,trigger
-FX SELECT REVERB,fx_select_reverb,2,2,note,34,trigger
-FX SELECT SPIRAL,fx_select_spiral,2,2,note,35,trigger
-FX SELECT VINYL BRAKE,fx_select_vinyl_brake,2,2,note,36,trigger
+FX SELECT NEXT,fx_select_next,2,2,note,40,trigger
+FX SELECT BACK,fx_select_back,2,2,note,41,trigger
+FX BEAT UP,fx_beat_up,2,2,note,42,trigger
+FX BEAT DOWN,fx_beat_down,2,2,note,43,trigger
 FX WET/DRY,fx_wet_dry,2,2,cc,32,0..1
-FX BEAT,fx_beat,2,2,cc,33,0..7
 BROWSE UP,browse_up,,3,note,0,trigger
 BROWSE DOWN,browse_down,,3,note,1,trigger
 LOAD DECK 1,load_deck_1,,3,note,2,trigger

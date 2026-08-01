@@ -100,7 +100,8 @@ def test_sync_report_flags_phase_or_mode() -> None:
 
 def test_fx_recipe_has_explicit_reset() -> None:
     events = fx_recipe(card())["events"]
-    assert events[0]["action"] == "fx_select_echo"
+    assert fx_recipe(card())["effect"] == "echo"
+    assert fx_recipe(card())["selection"]["requires_observed_current_effect"] is True
     assert any(event["action"] == "fx_wet_dry" and event["parameters"]["value"] == 0 for event in events)
     assert sum(event["action"] == "fx_toggle" for event in events) == 2
 

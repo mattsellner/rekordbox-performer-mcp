@@ -32,10 +32,10 @@ DECK_NOTES = {
     "loop_16": 10,
     "quantize": 11,
     "fx_toggle": 32,
-    "fx_select_echo": 33,
-    "fx_select_reverb": 34,
-    "fx_select_spiral": 35,
-    "fx_select_vinyl_brake": 36,
+    "fx_select_next": 40,
+    "fx_select_back": 41,
+    "fx_beat_up": 42,
+    "fx_beat_down": 43,
     "mix_point_previous": 96,
     "mix_point_next": 97,
     "mix_point_set": 98,
@@ -50,7 +50,6 @@ DECK_CONTROLS = {
     "filter": (5, "bipolar"),
     "tempo": (6, "bipolar"),
     "fx_wet_dry": (32, "unit"),
-    "fx_beat": (33, "fx_beat"),
 }
 
 GLOBAL_NOTES = {
@@ -88,11 +87,6 @@ def _scale_value(mode: str, raw: Any) -> int:
         if not -1.0 <= value <= 1.0:
             raise ProtocolError("value must be between -1.0 and 1.0")
         return round((value + 1.0) * 63.5)
-    if mode == "fx_beat":
-        value = int(raw)
-        if not 0 <= value <= 7:
-            raise ProtocolError("FX beat value must be between 0 and 7")
-        return round(value * 127 / 7)
     raise ProtocolError(f"unknown value mode: {mode}")
 
 
@@ -206,9 +200,7 @@ def mapping_manifest() -> list[dict[str, Any]]:
                     "midi_channel": deck,
                     "message": "control_change",
                     "number": control,
-                    "value_range": (
-                        "0..1" if mode == "unit" else "0..7" if mode == "fx_beat" else "-1..1"
-                    ),
+                    "value_range": "0..1" if mode == "unit" else "-1..1",
                 }
             )
     for action, note in GLOBAL_NOTES.items():
