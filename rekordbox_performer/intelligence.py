@@ -1121,6 +1121,23 @@ def validate_transition_card(
         and outgoing_stop < outgoing_fader_zero
     ):
         errors.append("outgoing deck is stopped before it is silent")
+    outgoing_fx_on = [
+        index for index, event in enumerate(card.events)
+        if event.action == "fx_toggle"
+        and event.parameters.get("deck") == card.outgoing_deck
+    ]
+    if outgoing_fx_on:
+        final_toggle = outgoing_fx_on[-1]
+        wet_reset = any(
+            event.action == "fx_wet_dry"
+            and event.parameters.get("deck") == card.outgoing_deck
+            and float(event.parameters.get("value", 1)) == 0.0
+            for event in card.events[final_toggle - 1:]
+        )
+        if len(outgoing_fx_on) % 2 or not wet_reset:
+            errors.append(
+                "outgoing FX plan must toggle off and reset wet/dry to zero"
+            )
     return errors
 
 

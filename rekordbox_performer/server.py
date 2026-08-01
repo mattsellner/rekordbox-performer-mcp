@@ -27,6 +27,15 @@ from .intelligence import (
     compile_transition_card,
 )
 from .observer import SharedDeckObserver
+from .performance import (
+    SetSessionManager,
+    cue_preparation_plan,
+    fx_recipe,
+    observation_from_elapsed,
+    sync_report,
+    transition_qa,
+    vocal_handoff,
+)
 from .protocol import (
     ALL_ACTIONS,
     CONTINUOUS_ACTIONS,
@@ -59,6 +68,7 @@ profile_store = ProfileStore()
 rehearsal_capture = RehearsalCapture(profile_store.data_dir / "recordings")
 rekordbox_ui = RekordboxUIAdapter()
 deck_observer = SharedDeckObserver(rekordbox_ui, profile_store.data_dir)
+set_sessions = SetSessionManager(profile_store.data_dir / "active-set.json")
 verified_hot_cues: dict[tuple[int, str, int], dict[str, Any]] = {}
 VERIFIED_CUE_TTL_SECONDS = 15 * 60
 
@@ -231,6 +241,27 @@ def _card_completion_verifier(
             time.sleep(1.1)
             second = rekordbox_ui.status()
         result = _verify_transition_postconditions(card, first, second)
+        if result["verified"]:
+            try:
+                outgoing_clock = live_state.get(card.outgoing_deck)
+                incoming_record = result["incoming"]["second"]
+                incoming_profile = profile_store.get(card.incoming_track_id)
+                elapsed = incoming_record.get("elapsed_seconds")
+                if elapsed is not None:
+                    incoming_clock = observation_from_elapsed(
+                        deck=card.incoming_deck,
+                        profile=incoming_profile,
+                        elapsed_seconds=elapsed,
+                        playing=True,
+                        sync_enabled=incoming_record.get("beat_sync_enabled"),
+                        quantize_enabled=incoming_record.get("quantize_enabled"),
+                    ).model_dump()
+                    result["sync"] = sync_report(outgoing_clock, incoming_clock)
+            except (KeyError, ValueError) as exc:
+                result["sync"] = {
+                    "verified": False,
+                    "errors": [f"sync telemetry unavailable: {exc}"],
+                }
         launched_monotonic = (launch_clock or {}).get("incoming_monotonic")
         if result["verified"] and launched_monotonic is not None:
             profile = profile_store.get(card.incoming_track_id)
@@ -335,12 +366,13 @@ def rank_transition_candidates(
     candidates: list[TransitionCandidate],
     max_bpm_delta: float = 4.0,
     allow_incompatible: bool = False,
+    outgoing_track_id: str | None = None,
+    outgoing_start_bar: int = 1,
+    incoming_start_bar: int = 1,
+    overlap_bars: int = 16,
 ) -> dict[str, Any]:
     """
-    Rank candidates by Camelot compatibility and tempo proximity.
-
-    Vocal density is intentionally not considered. Incompatible harmonic moves
-    are excluded by default and require an explicit override.
+    Rank by Camelot, tempo, and an optional soft vocal-overlap penalty.
     """
     if outgoing_bpm <= 0:
         raise ValueError("outgoing_bpm must be positive")
@@ -363,6 +395,19 @@ def rank_transition_candidates(
             "bpm_delta": round(bpm_delta, 3),
             "harmonic": harmonic,
         }
+        vocal = None
+        if outgoing_track_id is not None:
+            try:
+                vocal = vocal_handoff(
+                    profile_store.get(outgoing_track_id),
+                    profile_store.get(candidate.track_id),
+                    outgoing_start_bar=outgoing_start_bar,
+                    incoming_start_bar=incoming_start_bar,
+                    overlap_bars=overlap_bars,
+                )
+            except KeyError:
+                vocal = {"available": False, "soft_penalty": 0, "blocking": False}
+            record["vocal"] = vocal
         reasons = []
         if bpm_delta > max_bpm_delta:
             reasons.append(
@@ -380,7 +425,8 @@ def rank_transition_candidates(
             continue
         record["score"] = round(
             relationship_score[harmonic["relationship"]] * 10
-            + max(0.0, max_bpm_delta - bpm_delta),
+            + max(0.0, max_bpm_delta - bpm_delta)
+            - float((vocal or {}).get("soft_penalty", 0)),
             3,
         )
         ranked.append(record)
@@ -390,7 +436,9 @@ def rank_transition_candidates(
         "outgoing_key": outgoing_key,
         "ranked": ranked,
         "excluded": excluded,
-        "vocal_clash_scoring": "disabled",
+        "vocal_clash_scoring": (
+            "soft_penalty" if outgoing_track_id is not None else "not_requested"
+        ),
     }
 
 
@@ -456,6 +504,79 @@ def get_track_profile(track_id: str) -> dict[str, Any]:
 def audit_track_profiles(track_ids: list[str] | None = None) -> dict[str, Any]:
     """Audit whether tracks have enough verified structure for live automation."""
     return profile_store.audit(track_ids)
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def plan_vocal_handoff(
+    outgoing_track_id: str,
+    incoming_track_id: str,
+    outgoing_start_bar: int,
+    incoming_start_bar: int,
+    overlap_bars: int = 16,
+) -> dict[str, Any]:
+    """Use Rekordbox vocal analysis as a soft transition-planning signal."""
+    if overlap_bars < 1 or overlap_bars > 64:
+        raise ValueError("overlap_bars must be between 1 and 64")
+    return vocal_handoff(
+        profile_store.get(outgoing_track_id),
+        profile_store.get(incoming_track_id),
+        outgoing_start_bar=outgoing_start_bar,
+        incoming_start_bar=incoming_start_bar,
+        overlap_bars=overlap_bars,
+    )
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def prepare_track_cues(track_id: str) -> dict[str, Any]:
+    """Plan an 8/16-bar pre-drop cue workflow for later Rekordbox verification."""
+    return cue_preparation_plan(profile_store.get(track_id))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def recommend_transition_fx(card: TransitionCard) -> dict[str, Any]:
+    """Recommend mapped outgoing-deck FX plus an explicit cleanup tail."""
+    return fx_recipe(card)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def prepare_set_session(name: str, track_ids: list[str]) -> dict[str, Any]:
+    """Persist a rolling current/next/following queue across MCP restarts."""
+    audit = profile_store.audit(track_ids)
+    session = set_sessions.create(name, track_ids)
+    return {"session": session, "track_audit": audit}
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def start_set_session() -> dict[str, Any]:
+    """Mark the prepared rolling set active."""
+    return set_sessions.start()
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def set_session_status() -> dict[str, Any]:
+    """Return the persistent three-track execution horizon."""
+    return set_sessions.status()
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def settle_set_transition(job_id: str) -> dict[str, Any]:
+    """Advance the rolling queue only after a transition job passes QA."""
+    job = scheduler.get(job_id)
+    qa = transition_qa(job)
+    if job["status"] not in {"completed", "failed", "cancelled"}:
+        raise RuntimeError("Transition job is not finished")
+    session = set_sessions.advance(
+        job_id,
+        qa["passed"],
+        "; ".join(qa["faults"]) or job.get("error"),
+    )
+    return {"session": session, "qa": qa}
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def transition_quality_report(job_id: str) -> dict[str, Any]:
+    """Grade timing, phase, postconditions, and dispatch health for one job."""
+    return transition_qa(scheduler.get(job_id))
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -1028,37 +1149,30 @@ async def refresh_transition_state(
         hot_cue=incoming_hot_cue,
     )
 
-    current = live_state.get(outgoing_deck)
-    outgoing_observation = DeckObservation(
+    outgoing_elapsed = outgoing_second.get("elapsed_seconds")
+    if outgoing_elapsed is None:
+        raise RuntimeError("Outgoing deck elapsed time is unavailable")
+    outgoing_observation = observation_from_elapsed(
         deck=outgoing_deck,
-        track_id=outgoing_track_id,
-        title=outgoing_title,
-        bpm=current["bpm"],
+        profile=profile_store.get(outgoing_track_id),
+        elapsed_seconds=outgoing_elapsed,
         playing=True,
-        bar=current["bar"],
-        beat=current["beat"],
-        track_beat=current["track_beat"],
-        beat_phase=current["beat_phase"],
         sync_enabled=outgoing_second.get("beat_sync_enabled"),
         quantize_enabled=outgoing_second.get("quantize_enabled"),
-        source="native",
-        confidence="high",
+        title=outgoing_title,
     )
     incoming_profile = profile_store.get(incoming_track_id)
-    incoming_observation = DeckObservation(
+    incoming_elapsed = incoming_second.get("elapsed_seconds")
+    if incoming_elapsed is None:
+        raise RuntimeError("Incoming deck elapsed time is unavailable")
+    incoming_observation = observation_from_elapsed(
         deck=incoming_deck,
-        track_id=incoming_track_id,
-        title=incoming_title,
-        bpm=incoming_profile.bpm,
+        profile=incoming_profile,
+        elapsed_seconds=incoming_elapsed,
         playing=False,
-        bar=1,
-        beat=1,
-        track_beat=1,
-        beat_phase=0,
         sync_enabled=incoming_second.get("beat_sync_enabled"),
         quantize_enabled=incoming_second.get("quantize_enabled"),
-        source="native",
-        confidence="high",
+        title=incoming_title,
     )
     return {
         "outgoing": live_state.update(outgoing_observation),

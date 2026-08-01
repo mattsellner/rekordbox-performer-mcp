@@ -50,6 +50,7 @@ class TransitionJob:
     )
     verification: dict[str, Any] | None = None
     execution_id: str | None = None
+    control_reserved_until: float | None = None
 
     def public(self) -> dict[str, Any]:
         average_lateness = (
@@ -84,6 +85,7 @@ class TransitionJob:
                 value > 10.0 for value in self.event_lateness_ms
             ),
             "verification": self.verification,
+            "control_reserved_until_monotonic": self.control_reserved_until,
             "error": self.error,
         }
 
@@ -164,6 +166,9 @@ class TransitionScheduler:
             completion_verifier=completion_verifier,
             event_observer=event_observer,
             execution_id=execution_id,
+        )
+        job.control_reserved_until = self.engine.reserve_job_control(
+            normalized[-1]["at_ms"] / 1000.0
         )
         self.jobs[job.id] = job
         if execution_id is not None:

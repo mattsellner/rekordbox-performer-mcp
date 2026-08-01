@@ -214,9 +214,40 @@ convenient phrase boundary is not sufficient.
 
 `rank_transition_candidates` normalizes Camelot and conventional key labels,
 filters incompatible moves by default, and ranks the remainder by harmonic
-relationship and BPM proximity. Vocal-clash scoring is deliberately disabled;
-cards can use the existing explicit vocal-risk waiver while phrase, bass,
-transport, and harmonic checks remain enforced.
+relationship and BPM proximity. Pass `outgoing_track_id` to add Rekordbox vocal
+analysis as a soft score penalty. Vocal overlap never excludes a candidate or
+blocks a card; phrase, bass, transport, and harmonic checks remain enforced.
+
+## Continuous-set performance workflow
+
+The reliability upgrade adds a restart-safe three-track horizon and measured
+handoffs:
+
+1. Call `prepare_set_session` with the ordered track IDs, then
+   `start_set_session`. `set_session_status` always exposes current, next, and
+   following tracks, even after the MCP process restarts.
+2. Use `prepare_track_cues` offline to find a phrase-safe cue 16 bars (or 8 bars
+   when necessary) before each verified drop. This produces a plan only; set
+   the cue in Rekordbox and prove it with `verify_hot_cue`.
+3. Use `plan_vocal_handoff` or the vocal-aware candidate ranker to choose a
+   vocal owner without treating overlap as a hard failure.
+4. Call `recommend_transition_fx` for Echo, Reverb, Spiral, or Vinyl Brake
+   events. Every recipe includes effect selection, beat length, wet/dry, and a
+   mandatory off/reset tail. Map the added controls from
+   `mapping/rekordbox-midi-learn.csv` before using them live.
+5. Stage and schedule with `stage_and_schedule_transition_card`. The scheduler
+   now reserves the existing user authorization for the complete job, so a
+   long transition cannot lose control halfway through merely because the
+   original arming timer expires.
+6. After completion, call `transition_quality_report`, then
+   `settle_set_transition`. The queue advances only after postconditions and QA
+   pass; failures preserve the current/next pair for recovery.
+
+`refresh_transition_state` now reconciles both decks from Rekordbox's displayed
+elapsed time and the analyzed beat grid. This corrects absolute bar position
+after a long-running track instead of copying a stale launch-relative clock.
+The UI clock is whole-second precision, so exact phase is reported as telemetry;
+Beat Sync, Quantize, and verified grid-aligned launch remain the phase authority.
 
 For the current Rekordbox 7 setup, MIX POINT LINK is the preferred precise
 launch mechanism. A future native or vision adapter can provide continuous deck

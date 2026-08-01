@@ -243,3 +243,21 @@ def test_scheduler_reports_exact_dispatch_to_event_observer() -> None:
         assert observed[0][1] > 0
 
     asyncio.run(scenario())
+
+
+def test_scheduler_reserves_control_for_entire_job() -> None:
+    async def scenario() -> None:
+        engine = MidiEngine()
+        output = FakeOutput()
+        engine.output = output
+        engine.port_name = output.name
+        engine.arm(10)
+        scheduler = TransitionScheduler(engine)
+        result = scheduler.start(
+            "long job",
+            [{"at_ms": 11_000, "action": "cue", "parameters": {"deck": 1}}],
+        )
+        assert result["control_reserved_until_monotonic"] > engine.armed_until
+        scheduler.cancel_all()
+
+    asyncio.run(scenario())

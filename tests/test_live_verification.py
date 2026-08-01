@@ -199,7 +199,7 @@ def test_transition_candidate_ranker_excludes_seven_a_to_two_a() -> None:
     )
     assert [item["track_id"] for item in result["ranked"]] == ["good"]
     assert [item["track_id"] for item in result["excluded"]] == ["bad"]
-    assert result["vocal_clash_scoring"] == "disabled"
+    assert result["vocal_clash_scoring"] == "not_requested"
 
 
 def test_hot_cue_position_window_handles_slow_ui_snapshot() -> None:
