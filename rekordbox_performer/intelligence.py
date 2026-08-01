@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,98 @@ LandmarkKind = Literal[
     "bass_out",
 ]
 SegmentKind = Literal["vocal", "instrumental", "bass", "breakdown", "build", "drop"]
+
+_CAMELOT_BY_KEY = {
+    "g#m": "1A",
+    "abm": "1A",
+    "d#m": "2A",
+    "ebm": "2A",
+    "a#m": "3A",
+    "bbm": "3A",
+    "fm": "4A",
+    "cm": "5A",
+    "gm": "6A",
+    "dm": "7A",
+    "am": "8A",
+    "em": "9A",
+    "bm": "10A",
+    "f#m": "11A",
+    "gbm": "11A",
+    "c#m": "12A",
+    "dbm": "12A",
+    "b": "1B",
+    "f#": "2B",
+    "gb": "2B",
+    "c#": "3B",
+    "db": "3B",
+    "g#": "4B",
+    "ab": "4B",
+    "d#": "5B",
+    "eb": "5B",
+    "a#": "6B",
+    "bb": "6B",
+    "f": "7B",
+    "c": "8B",
+    "g": "9B",
+    "d": "10B",
+    "a": "11B",
+    "e": "12B",
+}
+
+
+def normalize_camelot(key: str | None) -> str | None:
+    """Normalize Rekordbox Camelot or conventional key labels."""
+    if not key:
+        return None
+    value = key.strip().replace("♭", "b").replace("♯", "#")
+    camelot = re.fullmatch(r"(1[0-2]|[1-9])([AaBb])", value)
+    if camelot:
+        return f"{int(camelot.group(1))}{camelot.group(2).upper()}"
+    compact = value.casefold().replace("minor", "m").replace("major", "")
+    compact = re.sub(r"\s+", "", compact)
+    return _CAMELOT_BY_KEY.get(compact)
+
+
+def camelot_compatibility(
+    outgoing_key: str | None,
+    incoming_key: str | None,
+) -> dict[str, Any]:
+    """Return a conservative harmonic-mixing compatibility report."""
+    outgoing = normalize_camelot(outgoing_key)
+    incoming = normalize_camelot(incoming_key)
+    if outgoing is None or incoming is None:
+        return {
+            "verified": False,
+            "compatible": False,
+            "outgoing": outgoing,
+            "incoming": incoming,
+            "wheel_distance": None,
+            "relationship": "unknown",
+        }
+    outgoing_number, outgoing_mode = int(outgoing[:-1]), outgoing[-1]
+    incoming_number, incoming_mode = int(incoming[:-1]), incoming[-1]
+    raw_distance = abs(outgoing_number - incoming_number)
+    wheel_distance = min(raw_distance, 12 - raw_distance)
+    same_mode_neighbor = outgoing_mode == incoming_mode and wheel_distance <= 1
+    relative_mode = outgoing_number == incoming_number
+    compatible = same_mode_neighbor or relative_mode
+    relationship = (
+        "same_key"
+        if outgoing == incoming
+        else "relative_major_minor"
+        if relative_mode
+        else "wheel_neighbor"
+        if same_mode_neighbor
+        else "incompatible"
+    )
+    return {
+        "verified": True,
+        "compatible": compatible,
+        "outgoing": outgoing,
+        "incoming": incoming,
+        "wheel_distance": wheel_distance,
+        "relationship": relationship,
+    }
 
 
 class TrackLandmark(BaseModel):
@@ -137,7 +231,13 @@ class TrackProfile(BaseModel):
             "bass": {"bass_in", "bass_out"} & kinds != set()
             or any(segment.kind == "bass" for segment in self.segments),
         }
-        return {"ready": all(checks.values()), "checks": checks}
+        ready = all(checks.values())
+        analysis_ready = all(
+            checks[name]
+            for name in ("beatgrid", "phrases", "mix_in", "mix_out")
+        )
+        tier = "A" if ready else "B" if analysis_ready else "C"
+        return {"ready": ready, "tier": tier, "checks": checks}
 
     def analysis_readiness(self) -> dict[str, Any]:
         live_confidence = {"verified", "high"}
@@ -215,6 +315,11 @@ class LiveState:
         total_beats = base_track_beat - 1 + observation.beat_phase
         if observation.playing:
             total_beats += age * observation.bpm / 60.0
+        # Normalize before deriving beat/bar fields.  Rounding only the final
+        # fractional phase can produce the impossible value 1.0 immediately
+        # before a beat rollover, which then fails DeckObservation validation
+        # during a live refresh.
+        total_beats = round(total_beats, 4)
         bar = int(total_beats // 4) + 1
         within_bar = total_beats % 4
         beat = int(within_bar) + 1
@@ -225,7 +330,7 @@ class LiveState:
             "bar": bar,
             "beat": beat,
             "track_beat": track_beat,
-            "beat_phase": round(beat_phase, 4),
+            "beat_phase": beat_phase,
             "observation_age_ms": round(age * 1000),
             "fresh": age <= 1.0,
         }
@@ -258,6 +363,15 @@ class TransitionCard(BaseModel):
     anchor_deck: int = Field(ge=1, le=2)
     outgoing_deck: int = Field(ge=1, le=2)
     incoming_deck: int = Field(ge=1, le=2)
+    transition_family: Literal[
+        "long_blend",
+        "bass_swap",
+        "phrase_cut",
+        "echo_exit",
+        "loop_bridge",
+        "breakdown_handoff",
+        "double_drop",
+    ] = "bass_swap"
     start_quantum_bars: Literal[1, 4, 8, 16, 32] = 16
     minimum_lead_bars: int = Field(default=1, ge=1, le=16)
     start_phrase_index: int | None = Field(default=None, ge=1)
@@ -266,6 +380,8 @@ class TransitionCard(BaseModel):
     quantize_required: bool = True
     phrase_alignment_verified: bool = False
     vocal_plan_verified: bool = False
+    vocal_risk_accepted: bool = False
+    harmonic_risk_accepted: bool = False
     bass_plan_verified: bool = False
     incoming_loaded_verified: bool = False
     intended_vocal_owner: Literal["outgoing", "incoming", "none", "intentional_overlap"]
@@ -336,22 +452,135 @@ def default_data_dir() -> Path:
 class ProfileStore:
     def __init__(self, data_dir: Path | None = None) -> None:
         self.data_dir = data_dir or default_data_dir()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.database_path = self.data_dir / "performance-state.sqlite3"
         self.profile_path = self.data_dir / "track-profiles.json"
         self.rehearsal_path = self.data_dir / "rehearsals.jsonl"
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    track_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS rehearsals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    outgoing_track_id TEXT NOT NULL,
+                    incoming_track_id TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    payload TEXT NOT NULL,
+                    recorded_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS rehearsals_pair
+                    ON rehearsals(outgoing_track_id, incoming_track_id);
+                """
+            )
+            profile_count = connection.execute(
+                "SELECT COUNT(*) FROM profiles"
+            ).fetchone()[0]
+            if profile_count == 0 and self.profile_path.exists():
+                profiles = json.loads(
+                    self.profile_path.read_text(encoding="utf-8")
+                )
+                now = time.time()
+                connection.executemany(
+                    """
+                    INSERT OR REPLACE INTO profiles(track_id, payload, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        (
+                            track_id,
+                            json.dumps(payload, ensure_ascii=False),
+                            now,
+                        )
+                        for track_id, payload in profiles.items()
+                    ],
+                )
+            rehearsal_count = connection.execute(
+                "SELECT COUNT(*) FROM rehearsals"
+            ).fetchone()[0]
+            if rehearsal_count == 0 and self.rehearsal_path.exists():
+                records = [
+                    json.loads(line)
+                    for line in self.rehearsal_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+                connection.executemany(
+                    """
+                    INSERT INTO rehearsals(
+                        outgoing_track_id,
+                        incoming_track_id,
+                        score,
+                        payload,
+                        recorded_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            record["outgoing_track_id"],
+                            record["incoming_track_id"],
+                            float(record["score"]),
+                            json.dumps(record, ensure_ascii=False),
+                            float(record.get("recorded_at", time.time())),
+                        )
+                        for record in records
+                    ],
+                )
 
     def _load_profiles(self) -> dict[str, dict[str, Any]]:
-        if not self.profile_path.exists():
-            return {}
-        return json.loads(self.profile_path.read_text(encoding="utf-8"))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT track_id, payload FROM profiles"
+            ).fetchall()
+        return {
+            row["track_id"]: json.loads(row["payload"])
+            for row in rows
+        }
+
+    def _write_profiles(
+        self,
+        profiles: dict[str, dict[str, Any]],
+    ) -> None:
+        if not profiles:
+            return
+        now = time.time()
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO profiles(track_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(track_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        track_id,
+                        json.dumps(payload, ensure_ascii=False),
+                        now,
+                    )
+                    for track_id, payload in profiles.items()
+                ],
+            )
 
     def upsert(self, profile: TrackProfile) -> dict[str, Any]:
-        profiles = self._load_profiles()
-        profiles[profile.track_id] = profile.model_dump()
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.profile_path.write_text(
-            json.dumps(profiles, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        self._write_profiles({profile.track_id: profile.model_dump()})
         return {
             "profile": profile.model_dump(),
             "readiness": profile.readiness(),
@@ -558,16 +787,18 @@ class ProfileStore:
             )
             profiles[track.track_id] = profile.model_dump()
             created += 1
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.profile_path.write_text(
-            json.dumps(profiles, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
         eligible_ids = [
             track.track_id
             for track in tracks
             if track.bpm > 0
         ]
+        self._write_profiles(
+            {
+                track_id: profiles[track_id]
+                for track_id in eligible_ids
+                if track_id in profiles
+            }
+        )
         audit = self.audit(eligible_ids)
         return {
             "track_count": len(tracks),
@@ -578,10 +809,14 @@ class ProfileStore:
         }
 
     def get(self, track_id: str) -> TrackProfile:
-        profiles = self._load_profiles()
-        if track_id not in profiles:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM profiles WHERE track_id = ?",
+                (track_id,),
+            ).fetchone()
+        if row is None:
             raise KeyError(f"No performance profile for track {track_id}")
-        return TrackProfile.model_validate(profiles[track_id])
+        return TrackProfile.model_validate(json.loads(row["payload"]))
 
     def audit(self, track_ids: list[str] | None = None) -> dict[str, Any]:
         profiles = self._load_profiles()
@@ -608,14 +843,31 @@ class ProfileStore:
         }
 
     def record_rehearsal(self, review: RehearsalReview) -> dict[str, Any]:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
         record = {
             **review.model_dump(),
             "score": review.score(),
             "recorded_at": time.time(),
         }
-        with self.rehearsal_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rehearsals(
+                    outgoing_track_id,
+                    incoming_track_id,
+                    score,
+                    payload,
+                    recorded_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    review.outgoing_track_id,
+                    review.incoming_track_id,
+                    float(record["score"]),
+                    json.dumps(record, ensure_ascii=False),
+                    float(record["recorded_at"]),
+                ),
+            )
         return record
 
     def rehearsal_summary(
@@ -623,25 +875,21 @@ class ProfileStore:
         outgoing_track_id: str | None = None,
         incoming_track_id: str | None = None,
     ) -> dict[str, Any]:
-        if not self.rehearsal_path.exists():
-            return {"count": 0, "average_score": None, "reviews": []}
-        records = [
-            json.loads(line)
-            for line in self.rehearsal_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        clauses = []
+        parameters: list[str] = []
         if outgoing_track_id:
-            records = [
-                item
-                for item in records
-                if item["outgoing_track_id"] == outgoing_track_id
-            ]
+            clauses.append("outgoing_track_id = ?")
+            parameters.append(outgoing_track_id)
         if incoming_track_id:
-            records = [
-                item
-                for item in records
-                if item["incoming_track_id"] == incoming_track_id
-            ]
+            clauses.append("incoming_track_id = ?")
+            parameters.append(incoming_track_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM rehearsals{where} ORDER BY id",
+                parameters,
+            ).fetchall()
+        records = [json.loads(row["payload"]) for row in rows]
         average = (
             round(sum(item["score"] for item in records) / len(records), 2)
             if records
@@ -650,11 +898,25 @@ class ProfileStore:
         return {"count": len(records), "average_score": average, "reviews": records}
 
 
-def _profile_live_ready(profile: TrackProfile, role: str) -> list[str]:
+def _profile_live_ready(
+    profile: TrackProfile,
+    role: str,
+    *,
+    vocal_risk_accepted: bool = False,
+) -> list[str]:
     readiness = profile.readiness()["checks"]
     required = ["beatgrid", "phrases", "vocals", "bass"]
+    if vocal_risk_accepted:
+        required.remove("vocals")
     required.append("mix_out" if role == "outgoing" else "mix_in")
     return [name for name in required if not readiness[name]]
+
+
+def _card_accepts_vocal_risk(card: TransitionCard) -> bool:
+    return card.vocal_risk_accepted or (
+        card.vocal_plan_verified
+        and card.intended_vocal_owner == "intentional_overlap"
+    )
 
 
 def validate_transition_card(
@@ -663,21 +925,51 @@ def validate_transition_card(
     incoming: TrackProfile,
 ) -> list[str]:
     errors: list[str] = []
+    vocal_risk_accepted = _card_accepts_vocal_risk(card)
+    harmonic = camelot_compatibility(outgoing.key, incoming.key)
     if card.outgoing_track_id != outgoing.track_id:
         errors.append("outgoing profile does not match card")
     if card.incoming_track_id != incoming.track_id:
         errors.append("incoming profile does not match card")
+    if (
+        abs(outgoing.bpm - incoming.bpm) > 0.05
+        and not card.beat_sync_required
+    ):
+        errors.append(
+            "tempo-mismatched tracks require verified Beat Sync"
+        )
     for label, value in (
         ("phrase alignment", card.phrase_alignment_verified),
-        ("vocal plan", card.vocal_plan_verified),
         ("bass plan", card.bass_plan_verified),
         ("incoming load", card.incoming_loaded_verified),
     ):
         if not value:
             errors.append(f"{label} is not verified")
-    for missing in _profile_live_ready(outgoing, "outgoing"):
+    if not (card.vocal_plan_verified or vocal_risk_accepted):
+        errors.append("vocal plan is not verified and vocal risk is not accepted")
+    if not card.harmonic_risk_accepted:
+        if not harmonic["verified"]:
+            errors.append(
+                "harmonic relationship is unknown; verify both keys or "
+                "explicitly accept harmonic risk"
+            )
+        elif not harmonic["compatible"]:
+            errors.append(
+                "harmonic move is outside same/relative/adjacent Camelot keys "
+                f"({harmonic['outgoing']} -> {harmonic['incoming']}); "
+                "choose a compatible track or explicitly accept harmonic risk"
+            )
+    for missing in _profile_live_ready(
+        outgoing,
+        "outgoing",
+        vocal_risk_accepted=vocal_risk_accepted,
+    ):
         errors.append(f"outgoing profile missing {missing}")
-    for missing in _profile_live_ready(incoming, "incoming"):
+    for missing in _profile_live_ready(
+        incoming,
+        "incoming",
+        vocal_risk_accepted=vocal_risk_accepted,
+    ):
         errors.append(f"incoming profile missing {missing}")
 
     unsafe_mode_toggles = [
@@ -723,7 +1015,7 @@ def validate_transition_card(
         for event in card.events
         if event.bar_offset == 0
         and event.beat_offset == 0
-        and event.action == "hot_cue"
+        and event.action in {"hot_cue", "play_pause"}
         and event.parameters.get("deck") == card.incoming_deck
     ]
     verified_entry_cues = {
@@ -735,14 +1027,74 @@ def validate_transition_card(
     }
     if len(launch_events) != 1:
         errors.append(
-            "incoming deck must launch exactly once from a verified hot cue "
+            "incoming deck must launch exactly once "
             "on transition bar 0 beat 1"
         )
-    elif launch_events[0].parameters.get("cue") not in verified_entry_cues:
-        errors.append(
-            "incoming launch cue is not a high-confidence mix-in or "
-            "phrase-start landmark"
-        )
+    else:
+        launch = launch_events[0]
+        drop_anchored = card.transition_family in {
+            "long_blend",
+            "bass_swap",
+            "double_drop",
+        }
+        if drop_anchored and launch.action != "hot_cue":
+            errors.append(
+                f"{card.transition_family} requires a verified Hot Cue launch"
+            )
+        elif (
+            launch.action == "hot_cue"
+            and launch.parameters.get("cue") not in verified_entry_cues
+        ):
+            errors.append(
+                "incoming launch cue is not a high-confidence mix-in or "
+                "phrase-start landmark"
+            )
+        elif launch.action == "play_pause":
+            file_start_entries = [
+                landmark
+                for landmark in incoming.landmarks
+                if landmark.kind in {"mix_in", "phrase_start"}
+                and landmark.bar == 1
+                and (landmark.beat or 1) == 1
+                and landmark.confidence in {"verified", "high"}
+            ]
+            if not file_start_entries:
+                errors.append(
+                    "play_pause launch requires a high-confidence file-start "
+                    "mix-in or phrase-start landmark"
+                )
+        if drop_anchored and launch.action == "hot_cue":
+            entry = next(
+                (
+                    landmark
+                    for landmark in incoming.landmarks
+                    if landmark.cue == launch.parameters.get("cue")
+                    and landmark.kind in {"mix_in", "phrase_start"}
+                    and landmark.confidence in {"verified", "high"}
+                ),
+                None,
+            )
+            if entry is not None:
+                entry_beat = (
+                    (entry.bar - 1) * incoming.time_signature
+                    + (entry.beat or 1)
+                )
+                critical_beat = (
+                    entry_beat
+                    + card.critical_bar_offset * incoming.time_signature
+                )
+                verified_drops = {
+                    (landmark.bar - 1) * incoming.time_signature
+                    + (landmark.beat or 1)
+                    for landmark in incoming.landmarks
+                    if landmark.kind == "drop"
+                    and landmark.confidence in {"verified", "high"}
+                }
+                if critical_beat not in verified_drops:
+                    errors.append(
+                        "critical bass swap does not land on a verified "
+                        "incoming drop"
+                    )
 
     outgoing_fader_zero: tuple[int, int] | None = None
     outgoing_stop: tuple[int, int] | None = None
@@ -796,7 +1148,16 @@ def compile_transition_card(
         else incoming.track_id
     ):
         errors.append("anchor deck track does not match transition card")
-    if not state["playing"]:
+    anchor_launches = [
+        event
+        for event in card.events
+        if event.bar_offset == 0
+        and event.beat_offset == 0
+        and event.action == "hot_cue"
+        and event.parameters.get("deck") == card.anchor_deck
+    ]
+    stopped_dual_launch = not state["playing"] and len(anchor_launches) == 1
+    if not state["playing"] and not stopped_dual_launch:
         errors.append("anchor deck is not playing")
     if state["observation_age_ms"] > max_observation_age_ms:
         errors.append(
@@ -806,6 +1167,11 @@ def compile_transition_card(
         errors.append("anchor observation confidence is below high")
     if state["source"] == "manual":
         errors.append("manual observations are not authoritative live clocks")
+    if state["source"] == "midi":
+        errors.append(
+            "outbound MIDI commands are not authoritative deck observations; "
+            "use verified native transport feedback"
+        )
     if state["source"] == "vision" and state["confidence"] != "verified":
         errors.append(
             "vision observations require verified adapter confidence"
@@ -823,6 +1189,11 @@ def compile_transition_card(
         if incoming_state["source"] == "manual":
             errors.append(
                 "manual incoming observations are not authoritative live state"
+            )
+        if incoming_state["source"] == "midi":
+            errors.append(
+                "outbound MIDI commands are not authoritative incoming-deck "
+                "state; use verified native transport feedback"
             )
         if (
             incoming_state["source"] == "vision"
@@ -856,6 +1227,63 @@ def compile_transition_card(
     beat_ms = 60_000.0 / bpm
     beats_per_bar = anchor_profile.time_signature
     current_beat = state["track_beat"] + state["beat_phase"]
+    if stopped_dual_launch:
+        anchor_launch = anchor_launches[0]
+        cue = anchor_launch.parameters.get("cue")
+        landmark = next(
+            (
+                item
+                for item in anchor_profile.landmarks
+                if item.cue == cue
+                and item.kind in {"mix_in", "phrase_start"}
+                and item.confidence in {"verified", "high"}
+            ),
+            None,
+        )
+        if landmark is None:
+            return {
+                "ready": False,
+                "errors": [
+                    "stopped anchor launch cue is not a high-confidence "
+                    "mix-in or phrase-start landmark"
+                ],
+                "events": [],
+            }
+        start_delay_ms = 250
+        events = []
+        for event in card.events:
+            offset_beats = (
+                event.bar_offset * anchor_profile.time_signature
+                + event.beat_offset
+            )
+            events.append(
+                {
+                    "at_ms": start_delay_ms + round(offset_beats * beat_ms),
+                    "action": event.action,
+                    "parameters": event.parameters,
+                }
+            )
+        return {
+            "ready": True,
+            "errors": [],
+            "harmonic_compatibility": camelot_compatibility(
+                outgoing.key,
+                incoming.key,
+            ),
+            "bpm": state["bpm"],
+            "anchor": state,
+            "incoming": incoming_state,
+            "start_basis": "verified_dual_hot_cue",
+            "start_delay_ms": start_delay_ms,
+            "start_track_beat": (
+                (landmark.bar - 1) * anchor_profile.time_signature
+                + (landmark.beat or 1)
+            ),
+            "start_bar": landmark.bar,
+            "start_beat_in_bar": landmark.beat or 1,
+            "start_phrase": None,
+            "events": events,
+        }
     minimum_lead_beats = card.minimum_lead_bars * beats_per_bar
     earliest = current_beat + minimum_lead_beats
     candidates = list(phrases)
@@ -903,6 +1331,10 @@ def compile_transition_card(
     return {
         "ready": True,
         "errors": [],
+        "harmonic_compatibility": camelot_compatibility(
+            outgoing.key,
+            incoming.key,
+        ),
         "bpm": bpm,
         "anchor": state,
         "incoming": incoming_state,
@@ -942,8 +1374,27 @@ def audit_set_plan(plan: SetPlan, store: ProfileStore) -> dict[str, Any]:
         )
     if plan.preload_lead_bars < 32:
         errors.append("preload lead must be at least 32 bars for this workflow")
+    waived_vocal_track_ids = {
+        track_id
+        for card in plan.cards
+        if _card_accepts_vocal_risk(card)
+        for track_id in (card.outgoing_track_id, card.incoming_track_id)
+    }
+    plan_track_ready = all(
+        track["ready"]
+        or (
+            track["track_id"] in waived_vocal_track_ids
+            and set(
+                name
+                for name, passed in track["checks"].items()
+                if not passed
+            )
+            <= {"vocals"}
+        )
+        for track in track_audit["tracks"]
+    )
     return {
-        "ready": track_audit["ready"] and not errors,
+        "ready": plan_track_ready and not errors,
         "errors": errors,
         "track_audit": track_audit,
         "preload_lead_bars": plan.preload_lead_bars,

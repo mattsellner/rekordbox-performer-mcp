@@ -24,11 +24,13 @@ low-level testing. Live musical handoffs must use the guarded workflow:
 3. Ingest native `PVDI` vocal spans and `PWV7` low-band spans when available;
    use `upsert_track_profile` only for additional verified landmarks.
 4. Require `audit_track_profiles` and `preview_set_plan` to pass before track one.
-5. Feed fresh observations for both decks through `observe_deck_state`,
-   including Beat Sync and Quantize indicator state.
+5. Launch the first deck with `launch_staged_track` or
+   `launch_verified_hot_cue`, then call `refresh_transition_state`. Do not
+   promote an outbound MIDI command into an observation.
 6. Express the transition in bars and beats with a `TransitionCard`.
 7. Call `preview_transition_card`, arm control, then call
-   `perform_transition_card`.
+   `perform_transition_card` with a unique `execution_id` for that one live
+   pass. Reuse the same ID only when retrying a lost MCP response.
 8. Grade the practice pass with `record_rehearsal`.
 
 For measured practice passes, install `.[rehearsal]`, call
@@ -48,14 +50,63 @@ The card validator rejects:
 - manual clocks or unverified vision clocks;
 - an already-playing incoming deck;
 - an incoming launch that is not exactly bar 0 beat 1 from a verified
-  mix-in/phrase-start Hot Cue;
+  mix-in/phrase-start Hot Cue for a blend or bass swap;
+- an incompatible Camelot move outside same-key, relative-major/minor, or
+  adjacent-wheel relationships unless harmonic risk is explicitly accepted;
 - events that are not ordered musically;
 - a critical handoff without both bass moves on the same downbeat;
 - an outgoing deck that is not faded to zero and stopped.
 
+Simple `phrase_cut`, `echo_exit`, and `breakdown_handoff` cards may launch a
+stopped deck with `play_pause` only when the incoming profile has a
+high-confidence file-start phrase landmark. Drop-anchored blends and bass swaps
+still require a verified Hot Cue.
+
 The scheduler reports average and maximum event lateness for diagnostics.
 Events sharing one musical timestamp dispatch concurrently, so two-deck Hot
 Cue launches and bass swaps are not skewed by MIDI note-hold time.
+Committed cards require an execution ID. Retrying an identical card with the
+same ID returns the original job instead of scheduling it again; using that ID
+for different events fails closed.
+MIDI dispatch alone is never reported as a successful live handoff:
+`perform_transition_card` verifies afterward that the incoming deck is moving
+and the outgoing deck is stopped. A failed or unavailable observation marks the
+job failed.
+
+## Performance hardening
+
+Codex may launch more than one stdio MCP client. Read-only clients can coexist,
+but an OS-backed lease allows only one process to own the live MIDI output.
+`control_status` reports the current lease owner. The lease is released on
+disconnect or process exit.
+
+Performance profiles and rehearsal reviews use a shared SQLite database in WAL
+mode. Legacy `track-profiles.json` and `rehearsals.jsonl` data is imported once,
+so concurrent MCP clients cannot overwrite one another's preparation.
+
+`rekordbox_ui_status` is served by one shared demand-bounded observer. It scans
+only during an explicit observation window and publishes timestamped snapshots
+for every MCP client, including observation age and observer PID. It restarts
+after idle, allows slow Rekordbox UI Automation scans to finish, and never
+returns a stale snapshot as current. A screenshot-derived
+snapshot is still planning evidence, not an authoritative musical clock.
+
+Each observation now samples the UI Automation tree and window geometry once,
+then parses both decks from that immutable sample. Transport checks reuse an
+already captured initial deck snapshot when available. This avoids repeated
+hundreds-of-control geometry walks during staging, cue verification, launch,
+and post-transition verification while preserving title, artist, elapsed-time,
+Sync, and Quantize evidence.
+
+Track readiness uses three tiers:
+
+- `A`: fully automation-ready;
+- `B`: analyzed and suitable for a verified simple cut/reset, but not a full
+  automated overlap;
+- `C`: manual-only until preparation gaps are resolved.
+
+`scheduler_metrics` reports aggregate p95/p99 event lateness, maximum lateness,
+and the number of events that missed the 10 ms deadline.
 
 ## Native Rekordbox launch timing
 
@@ -117,13 +168,55 @@ and refuses ambiguous rows. `load_track_exact` verifies that the target deck is
 stopped, loads the selected row, and checks title and artist afterward. Unicode
 apostrophe and quote variants are normalized without weakening artist checks.
 
+Prefer `stage_track` for live work. It accepts a stable catalog `track_id`,
+title, artist, source, and optional duplicate-row index. It restores browser
+focus, first closes the channel fader and sends CUE, verifies the deck is
+stopped, attempts the mapped FLX4 Load action, and falls back to a deterministic
+drag-to-deck load if MIDI focus fails. If Rekordbox auto-starts the newly loaded
+track, the server immediately mutes and stops that deck and rejects the staging
+attempt; stage it again before verification. Browser row selection and drag
+fallbacks use the row's non-editable selector gutter rather than the title cell,
+preventing accidental inline title editing.
+
+Successful staging also learns a session-local route for the stable
+`track_id`: the query, duplicate-row index, and verified MIDI-or-drag load
+method. Restaging that track later in the same set tries the proven query first,
+skips a known-failing MIDI load when appropriate, and reuses coordinates from
+the current browser snapshot. Preflight each planned track once before playback
+so retired-deck reloads take this optimized path. The cache is intentionally
+discarded when Codex/Rekordbox Performer restarts.
+
 ## Telemetry boundary
 
 MIDI Learn is a control surface, not a complete deck-state API.
 `observe_deck_state` accepts observations from a native, MIDI, vision, or manual
-adapter and rejects stale state at compile time. Manual observations are never
+adapter and rejects stale state at compile time. Because this server currently
+has outbound MIDI only, high-confidence `source="midi"` observations are
+rejected: a command timestamp is not feedback. Manual observations are never
 accepted as authoritative live clocks. Vision observations require verified
 adapter confidence; an ad-hoc screenshot estimate cannot authorize a card.
+
+Use `verify_hot_cue` before committing a Hot Cue card. Verification is
+session-scoped and proves the loaded title, recalled position, and advancing
+transport while the deck is muted. Use `launch_staged_track` for a verified
+file-start launch and `refresh_transition_state` immediately before previewing
+and committing the card. Raw `trigger_control` responses explicitly report
+`effect_verified=false`.
+
+After a transition completes, the verifier promotes the incoming deck's exact
+scheduled Hot Cue dispatch time into the next authoritative live clock. This
+keeps a multi-song set's timing runway continuous instead of depending on a
+slow post-transition refresh. Any BPM difference greater than 0.05 BPM requires
+Beat Sync in the card. Drop-oriented transition families (`long_blend`,
+`bass_swap`, and `double_drop`) also require their critical bass-swap beat to
+land on a high-confidence or verified incoming `drop` landmark; a merely
+convenient phrase boundary is not sufficient.
+
+`rank_transition_candidates` normalizes Camelot and conventional key labels,
+filters incompatible moves by default, and ranks the remainder by harmonic
+relationship and BPM proximity. Vocal-clash scoring is deliberately disabled;
+cards can use the existing explicit vocal-risk waiver while phrase, bass,
+transport, and harmonic checks remain enforced.
 
 For the current Rekordbox 7 setup, MIX POINT LINK is the preferred precise
 launch mechanism. A future native or vision adapter can provide continuous deck
@@ -156,7 +249,11 @@ py -3.12 -m venv .venv
 8. Call `list_midi_outputs`, `connect_midi`, and `control_status`.
 9. Enable MIX POINT LINK in Preferences when available.
 10. Preflight profiles and a complete set plan.
-11. Preview a transition card, arm control, then perform it.
+11. Before track one, cycle every planned incoming track through its assigned
+    deck and verify its Hot Cue for the current session; then restage the first
+    two tracks. This keeps expensive cue audits out of the live retirement
+    window.
+12. Preview a transition card, arm control, then perform it.
 
 The dedicated mapping does not replace the DDJ-FLX4 factory mapping.
 

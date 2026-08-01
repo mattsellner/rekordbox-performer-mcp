@@ -10,7 +10,7 @@ from typing import Any
 
 import win32clipboard
 from PIL import Image
-from pywinauto import Application, Desktop
+from pywinauto import Application, Desktop, mouse
 from pywinauto.keyboard import send_keys
 
 
@@ -90,11 +90,32 @@ class DeckSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class ControlSample:
+    control: Any
+    control_type: str | None
+    text: str
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+
 class RekordboxUIAdapter:
     """Read and manipulate only stable, observable Rekordbox UI controls."""
 
     def __init__(self, window_title: str = "rekordbox") -> None:
         self.window_title = window_title
+        # Successful stage routes are learned by server._stage_track. Keeping
+        # the cache on the adapter scopes it to one Rekordbox/Codex session and
+        # naturally discards it after either process restarts.
+        self.stage_route_cache: dict[str, dict[str, Any]] = {}
+        # Rekordbox exposes thousands of UIA descendants.  Enumerating that
+        # tree for every deck-clock read can consume an entire musical phrase.
+        # Cache only the small set of controls used by status/deck snapshots;
+        # their text and pixels are still sampled fresh on every call.
+        self._status_control_cache: list[Any] | None = None
+        self._status_cache_signature: tuple[int, int] | None = None
 
     def _root(self):
         window = next(
@@ -123,11 +144,12 @@ class RekordboxUIAdapter:
         )
 
     def _mode(self, root) -> str:
+        window = root.rectangle()
         controls = [
             control
             for control in root.descendants()
             if getattr(control.element_info, "control_type", None) == "ComboBox"
-            and 0 <= self._relative_rectangle(root, control)[1] <= 70
+            and 0 <= control.rectangle().top - window.top <= 70
         ]
         known_modes = {"performance", "export", "edit", "lighting"}
         return next(
@@ -139,13 +161,87 @@ class RekordboxUIAdapter:
             "",
         )
 
+    def _sample_controls(
+        self,
+        root,
+        descendants: list[Any] | None = None,
+    ) -> tuple[list[ControlSample], int]:
+        """Read UIA geometry/text once for a complete Rekordbox snapshot."""
+        window = root.rectangle()
+        samples = []
+        for control in descendants or root.descendants():
+            info = control.element_info
+            control_type = getattr(info, "control_type", None)
+            rectangle = control.rectangle()
+            # Rekordbox exposes BEAT SYNC and Quantize labels through Button
+            # or Custom controls depending on the build, so retain names for
+            # every sampled control. This is still one UIA read per control.
+            text_reader = getattr(control, "window_text", None)
+            text = text_reader() if text_reader is not None else ""
+            samples.append(
+                ControlSample(
+                    control=control,
+                    control_type=control_type,
+                    text=text,
+                    left=rectangle.left - window.left,
+                    top=rectangle.top - window.top,
+                    right=rectangle.right - window.left,
+                    bottom=rectangle.bottom - window.top,
+                )
+            )
+        return samples, window.width()
+
+    def _status_controls(self, root) -> list[Any]:
+        window = root.rectangle()
+        signature = (int(getattr(root, "handle", id(root))), window.width())
+        if (
+            self._status_control_cache is not None
+            and self._status_cache_signature == signature
+        ):
+            return self._status_control_cache
+        controls = []
+        for control in root.descendants():
+            info = control.element_info
+            control_type = getattr(info, "control_type", None)
+            rectangle = control.rectangle()
+            top = rectangle.top - window.top
+            if (
+                (control_type == "ComboBox" and 0 <= top <= 70)
+                or (
+                    control_type in {"Text", "Button", "Custom"}
+                    and (250 <= top <= 335 or 410 <= top <= 510)
+                )
+            ):
+                controls.append(control)
+        self._status_control_cache = controls
+        self._status_cache_signature = signature
+        return controls
+
+    @staticmethod
+    def _mode_from_samples(samples: list[ControlSample]) -> str:
+        known_modes = {"performance", "export", "edit", "lighting"}
+        return next(
+            (
+                sample.text
+                for sample in samples
+                if sample.control_type == "ComboBox"
+                and 0 <= sample.top <= 70
+                and sample.text.casefold() in known_modes
+            ),
+            "",
+        )
+
     def _search_edit(self, root):
+        window = root.rectangle()
+        width = window.width()
         controls = []
         for control in root.descendants():
             if getattr(control.element_info, "control_type", None) != "Edit":
                 continue
-            left, top, right, _ = self._relative_rectangle(root, control)
-            if 700 <= top <= 780 and left >= root.rectangle().width() - 350:
+            rectangle = control.rectangle()
+            left = rectangle.left - window.left
+            top = rectangle.top - window.top
+            if 700 <= top <= 780 and left >= width - 350:
                 controls.append(control)
         if len(controls) != 1:
             raise RuntimeError(
@@ -189,50 +285,188 @@ class RekordboxUIAdapter:
             win32clipboard.CloseClipboard()
 
     def _result_rows(self, root) -> list[int]:
-        tops = []
-        for control in root.descendants():
-            control_type = getattr(
-                control.element_info,
-                "control_type",
-                None,
-            )
+        samples, width = self._sample_browser_rows(root)
+        return self._result_rows_from_samples(samples, width)
+
+    def _sample_browser_rows(
+        self,
+        root,
+        descendants: list[Any] | None = None,
+    ) -> tuple[list[ControlSample], int]:
+        """Sample only row-shaped Custom controls during search polling.
+
+        A complete Rekordbox tree contains hundreds of controls. Reading text
+        and geometry from every one on each poll dominated exact-load time,
+        especially while another deck was playing. Browser result detection
+        needs only Custom-control geometry, so keep the polling path narrow.
+        """
+        window = root.rectangle()
+        width = window.width()
+        samples = []
+        for control in descendants or root.descendants():
+            control_type = getattr(control.element_info, "control_type", None)
             if control_type != "Custom":
                 continue
-            left, top, right, bottom = self._relative_rectangle(root, control)
+            rectangle = control.rectangle()
+            left = rectangle.left - window.left
+            top = rectangle.top - window.top
+            right = rectangle.right - window.left
+            bottom = rectangle.bottom - window.top
             if (
                 770 <= top <= 930
                 and 18 <= bottom - top <= 28
-                and right - left >= root.rectangle().width() * 0.75
+                and right - left >= width * 0.75
             ):
-                tops.append(top)
-        return unique_row_tops(tops)
+                samples.append(
+                    ControlSample(
+                        control=control,
+                        control_type=control_type,
+                        text="",
+                        left=left,
+                        top=top,
+                        right=right,
+                        bottom=bottom,
+                    )
+                )
+        return samples, width
+
+    @staticmethod
+    def _result_rows_from_samples(
+        samples: list[ControlSample],
+        window_width: int,
+    ) -> list[int]:
+        tops = []
+        for sample in samples:
+            if (
+                sample.control_type == "Custom"
+                and 770 <= sample.top <= 930
+                and 18 <= sample.bottom - sample.top <= 28
+                and sample.right - sample.left >= window_width * 0.75
+            ):
+                tops.append(sample.top)
+        row_tops = unique_row_tops(tops)
+        # Rekordbox exposes the browser's column-header band as a row-shaped
+        # Custom control.  It is always the first wide 22 px band and is not a
+        # draggable track.  Returning it caused an empty/header drag that left
+        # the target deck at "Not Loaded.".
+        return row_tops[1:] if row_tops else []
+
+    def _result_row_point(self, root, row_top: int) -> tuple[int, int]:
+        """Return a safe absolute hit point in the row's non-editable gutter."""
+        window = root.rectangle()
+        samples, _ = self._sample_controls(root)
+        return self._result_row_point_from_samples(samples, window, row_top)
+
+    @staticmethod
+    def _result_row_point_from_samples(
+        samples: list[ControlSample],
+        window,
+        row_top: int,
+    ) -> tuple[int, int]:
+        width = window.width()
+        candidates = []
+        for sample in samples:
+            if (
+                abs(sample.top - row_top) <= 1
+                and 18 <= sample.bottom - sample.top <= 28
+                and sample.right - sample.left >= width * 0.75
+            ):
+                candidates.append(
+                    (sample.left, sample.top, sample.right, sample.bottom)
+                )
+        if candidates:
+            left, top, right, bottom = max(
+                candidates,
+                key=lambda item: item[2] - item[0],
+            )
+            # The title cell is editable.  Twelve pixels inside the wide row
+            # container lands in Rekordbox's selector/artwork gutter instead.
+            return (
+                window.left + left + min(12, max(1, right - left - 1)),
+                window.top + (top + bottom) // 2,
+            )
+        # Conservative fallback for layouts that do not expose the row Custom
+        # control: use the browser's far-left gutter, never the title column.
+        return (
+            window.left + int(window.width() * 0.18),
+            window.top + row_top + 10,
+        )
 
     def select_exact_track(
         self,
         title: str,
         *,
+        search_query: str | None = None,
         result_index: int | None = None,
-        timeout_seconds: float = 6.0,
+        timeout_seconds: float = 3.0,
     ) -> dict[str, Any]:
         root = self._root()
-        mode = self._mode(root)
+        descendants = root.descendants()
+        samples, window_width = self._sample_controls(root, descendants)
+        mode = self._mode_from_samples(samples)
         if mode.casefold() != "performance":
             raise RuntimeError(
                 f"Rekordbox must be in Performance mode, found {mode!r}"
             )
-        search = self._search_edit(root)
-        previous = self._set_clipboard_text(title)
+        collection_controls = [
+            sample.control
+            for sample in samples
+            if sample.control_type == "Text"
+            and normalize_title(sample.text) == "collection"
+        ]
+        if len(collection_controls) != 1:
+            raise RuntimeError(
+                "Expected one Rekordbox Collection browser source, "
+                f"found {len(collection_controls)}"
+            )
+        collection_controls[0].click_input()
+        time.sleep(0.15)
+        search_controls = [
+            sample.control
+            for sample in samples
+            if sample.control_type == "Edit"
+            and 700 <= sample.top <= 780
+            and sample.left >= window_width - 350
+        ]
+        if len(search_controls) != 1:
+            raise RuntimeError(
+                "Expected one Rekordbox browser search field, "
+                f"found {len(search_controls)}"
+            )
+        search = search_controls[0]
+        query = search_query or title
+        previous = self._set_clipboard_text(query)
         try:
             root.set_focus()
             search.click_input()
-            send_keys("^a^v")
+            # Clear and paste as two settled operations. Rekordbox applies its
+            # browser filter asynchronously; a combined Ctrl+A/Ctrl+V could
+            # leave the previous result rows visible long enough to be
+            # mistaken for the new query, and restoring the clipboard
+            # immediately could race the paste on busy UI threads.
+            send_keys("^a{BACKSPACE}")
+            time.sleep(0.08)
+            send_keys("^v")
+            time.sleep(0.12)
         finally:
             self._restore_clipboard_text(previous)
 
+        # Rekordbox updates the result grid asynchronously. A short fixed
+        # settle avoids accepting geometry left over from the previous query.
+        time.sleep(0.25)
         deadline = time.monotonic() + timeout_seconds
         rows: list[int] = []
+        result_samples: list[ControlSample] = []
         while time.monotonic() < deadline:
-            rows = self._result_rows(root)
+            descendants = root.descendants()
+            result_samples, window_width = self._sample_browser_rows(
+                root,
+                descendants,
+            )
+            rows = self._result_rows_from_samples(
+                result_samples,
+                window_width,
+            )
             if rows:
                 break
             time.sleep(0.1)
@@ -253,15 +487,80 @@ class RekordboxUIAdapter:
                 f"result_index must be between 0 and {len(rows) - 1}"
             )
         window = root.rectangle()
-        row_y = window.top + rows[result_index] + 10
-        row_x = window.left + int(window.width() * 0.45)
+        row_x, row_y = self._result_row_point_from_samples(
+            result_samples,
+            window,
+            rows[result_index],
+        )
+        deck_drop_points = {}
+        for deck in (1, 2):
+            deck_samples = [
+                sample
+                for sample in samples
+                if sample.control_type == "Text"
+                and 260 <= sample.top <= 330
+                and sample.right - sample.left >= window.width() * 0.2
+                and (
+                    (deck == 1 and (sample.left + sample.right) / 2 < window.width() / 2)
+                    or (deck == 2 and (sample.left + sample.right) / 2 >= window.width() / 2)
+                )
+            ]
+            if deck_samples:
+                target = max(deck_samples, key=lambda item: item.right - item.left)
+                deck_drop_points[deck] = (
+                    window.left + (target.left + target.right) // 2,
+                    window.top + (target.top + target.bottom) // 2,
+                )
         root.click_input(coords=(row_x - window.left, row_y - window.top))
         return {
             "title": title,
+            "search_query": query,
             "result_count": len(rows),
             "result_index": result_index,
             "selected_row_top": rows[result_index],
+            "selected_row_point": (row_x, row_y),
+            "deck_drop_points": deck_drop_points,
             "focused": True,
+        }
+
+    def drag_selected_track_to_deck(
+        self,
+        *,
+        selected_row_top: int,
+        deck: int,
+        selected_row_point: tuple[int, int] | None = None,
+        deck_drop_point: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
+        """Load the selected browser row by dragging it onto a stopped deck."""
+        if deck not in (1, 2):
+            raise ValueError("deck must be 1 or 2")
+        root = self._root()
+        window = root.rectangle()
+        source = selected_row_point or self._result_row_point(
+            root,
+            selected_row_top,
+        )
+        target = deck_drop_point or (
+            window.left + int(window.width() * (0.25 if deck == 1 else 0.75)),
+            window.top + min(310, int(window.height() * 0.3)),
+        )
+        root.set_focus()
+        mouse.move(coords=source)
+        mouse.press(button="left", coords=source)
+        time.sleep(0.25)
+        for step in range(1, 7):
+            point = (
+                source[0] + (target[0] - source[0]) * step // 6,
+                source[1] + (target[1] - source[1]) * step // 6,
+            )
+            mouse.move(coords=point)
+            time.sleep(0.06)
+        mouse.release(button="left", coords=target)
+        return {
+            "deck": deck,
+            "source": source,
+            "target": target,
+            "method": "drag_to_deck",
         }
 
     def _deck_controls(
@@ -272,11 +571,14 @@ class RekordboxUIAdapter:
     ) -> list[Any]:
         if deck not in (1, 2):
             raise ValueError("deck must be 1 or 2")
-        width = root.rectangle().width()
+        window = root.rectangle()
+        width = window.width()
         midpoint = width / 2
         controls = []
         for control in descendants or root.descendants():
-            left, _, right, _ = self._relative_rectangle(root, control)
+            rectangle = control.rectangle()
+            left = rectangle.left - window.left
+            right = rectangle.right - window.left
             center = (left + right) / 2
             if (deck == 1 and center < midpoint) or (
                 deck == 2 and center >= midpoint
@@ -310,12 +612,12 @@ class RekordboxUIAdapter:
 
     def _deck_snapshot(
         self,
-        root,
-        descendants: list[Any],
+        samples: list[ControlSample],
         image: Image.Image,
         deck: int,
+        window_width: int,
     ) -> DeckSnapshot:
-        controls = self._deck_controls(root, deck, descendants)
+        midpoint = window_width / 2
         title_candidates = []
         artist_candidates = []
         bpm = None
@@ -323,14 +625,21 @@ class RekordboxUIAdapter:
         elapsed = None
         sync = None
         quantize = None
-        for control in controls:
-            left, top, right, _ = self._relative_rectangle(root, control)
-            text = control.window_text()
-            control_type = getattr(control.element_info, "control_type", None)
+        for sample in samples:
+            left = sample.left
+            top = sample.top
+            right = sample.right
+            text = sample.text
+            control_type = sample.control_type
+            center = (left + right) / 2
+            if (deck == 1 and center >= midpoint) or (
+                deck == 2 and center < midpoint
+            ):
+                continue
             if (
                 control_type == "Text"
                 and 260 <= top <= 310
-                and right - left >= root.rectangle().width() * 0.2
+                and right - left >= window_width * 0.2
                 and text
             ):
                 title_candidates.append((right - left, text))
@@ -368,9 +677,13 @@ class RekordboxUIAdapter:
                 elif not stripped.startswith("-") and ":" not in stripped:
                     artist_candidates.append((left, stripped))
             if text == "BEAT\nSYNC":
-                sync = self._button_active(root, control, image)
+                sync = blue_ratio(
+                    image.crop((left, sample.top, right, sample.bottom))
+                ) >= 0.25
             if text == "Q" and 420 <= top <= 500:
-                quantize = self._button_active(root, control, image)
+                quantize = blue_ratio(
+                    image.crop((left, sample.top, right, sample.bottom))
+                ) >= 0.25
         title = max(title_candidates, default=(0, ""))[1]
         artist = min(artist_candidates, default=(0, ""))[1]
         return DeckSnapshot(
@@ -386,17 +699,19 @@ class RekordboxUIAdapter:
 
     def deck_snapshot(self, deck: int) -> DeckSnapshot:
         root = self._root()
-        descendants = root.descendants()
+        descendants = self._status_controls(root)
+        samples, window_width = self._sample_controls(root, descendants)
         image = self._capture_focused(root)
-        return self._deck_snapshot(root, descendants, image, deck)
+        return self._deck_snapshot(samples, image, deck, window_width)
 
     def deck_is_playing(
         self,
         deck: int,
         *,
         sample_seconds: float = 1.1,
+        initial: DeckSnapshot | None = None,
     ) -> bool:
-        first = self.deck_snapshot(deck)
+        first = initial or self.deck_snapshot(deck)
         time.sleep(sample_seconds)
         second = self.deck_snapshot(deck)
         if first.title != second.title:
@@ -416,28 +731,46 @@ class RekordboxUIAdapter:
         timeout_seconds: float = 8.0,
     ) -> DeckSnapshot:
         deadline = time.monotonic() + timeout_seconds
-        last = self.deck_snapshot(deck)
+        last: DeckSnapshot | None = None
+        last_error: RuntimeError | None = None
         while time.monotonic() < deadline:
+            try:
+                last = self.deck_snapshot(deck)
+                last_error = None
+            except RuntimeError as exc:
+                last_error = exc
+                time.sleep(0.1)
+                continue
             if normalize_title(last.title) == normalize_title(expected_title):
                 return last
             time.sleep(0.25)
-            last = self.deck_snapshot(deck)
+        if (
+            last is not None
+            and normalize_title(last.title) == normalize_title(expected_title)
+        ):
+            return last
+        if last is None and last_error is not None:
+            raise RuntimeError(
+                f"Deck {deck} could not be observed while waiting for "
+                f"{expected_title!r}: {last_error}"
+            ) from last_error
         raise RuntimeError(
             f"Deck {deck} loaded {last.title!r}, expected {expected_title!r}"
         )
 
     def status(self) -> dict[str, Any]:
         root = self._root()
-        descendants = root.descendants()
+        descendants = self._status_controls(root)
+        samples, window_width = self._sample_controls(root, descendants)
         image = self._capture_focused(root)
         return {
-            "mode": self._mode(root),
+            "mode": self._mode_from_samples(samples),
             "decks": [
                 self._deck_snapshot(
-                    root,
-                    descendants,
+                    samples,
                     image,
                     deck,
+                    window_width,
                 ).public()
                 for deck in (1, 2)
             ],

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from rekordbox_performer.intelligence import (
@@ -17,6 +18,9 @@ from rekordbox_performer.intelligence import (
     SetPlan,
     audit_set_plan,
     compile_transition_card,
+    camelot_compatibility,
+    normalize_camelot,
+    validate_transition_card,
 )
 
 
@@ -67,6 +71,12 @@ def prepared_profile(track_id: str, title: str) -> TrackProfile:
             TrackLandmark(
                 name="bass entry",
                 kind="bass_in",
+                bar=17,
+                confidence="verified",
+            ),
+            TrackLandmark(
+                name="verified drop",
+                kind="drop",
                 bar=17,
                 confidence="verified",
             ),
@@ -138,8 +148,95 @@ def valid_card() -> TransitionCard:
 def test_ready_profile_requires_vocal_map() -> None:
     profile = prepared_profile("a", "A")
     assert profile.readiness()["ready"] is True
+    assert profile.readiness()["tier"] == "A"
     profile.segments = []
     assert profile.readiness()["checks"]["vocals"] is False
+    assert profile.readiness()["tier"] == "B"
+
+
+def test_normalize_camelot_accepts_rekordbox_and_note_keys() -> None:
+    assert normalize_camelot("7A") == "7A"
+    assert normalize_camelot("Ebm") == "2A"
+    assert normalize_camelot("F#") == "2B"
+    assert normalize_camelot(None) is None
+
+
+def test_camelot_compatibility_rejects_seven_a_to_two_a() -> None:
+    result = camelot_compatibility("7A", "Ebm")
+    assert result["outgoing"] == "7A"
+    assert result["incoming"] == "2A"
+    assert result["compatible"] is False
+
+
+def test_card_rejects_incompatible_harmonic_move_by_default() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    outgoing.key = "7A"
+    incoming.key = "Ebm"
+    errors = validate_transition_card(valid_card(), outgoing, incoming)
+    assert any("7A -> 2A" in error for error in errors)
+
+
+def test_card_can_explicitly_accept_harmonic_risk() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    outgoing.key = "7A"
+    incoming.key = "2A"
+    card = valid_card()
+    card.harmonic_risk_accepted = True
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert not any("harmonic" in error for error in errors)
+
+
+def test_live_state_rolls_rounded_phase_into_next_beat() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            track_beat=1,
+            beat_phase=0.99996,
+            source="native",
+            confidence="high",
+        )
+    )
+
+    current = state.get(1)
+    assert current["track_beat"] == 2
+    assert current["beat"] == 2
+    assert current["beat_phase"] == 0.0
+
+
+def test_phrase_cut_can_launch_verified_file_start_without_hot_cue() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.transition_family = "phrase_cut"
+    card.events[0] = MusicalEvent(
+        bar_offset=0,
+        action="play_pause",
+        parameters={"deck": 2},
+    )
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert not any("launch" in error.lower() for error in errors)
+
+
+def test_bass_swap_still_requires_verified_hot_cue() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.events[0] = MusicalEvent(
+        bar_offset=0,
+        action="play_pause",
+        parameters={"deck": 2},
+    )
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert any("requires a verified Hot Cue" in error for error in errors)
 
 
 def test_card_compiles_to_next_phrase_boundary() -> None:
@@ -228,7 +325,108 @@ def test_card_rejects_unverified_vocal_plan() -> None:
         state,
     )
     assert compiled["ready"] is False
-    assert "vocal plan is not verified" in compiled["errors"]
+    assert (
+        "vocal plan is not verified and vocal risk is not accepted"
+        in compiled["errors"]
+    )
+
+
+def test_card_accepts_explicit_vocal_risk_without_vocal_segments() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    outgoing.segments = [
+        segment for segment in outgoing.segments if segment.kind != "vocal"
+    ]
+    incoming.segments = [
+        segment for segment in incoming.segments if segment.kind != "vocal"
+    ]
+    outgoing.vocal_confidence = "unknown"
+    incoming.vocal_confidence = "unknown"
+    card = valid_card()
+    card.vocal_plan_verified = False
+    card.vocal_risk_accepted = True
+
+    compiled = compile_transition_card(card, outgoing, incoming, state)
+
+    assert compiled["ready"] is True
+
+
+def test_intentional_overlap_is_backward_compatible_vocal_risk_acceptance() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    for profile in (outgoing, incoming):
+        profile.segments = [
+            segment for segment in profile.segments if segment.kind != "vocal"
+        ]
+        profile.vocal_confidence = "unknown"
+    card = valid_card()
+    card.intended_vocal_owner = "intentional_overlap"
+
+    compiled = compile_transition_card(card, outgoing, incoming, state)
+
+    assert compiled["ready"] is True
 
 
 def test_profile_and_rehearsal_store(tmp_path: Path) -> None:
@@ -252,6 +450,33 @@ def test_profile_and_rehearsal_store(tmp_path: Path) -> None:
     stored = store.record_rehearsal(review)
     assert stored["score"] >= 8
     assert store.rehearsal_summary("a", "b")["count"] == 1
+
+
+def test_profile_store_clients_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    first = ProfileStore(tmp_path)
+    second = ProfileStore(tmp_path)
+
+    first.upsert(prepared_profile("a", "A"))
+    second.upsert(prepared_profile("b", "B"))
+
+    assert first.get("a").title == "A"
+    assert first.get("b").title == "B"
+    assert second.audit(["a", "b"])["ready"] is True
+
+
+def test_profile_store_migrates_legacy_json_once(tmp_path: Path) -> None:
+    legacy = prepared_profile("legacy", "Legacy")
+    (tmp_path / "track-profiles.json").write_text(
+        json.dumps({"legacy": legacy.model_dump()}),
+        encoding="utf-8",
+    )
+
+    store = ProfileStore(tmp_path)
+    assert store.get("legacy").title == "Legacy"
+
+    (tmp_path / "track-profiles.json").write_text("{}", encoding="utf-8")
+    reopened = ProfileStore(tmp_path)
+    assert reopened.get("legacy").title == "Legacy"
 
 
 def test_playlist_seed_preserves_verified_profile(tmp_path: Path) -> None:
@@ -314,6 +539,29 @@ def test_complete_set_plan_audit(tmp_path: Path) -> None:
         cards=[valid_card()],
     )
     result = audit_set_plan(plan, store)
+    assert result["ready"] is True
+
+
+def test_set_plan_audit_accepts_only_waived_vocal_gap(tmp_path: Path) -> None:
+    store = ProfileStore(tmp_path)
+    for track_id, title in (("a", "A"), ("b", "B")):
+        profile = prepared_profile(track_id, title)
+        profile.segments = [
+            segment for segment in profile.segments if segment.kind != "vocal"
+        ]
+        profile.vocal_confidence = "unknown"
+        store.upsert(profile)
+    card = valid_card()
+    card.vocal_plan_verified = False
+    card.vocal_risk_accepted = True
+    plan = SetPlan(
+        name="two tracks with accepted vocal risk",
+        track_ids=["a", "b"],
+        cards=[card],
+    )
+
+    result = audit_set_plan(plan, store)
+
     assert result["ready"] is True
 
 
@@ -628,6 +876,35 @@ def test_card_rejects_unverified_incoming_launch_cue() -> None:
     )
 
 
+def test_bass_swap_rejects_critical_bar_without_verified_drop() -> None:
+    incoming = prepared_profile("b", "B")
+    incoming.landmarks = [
+        landmark for landmark in incoming.landmarks if landmark.kind != "drop"
+    ]
+    errors = validate_transition_card(
+        valid_card(),
+        prepared_profile("a", "A"),
+        incoming,
+    )
+    assert (
+        "critical bass swap does not land on a verified incoming drop"
+        in errors
+    )
+
+
+def test_tempo_mismatch_requires_verified_beat_sync() -> None:
+    incoming = prepared_profile("b", "B")
+    incoming.bpm = 129
+    card = valid_card()
+    card.beat_sync_required = False
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        incoming,
+    )
+    assert "tempo-mismatched tracks require verified Beat Sync" in errors
+
+
 def test_card_rejects_manual_clock_and_playing_incoming_deck() -> None:
     state = LiveState()
     state.update(
@@ -737,3 +1014,88 @@ def test_phrase_compiler_respects_non_bar_one_boundary() -> None:
     assert compiled["ready"] is True
     assert compiled["start_track_beat"] == 67
     assert compiled["start_beat_in_bar"] == 3
+
+
+def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
+    outgoing = prepared_profile("a", "A")
+    outgoing.landmarks.append(
+        TrackLandmark(
+            name="bridge",
+            kind="phrase_start",
+            bar=65,
+            beat=1,
+            cue=2,
+            confidence="verified",
+        )
+    )
+    card = valid_card()
+    card.beat_sync_required = False
+    card.critical_bar_offset = 4
+    incoming = prepared_profile("b", "B")
+    incoming.landmarks.append(
+        TrackLandmark(
+            name="short-entry drop",
+            kind="drop",
+            bar=5,
+            confidence="verified",
+        )
+    )
+    card.events = [
+        MusicalEvent(
+            bar_offset=0,
+            action="hot_cue",
+            parameters={"deck": 1, "cue": 2},
+        ),
+        MusicalEvent(
+            bar_offset=0,
+            action="hot_cue",
+            parameters={"deck": 2, "cue": 1},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="eq_low",
+            parameters={"deck": 1, "value": -1},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="eq_low",
+            parameters={"deck": 2, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            action="channel_fader",
+            parameters={"deck": 1, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            beat_offset=1,
+            action="cue",
+            parameters={"deck": 1},
+        ),
+    ]
+    state = LiveState()
+    for deck, track_id in ((1, "a"), (2, "b")):
+        state.update(
+            DeckObservation(
+                deck=deck,
+                track_id=track_id,
+                title=track_id.upper(),
+                bpm=128,
+                playing=False,
+                bar=1,
+                beat=1,
+                source="native",
+                confidence="verified",
+                sync_enabled=False,
+                quantize_enabled=True,
+            )
+        )
+
+    compiled = compile_transition_card(card, outgoing, incoming, state)
+
+    assert compiled["ready"] is True
+    assert compiled["start_basis"] == "verified_dual_hot_cue"
+    assert compiled["start_bar"] == 65
+    assert compiled["events"][0]["at_ms"] == 250
+    assert compiled["events"][1]["at_ms"] == 250
+    assert compiled["events"][2]["at_ms"] == 7750

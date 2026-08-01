@@ -6,7 +6,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .engine import MidiEngine
 from .protocol import encode_action
@@ -14,6 +14,17 @@ from .protocol import encode_action
 
 MAX_EVENTS = 500
 MAX_DURATION_MS = 15 * 60 * 1000
+
+
+def percentile(values: list[float], percent: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(
+        len(ordered) - 1,
+        max(0, round((len(ordered) - 1) * percent)),
+    )
+    return ordered[index]
 
 
 @dataclass
@@ -29,6 +40,16 @@ class TransitionJob:
     error: str | None = None
     event_lateness_ms: list[float] = field(default_factory=list, repr=False)
     task: asyncio.Task | None = field(default=None, repr=False)
+    completion_verifier: Callable[[], dict[str, Any]] | None = field(
+        default=None,
+        repr=False,
+    )
+    event_observer: Callable[[dict[str, Any], float], None] | None = field(
+        default=None,
+        repr=False,
+    )
+    verification: dict[str, Any] | None = None
+    execution_id: str | None = None
 
     def public(self) -> dict[str, Any]:
         average_lateness = (
@@ -38,6 +59,7 @@ class TransitionJob:
         )
         return {
             "id": self.id,
+            "execution_id": self.execution_id,
             "name": self.name,
             "status": self.status,
             "created_at": self.created_at,
@@ -50,6 +72,18 @@ class TransitionJob:
                 max(self.event_lateness_ms, default=0.0),
                 2,
             ),
+            "p95_event_lateness_ms": round(
+                percentile(self.event_lateness_ms, 0.95),
+                2,
+            ),
+            "p99_event_lateness_ms": round(
+                percentile(self.event_lateness_ms, 0.99),
+                2,
+            ),
+            "events_over_10ms_late": sum(
+                value > 10.0 for value in self.event_lateness_ms
+            ),
+            "verification": self.verification,
             "error": self.error,
         }
 
@@ -85,6 +119,7 @@ class TransitionScheduler:
     def __init__(self, engine: MidiEngine) -> None:
         self.engine = engine
         self.jobs: dict[str, TransitionJob] = {}
+        self.execution_jobs: dict[str, str] = {}
 
     def preview(
         self, name: str, events: list[dict[str, Any]]
@@ -99,19 +134,42 @@ class TransitionScheduler:
         }
 
     def start(
-        self, name: str, events: list[dict[str, Any]]
+        self,
+        name: str,
+        events: list[dict[str, Any]],
+        *,
+        completion_verifier: Callable[[], dict[str, Any]] | None = None,
+        event_observer: Callable[[dict[str, Any], float], None] | None = None,
+        execution_id: str | None = None,
     ) -> dict[str, Any]:
         if not self.engine.is_armed():
             raise RuntimeError("Live MIDI control must be armed before scheduling")
         normalized = validate_events(events)
+        if execution_id is not None:
+            execution_id = execution_id.strip()
+            if not execution_id:
+                raise ValueError("execution_id must not be blank")
+            existing_id = self.execution_jobs.get(execution_id)
+            if existing_id is not None:
+                existing = self.jobs[existing_id]
+                if existing.name != name or existing.events != normalized:
+                    raise RuntimeError(
+                        "execution_id is already bound to a different transition"
+                    )
+                return {**existing.public(), "deduplicated": True}
         job = TransitionJob(
             id=uuid.uuid4().hex,
             name=name,
             events=normalized,
+            completion_verifier=completion_verifier,
+            event_observer=event_observer,
+            execution_id=execution_id,
         )
         self.jobs[job.id] = job
+        if execution_id is not None:
+            self.execution_jobs[execution_id] = job.id
         job.task = asyncio.create_task(self._run(job))
-        return job.public()
+        return {**job.public(), "deduplicated": False}
 
     async def _run(self, job: TransitionJob) -> None:
         job.status = "running"
@@ -139,15 +197,28 @@ class TransitionScheduler:
                     job.event_lateness_ms.append(
                         max(0.0, (time.monotonic() - target) * 1000)
                     )
+                    dispatched_monotonic = time.monotonic()
                     await self.engine.send_action(
                         event["action"], event["parameters"]
                     )
+                    if job.event_observer is not None:
+                        job.event_observer(event, dispatched_monotonic)
                     job.completed_events += 1
 
                 # Events sharing a musical timestamp must reach MIDI together.
                 # Serial button holds otherwise skew simultaneous Hot Cues and
                 # two-deck bass swaps by the note-hold duration.
                 await asyncio.gather(*(dispatch(event) for event in group))
+            if job.completion_verifier is not None:
+                job.status = "verifying"
+                job.verification = await asyncio.to_thread(
+                    job.completion_verifier
+                )
+                if not job.verification.get("verified", False):
+                    raise RuntimeError(
+                        "Rekordbox did not satisfy transition postconditions: "
+                        + "; ".join(job.verification.get("errors", []))
+                    )
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -178,3 +249,25 @@ class TransitionScheduler:
                 job.task.cancel()
                 cancelled.append(job.public())
         return cancelled
+
+    def metrics(self) -> dict[str, Any]:
+        jobs = list(self.jobs.values())
+        lateness = [
+            value
+            for job in jobs
+            for value in job.event_lateness_ms
+        ]
+        return {
+            "job_count": len(jobs),
+            "completed_jobs": sum(job.status == "completed" for job in jobs),
+            "failed_jobs": sum(job.status == "failed" for job in jobs),
+            "active_jobs": sum(
+                job.status in {"scheduled", "running", "verifying"}
+                for job in jobs
+            ),
+            "event_count": len(lateness),
+            "p95_event_lateness_ms": round(percentile(lateness, 0.95), 2),
+            "p99_event_lateness_ms": round(percentile(lateness, 0.99), 2),
+            "max_event_lateness_ms": round(max(lateness, default=0.0), 2),
+            "events_over_10ms_late": sum(value > 10.0 for value in lateness),
+        }

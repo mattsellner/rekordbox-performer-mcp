@@ -9,7 +9,9 @@ from typing import Any, Protocol
 
 import mido
 
+from .intelligence import default_data_dir
 from .protocol import CONTINUOUS_ACTIONS, encode_action
+from .runtime import ControlLease
 
 
 DEFAULT_PORT_NAME = "Codex Rekordbox Performer"
@@ -24,11 +26,14 @@ class MidiOutput(Protocol):
 
 
 class MidiEngine:
-    def __init__(self) -> None:
+    def __init__(self, lease: ControlLease | None = None) -> None:
         self.output: MidiOutput | None = None
         self.port_name: str | None = None
         self.armed_until = 0.0
         self.sent_messages = 0
+        self.lease = lease or ControlLease(
+            default_data_dir() / "live-midi-control.lock"
+        )
 
     @staticmethod
     def list_output_ports() -> list[str]:
@@ -51,9 +56,16 @@ class MidiEngine:
                 f"Expected one MIDI output matching '{requested_name}', found "
                 f"{len(matches)}. Available outputs: {available}"
             )
+        if self.output is not None and self.port_name == matches[0]:
+            return self.status()
         self.disconnect()
-        self.output = mido.open_output(matches[0])
-        self.port_name = matches[0]
+        self.lease.acquire()
+        try:
+            self.output = mido.open_output(matches[0])
+            self.port_name = matches[0]
+        except Exception:
+            self.lease.release()
+            raise
         return self.status()
 
     def disconnect(self) -> None:
@@ -62,6 +74,7 @@ class MidiEngine:
             self.output.close()
         self.output = None
         self.port_name = None
+        self.lease.release()
 
     def arm(self, seconds: int = 300) -> dict[str, Any]:
         if self.output is None:
@@ -142,5 +155,5 @@ class MidiEngine:
             "armed": self.is_armed(),
             "armed_seconds_remaining": round(remaining, 1),
             "sent_messages": self.sent_messages,
+            "control_lease": self.lease.status(),
         }
-
