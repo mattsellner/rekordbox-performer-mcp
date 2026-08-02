@@ -32,3 +32,17 @@ def test_mapping_has_rekordbox_shape() -> None:
         "MixPointSelectPrev", "MixPointSelectNext", "MixPointLink",
         "ActivePartVocal", "ActivePartInst", "ActivePartDrums",
     } <= names
+
+    stem_rows = {
+        row[0]: row
+        for row in rows[2:]
+        if row[0] in {"ActivePartVocal", "ActivePartInst", "ActivePartDrums"}
+    }
+    assert set(stem_rows) == {
+        "ActivePartVocal", "ActivePartInst", "ActivePartDrums"
+    }
+    for row in stem_rows.values():
+        assert row[2] == "Pad"
+        assert row[3] == ""
+        assert row[4] and row[5]
+        assert row[8:13] == ["", "", "", "", ""]

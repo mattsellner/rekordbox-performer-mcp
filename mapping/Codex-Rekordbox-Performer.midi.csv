@@ -2,9 +2,9 @@
 #name,function,type,input,deck1,deck2,deck3,deck4,output,deck1,deck2,deck3,deck4,option,comment
 AutoLoop,AutoLoop,Button,,9005,9105,,,,,,,,,Toggle auto loop
 AutoLoop,4BeatLoop,Button,,9008,9108,,,,,,,,,Set or toggle 4-beat loop
-ActivePartDrums,ActivePartDrums,Button,,902E,912E,,,,902E,912E,,,,Toggle drums stem
-ActivePartInst,ActivePartInst,Button,,902D,912D,,,,902D,912D,,,,Toggle instrumental stem
-ActivePartVocal,ActivePartVocal,Button,,902C,912C,,,,902C,912C,,,,Toggle vocal stem
+ActivePartDrums,ActivePartDrums,Pad,,902E,912E,,,,,,,,,Toggle drums stem
+ActivePartInst,ActivePartInst,Pad,,902D,912D,,,,,,,,,Toggle instrumental stem
+ActivePartVocal,ActivePartVocal,Pad,,902C,912C,,,,,,,,,Toggle vocal stem
 Back,Back,Button,9204,,,,,,,,,,,Close current folder
 BrowseDown,BrowseDown,Button,9201,,,,,,,,,,,Browse one item down
 BrowseUp,BrowseUp,Button,9200,,,,,,,,,,,Browse one item up
