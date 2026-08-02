@@ -29,6 +29,35 @@ def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
     assert snapshot.bpm == 123.44
 
 
+def test_deck_snapshot_does_not_overwrite_right_jog_bpm_with_file_bpm() -> None:
+    samples = [
+        ControlSample(None, "Text", "123.44", 1095, 451, 1149, 474),
+        ControlSample(None, "Text", "123.00", 1085, 474, 1119, 485),
+    ]
+    snapshot = RekordboxUIAdapter()._deck_snapshot(
+        samples,
+        Image.new("RGB", (1902, 999)),
+        deck=2,
+        window_width=1902,
+    )
+    assert snapshot.bpm == 123.44
+
+
+def test_deck_snapshot_accepts_edit_control_for_left_jog_bpm() -> None:
+    samples = [
+        ControlSample(None, "Text", "121.00", 180, 302, 224, 316),
+        ControlSample(None, "Edit", "123.44", 763, 451, 817, 474),
+        ControlSample(None, "Text", "2.0", 753, 474, 779, 485),
+    ]
+    snapshot = RekordboxUIAdapter()._deck_snapshot(
+        samples,
+        Image.new("RGB", (1902, 999)),
+        deck=1,
+        window_width=1902,
+    )
+    assert snapshot.bpm == 123.44
+
+
 def test_deck_snapshot_derives_live_bpm_from_pitch_when_jog_bpm_is_omitted() -> None:
     samples = [
         ControlSample(None, "Text", "121.00", 180, 302, 224, 316),

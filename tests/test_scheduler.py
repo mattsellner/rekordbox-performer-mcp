@@ -63,6 +63,26 @@ class FakeOutput:
         pass
 
 
+def test_engine_reports_last_commanded_continuous_state() -> None:
+    async def scenario() -> None:
+        engine = MidiEngine()
+        output = FakeOutput()
+        engine.output = output
+        engine.port_name = output.name
+        engine.arm(30)
+        await engine.send_action(
+            "channel_fader", {"deck": 2, "value": 0.55}
+        )
+        state = engine.status()["continuous_control_state"]
+        assert state["deck_2.channel_fader"]["value"] == 0.55
+        assert (
+            state["deck_2.channel_fader"]["verification"]
+            == "commanded_not_observed"
+        )
+
+    asyncio.run(scenario())
+
+
 def test_scheduler_executes_locally() -> None:
     async def scenario() -> None:
         engine = MidiEngine()

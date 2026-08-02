@@ -109,6 +109,10 @@ async def _guard_incoming_sync(
         # after transport has settled but before any audible fader event.
         await asyncio.sleep((launch_delay_ms + 1_500) / 1000.0)
         with deck_observer.exclusive_adapter():
+            # Rekordbox recreates jog-display controls when a stopped deck
+            # begins playing. Reacquire them so the guard reads playback BPM,
+            # not the analyzed BPM shown in the metadata row below it.
+            rekordbox_ui.invalidate_status_cache()
             first_status = rekordbox_ui.status()
             await asyncio.sleep(0.6)
             second_status = rekordbox_ui.status()
@@ -1219,6 +1223,59 @@ async def launch_staged_track(
     }
 
 
+async def _establish_opening_mixer_contract(
+    *, audible_deck: int
+) -> dict[str, Any]:
+    """Put every absolute MIDI mixer control in a known opening state.
+
+    Rekordbox's virtual-MIDI route has no feedback channel for absolute CCs.
+    Reasserting the complete contract immediately before launch makes the
+    commanded mixer state deterministic; visual deck state is verified by the
+    UI observer separately.
+    """
+    if audible_deck not in (1, 2):
+        raise ValueError("audible_deck must be 1 or 2")
+    actions: list[dict[str, Any]] = [
+        {"action": "crossfader", "parameters": {"value": 0}},
+    ]
+    for deck in (1, 2):
+        values = {
+            "channel_fader": 1 if deck == audible_deck else 0,
+            "gain": 0,
+            "eq_high": 0,
+            "eq_mid": 0,
+            "eq_low": 0,
+            "filter": 0,
+            "tempo": 0,
+            "fx_wet_dry": 0,
+        }
+        actions.extend(
+            {
+                "action": action,
+                "parameters": {"deck": deck, "value": value},
+            }
+            for action, value in values.items()
+        )
+    dispatched = []
+    for item in actions:
+        dispatched.append(
+            {
+                **item,
+                "messages": await engine.send_action(
+                    item["action"], item["parameters"]
+                ),
+            }
+        )
+    return {
+        "audible_deck": audible_deck,
+        "controls": dispatched,
+        "fx_toggle_safety": (
+            "FX wet/dry is zero on both decks; toggle position cannot make "
+            "an effect audible until a scheduled wet/dry event occurs."
+        ),
+    }
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def launch_and_schedule_opening_transition(
     card: TransitionCard,
@@ -1272,6 +1329,10 @@ async def launch_and_schedule_opening_transition(
             raise RuntimeError(f"Deck {deck} is already playing")
         if second.get("elapsed_seconds") is None or second["elapsed_seconds"] > 1:
             raise RuntimeError(f"Deck {deck} is not staged at file start")
+
+    mixer_contract = await _establish_opening_mixer_contract(
+        audible_deck=card.outgoing_deck
+    )
 
     for deck, profile, title in (
         (card.outgoing_deck, outgoing_profile, outgoing_title),
@@ -1342,6 +1403,7 @@ async def launch_and_schedule_opening_transition(
             "ready": False,
             "started": False,
             "errors": mode_errors,
+            "mixer_contract": mixer_contract,
             "master_messages": master_messages,
             "outgoing_modes": outgoing_modes,
             "incoming_modes": incoming_modes,
@@ -1381,6 +1443,7 @@ async def launch_and_schedule_opening_transition(
             "ready": False,
             "started": True,
             "errors": scheduled.get("errors", ["first transition was not scheduled"]),
+            "mixer_contract": mixer_contract,
             "launch": launch,
             "refresh": refreshed,
             "schedule": scheduled,
@@ -1390,6 +1453,7 @@ async def launch_and_schedule_opening_transition(
         "ready": True,
         "started": True,
         "session": set_sessions.start(),
+        "mixer_contract": mixer_contract,
         "master_messages": master_messages,
         "outgoing_modes": outgoing_modes,
         "incoming_modes": incoming_modes,

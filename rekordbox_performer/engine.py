@@ -32,6 +32,7 @@ class MidiEngine:
         self.armed_until = 0.0
         self.job_armed_until = 0.0
         self.sent_messages = 0
+        self.continuous_control_state: dict[str, dict[str, Any]] = {}
         self.lease = lease or ControlLease(
             default_data_dir() / "live-midi-control.lock"
         )
@@ -133,6 +134,15 @@ class MidiEngine:
             descriptions.append(str(item.message))
             if item.delay_after_ms:
                 await asyncio.sleep(item.delay_after_ms / 1000)
+        if action in CONTINUOUS_ACTIONS:
+            parameters = dict(parameters or {})
+            deck = parameters.get("deck")
+            key = f"deck_{deck}.{action}" if deck is not None else action
+            self.continuous_control_state[key] = {
+                "value": float(parameters["value"]),
+                "commanded_at": time.time(),
+                "verification": "commanded_not_observed",
+            }
         return descriptions
 
     async def send_learn_signal(
@@ -172,5 +182,6 @@ class MidiEngine:
             "armed_seconds_remaining": round(remaining, 1),
             "job_armed_seconds_remaining": round(job_remaining, 1),
             "sent_messages": self.sent_messages,
+            "continuous_control_state": dict(self.continuous_control_state),
             "control_lease": self.lease.status(),
         }

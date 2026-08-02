@@ -202,7 +202,26 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
     assert result["ready"] is True
     assert result["started"] is True
     assert result["schedule"]["job"]["id"] == "job-1"
-    assert engine.actions == ["master"]
+    assert engine.actions == [
+        "crossfader",
+        "channel_fader",
+        "gain",
+        "eq_high",
+        "eq_mid",
+        "eq_low",
+        "filter",
+        "tempo",
+        "fx_wet_dry",
+        "channel_fader",
+        "gain",
+        "eq_high",
+        "eq_mid",
+        "eq_low",
+        "filter",
+        "tempo",
+        "fx_wet_dry",
+        "master",
+    ]
 
 
 def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(
@@ -211,6 +230,10 @@ def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(
     class GuardUI:
         def __init__(self) -> None:
             self.calls = 0
+            self.invalidated = False
+
+        def invalidate_status_cache(self) -> None:
+            self.invalidated = True
 
         def status(self) -> dict:
             self.calls += 1

@@ -208,7 +208,7 @@ class RekordboxUIAdapter:
             if (
                 (control_type == "ComboBox" and 0 <= top <= 70)
                 or (
-                    control_type in {"Text", "Button", "Custom"}
+                    control_type in {"Text", "Edit", "Button", "Custom"}
                     and (250 <= top <= 335 or 410 <= top <= 510)
                 )
             ):
@@ -216,6 +216,16 @@ class RekordboxUIAdapter:
         self._status_control_cache = controls
         self._status_cache_signature = signature
         return controls
+
+    def invalidate_status_cache(self) -> None:
+        """Force the next status read to reacquire Rekordbox UIA controls.
+
+        Rekordbox can recreate the large live-BPM controls when transport or
+        deck content changes. Holding the old UIA objects would silently turn
+        a live-clock observation back into analyzed-file metadata.
+        """
+        self._status_control_cache = None
+        self._status_cache_signature = None
 
     @staticmethod
     def _mode_from_samples(samples: list[ControlSample]) -> str:
@@ -689,7 +699,7 @@ class RekordboxUIAdapter:
             # Rekordbox exposes the large jog-display BPM separately from the
             # analyzed/native BPM in the metadata row.  This is the scheduler
             # clock after tempo and Beat Sync are applied.
-            if control_type == "Text" and 430 <= top <= 475 and text:
+            if control_type in {"Text", "Edit"} and 430 <= top < 470 and text:
                 try:
                     numeric = float(text.strip())
                 except ValueError:
