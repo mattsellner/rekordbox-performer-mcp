@@ -1230,11 +1230,9 @@ def compile_transition_card(
                 errors.append("incoming Beat Sync state is unobserved")
             elif not incoming_state["sync_enabled"]:
                 errors.append("incoming Beat Sync is off")
-            if abs(float(state["bpm"]) - float(incoming_state["bpm"])) > 0.05:
-                errors.append(
-                    "Beat Sync is indicated but deck BPMs do not match "
-                    f"({state['bpm']:.2f} vs {incoming_state['bpm']:.2f})"
-                )
+            # A stopped Rekordbox deck continues to display its analyzed/native
+            # BPM even with Sync armed.  Actual playback BPM is verified by the
+            # post-launch sync guard before the incoming fader may rise.
         if card.quantize_required:
             if incoming_state["quantize_enabled"] is None:
                 errors.append("incoming Quantize state is unobserved")

@@ -70,6 +70,8 @@ rekordbox_ui = RekordboxUIAdapter()
 deck_observer = SharedDeckObserver(rekordbox_ui, profile_store.data_dir)
 set_sessions = SetSessionManager(profile_store.data_dir / "active-set.json")
 verified_hot_cues: dict[tuple[int, str, int], dict[str, Any]] = {}
+sync_guard_tasks: set[asyncio.Task[Any]] = set()
+sync_guard_status: dict[str, dict[str, Any]] = {}
 VERIFIED_CUE_TTL_SECONDS = 15 * 60
 
 
@@ -87,6 +89,118 @@ def _transport_changed(
     before = first.get("elapsed_seconds")
     after = second.get("elapsed_seconds")
     return before is not None and after is not None and before != after
+
+
+async def _guard_incoming_sync(
+    *,
+    job_id: str,
+    card: TransitionCard,
+    launch_delay_ms: int,
+    outgoing_title: str,
+    incoming_title: str,
+) -> None:
+    """Abort an inaudible incoming deck if live Sync did not take effect."""
+    sync_guard_status[job_id] = {
+        "status": "waiting",
+        "launch_delay_ms": launch_delay_ms,
+    }
+    try:
+        # Cards keep the incoming fader at zero for at least four bars.  Check
+        # after transport has settled but before any audible fader event.
+        await asyncio.sleep((launch_delay_ms + 1_500) / 1000.0)
+        with deck_observer.exclusive_adapter():
+            first_status = rekordbox_ui.status()
+            await asyncio.sleep(0.6)
+            second_status = rekordbox_ui.status()
+        outgoing = _deck_record(second_status, card.outgoing_deck)
+        incoming_first = _deck_record(first_status, card.incoming_deck)
+        incoming = _deck_record(second_status, card.incoming_deck)
+        errors = []
+        if normalize_title(outgoing.get("title", "")) != normalize_title(
+            outgoing_title
+        ):
+            errors.append("outgoing title changed before sync guard")
+        if normalize_title(incoming.get("title", "")) != normalize_title(
+            incoming_title
+        ):
+            errors.append("incoming title changed before sync guard")
+        if not _transport_changed(incoming_first, incoming):
+            errors.append("incoming transport did not start")
+        if incoming.get("beat_sync_enabled") is not True:
+            errors.append("incoming Beat Sync is not confirmed on")
+        outgoing_bpm = outgoing.get("bpm")
+        incoming_bpm = incoming.get("bpm")
+        if outgoing_bpm is None or incoming_bpm is None:
+            errors.append("live deck BPM is unavailable")
+        elif abs(float(outgoing_bpm) - float(incoming_bpm)) > 0.05:
+            errors.append(
+                "live deck BPMs do not match "
+                f"({float(outgoing_bpm):.2f} vs {float(incoming_bpm):.2f})"
+            )
+        if errors:
+            scheduler.cancel(job_id)
+            await engine.send_action(
+                "channel_fader", {"deck": card.incoming_deck, "value": 0}
+            )
+            await engine.send_action(
+                "eq_low", {"deck": card.incoming_deck, "value": -1}
+            )
+            await engine.send_action("cue", {"deck": card.incoming_deck})
+            sync_guard_status[job_id] = {
+                "status": "failed_safe",
+                "errors": errors,
+                "observed": second_status,
+            }
+            return
+        sync_guard_status[job_id] = {
+            "status": "passed",
+            "errors": [],
+            "observed": second_status,
+        }
+    except asyncio.CancelledError:
+        sync_guard_status[job_id] = {"status": "cancelled"}
+        raise
+    except Exception as exc:
+        scheduler.cancel(job_id)
+        await engine.send_action(
+            "channel_fader", {"deck": card.incoming_deck, "value": 0}
+        )
+        await engine.send_action("cue", {"deck": card.incoming_deck})
+        sync_guard_status[job_id] = {
+            "status": "failed_safe",
+            "errors": [f"sync guard error: {exc}"],
+        }
+
+
+def _arm_sync_guard(
+    *,
+    job_id: str,
+    card: TransitionCard,
+    events: list[dict[str, Any]],
+    outgoing_title: str,
+    incoming_title: str,
+) -> dict[str, Any]:
+    launches = [
+        event
+        for event in events
+        if event.get("action") in {"play_pause", "hot_cue"}
+        and event.get("parameters", {}).get("deck") == card.incoming_deck
+    ]
+    if len(launches) != 1:
+        raise RuntimeError("sync guard requires exactly one incoming launch event")
+    launch_delay_ms = int(launches[0]["at_ms"])
+    task = asyncio.create_task(
+        _guard_incoming_sync(
+            job_id=job_id,
+            card=card,
+            launch_delay_ms=launch_delay_ms,
+            outgoing_title=outgoing_title,
+            incoming_title=incoming_title,
+        )
+    )
+    sync_guard_tasks.add(task)
+    task.add_done_callback(sync_guard_tasks.discard)
+    return {"status": "armed", "launch_delay_ms": launch_delay_ms}
 
 
 def _hot_cue_position_window(
@@ -641,19 +755,30 @@ async def perform_transition_card(
         ):
             launch_clock["incoming_monotonic"] = dispatched
 
+    job = scheduler.start(
+        card.name,
+        compiled["events"],
+        completion_verifier=lambda: _card_completion_verifier(
+            card,
+            launch_clock,
+        ),
+        event_observer=observe_dispatch,
+        execution_id=execution_id,
+    )
+    guard = None
+    if card.beat_sync_required:
+        guard = _arm_sync_guard(
+            job_id=job["id"],
+            card=card,
+            events=compiled["events"],
+            outgoing_title=profile_store.get(card.outgoing_track_id).title,
+            incoming_title=profile_store.get(card.incoming_track_id).title,
+        )
     return {
         **compiled,
         "cue_verification": cue_verification,
-        "job": scheduler.start(
-            card.name,
-            compiled["events"],
-            completion_verifier=lambda: _card_completion_verifier(
-                card,
-                launch_clock,
-            ),
-            event_observer=observe_dispatch,
-            execution_id=execution_id,
-        ),
+        "job": job,
+        "sync_guard": guard,
     }
 
 
@@ -1104,10 +1229,9 @@ async def launch_and_schedule_opening_transition(
     """Atomically launch track one and schedule the first handoff.
 
     The set is not considered started until both stopped decks are verified,
-    the audible deck is established as Master, Sync/Quantize are confirmed on
-    both decks, their displayed playback BPMs agree, and the first transition
-    job exists.  This removes model/tool round-trip latency from the opening
-    transition's runway.
+    Sync/Quantize are armed, the audible deck has started and been established
+    as Master, and the first transition job exists.  A post-launch sync guard
+    verifies the incoming deck's actual playing BPM before its fader may rise.
     """
     if not execution_id.strip():
         raise ValueError("execution_id is required")
@@ -1167,9 +1291,7 @@ async def launch_and_schedule_opening_transition(
             )
         )
 
-    master_messages = await engine.send_action(
-        "master", {"deck": card.outgoing_deck}
-    )
+    master_messages: list[Any] = []
     outgoing_modes = await ensure_deck_modes(
         deck=card.outgoing_deck,
         beat_sync=True if card.beat_sync_required else None,
@@ -1210,11 +1332,6 @@ async def launch_and_schedule_opening_transition(
             mode_errors.append("outgoing Beat Sync is not confirmed on")
         if incoming_state["sync_enabled"] is not True:
             mode_errors.append("incoming Beat Sync is not confirmed on")
-        if abs(outgoing_state["bpm"] - incoming_state["bpm"]) > 0.05:
-            mode_errors.append(
-                "displayed deck BPMs do not match "
-                f"({outgoing_state['bpm']:.2f} vs {incoming_state['bpm']:.2f})"
-            )
     if card.quantize_required:
         if outgoing_state["quantize_enabled"] is not True:
             mode_errors.append("outgoing Quantize is not confirmed on")
@@ -1236,6 +1353,12 @@ async def launch_and_schedule_opening_transition(
         track_id=card.outgoing_track_id,
         title=outgoing_title,
     )
+    # Rekordbox ignores Master assignment on a stopped deck.  Establish the
+    # reference only after transport is proven moving, then compile immediately.
+    master_messages = await engine.send_action(
+        "master", {"deck": card.outgoing_deck}
+    )
+    await asyncio.sleep(0.2)
     refreshed = await refresh_transition_state(
         outgoing_deck=card.outgoing_deck,
         outgoing_track_id=card.outgoing_track_id,
@@ -1907,7 +2030,10 @@ async def perform_transition(
 @mcp.tool(annotations={"readOnlyHint": True})
 def transition_status(job_id: str) -> dict[str, Any]:
     """Get a scheduled transition's progress."""
-    return scheduler.get(job_id)
+    return {
+        **scheduler.get(job_id),
+        "sync_guard": sync_guard_status.get(job_id),
+    }
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})

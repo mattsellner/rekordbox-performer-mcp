@@ -837,7 +837,7 @@ def test_card_rejects_disabled_outgoing_sync() -> None:
     assert "outgoing Beat Sync is off" in compiled["errors"]
 
 
-def test_card_rejects_sync_indicator_when_deck_bpms_do_not_match() -> None:
+def test_card_allows_stopped_native_bpm_until_post_launch_sync_guard() -> None:
     state = LiveState()
     for deck, track_id, playing, bpm in (
         (1, "a", True, 123),
@@ -861,8 +861,8 @@ def test_card_rejects_sync_indicator_when_deck_bpms_do_not_match() -> None:
     compiled = compile_transition_card(
         valid_card(), prepared_profile("a", "A"), prepared_profile("b", "B"), state
     )
-    assert compiled["ready"] is False
-    assert any("deck BPMs do not match" in error for error in compiled["errors"])
+    assert compiled["ready"] is True
+    assert compiled["errors"] == []
 
 
 def test_card_rejects_bass_swap_split_across_critical_bar() -> None:

@@ -170,15 +170,25 @@ def test_atomic_opening_enters_rescue_loop_when_job_is_not_scheduled(
     assert "loop_8" in engine.actions
 
 
-def test_atomic_opening_refuses_to_start_when_displayed_bpms_disagree(
+def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
     monkeypatch,
 ) -> None:
     engine = _install_opening_fakes(monkeypatch, incoming_bpm=129.0)
 
-    async def should_not_launch(**kwargs):
-        raise AssertionError("opening track must not launch")
+    async def launch(**kwargs):
+        assert "master" not in engine.actions
+        return {"live_state": {"playing": True}}
 
-    monkeypatch.setattr(server, "launch_staged_track", should_not_launch)
+    async def refresh(**kwargs):
+        assert "master" in engine.actions
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def schedule(**kwargs):
+        return {"ready": True, "job": {"id": "job-1"}}
+
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
 
     result = asyncio.run(
         server.launch_and_schedule_opening_transition(
@@ -189,10 +199,75 @@ def test_atomic_opening_refuses_to_start_when_displayed_bpms_disagree(
         )
     )
 
-    assert result["ready"] is False
-    assert result["started"] is False
-    assert any("BPMs do not match" in error for error in result["errors"])
+    assert result["ready"] is True
+    assert result["started"] is True
+    assert result["schedule"]["job"]["id"] == "job-1"
     assert engine.actions == ["master"]
+
+
+def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(
+    monkeypatch,
+) -> None:
+    class GuardUI:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def status(self) -> dict:
+            self.calls += 1
+            return {
+                "decks": [
+                    {
+                        "deck": 1,
+                        "title": "Outgoing",
+                        "elapsed_seconds": 10 + self.calls,
+                        "bpm": 121.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                    {
+                        "deck": 2,
+                        "title": "Incoming",
+                        "elapsed_seconds": self.calls,
+                        "bpm": 123.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                ]
+            }
+
+    class GuardScheduler:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+
+        def cancel(self, job_id: str) -> dict:
+            self.cancelled.append(job_id)
+            return {"id": job_id, "status": "cancelled"}
+
+    async def no_sleep(_seconds):
+        return None
+
+    engine = OpeningEngine()
+    scheduler = GuardScheduler()
+    monkeypatch.setattr(server, "rekordbox_ui", GuardUI())
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server, "scheduler", scheduler)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(server, "sync_guard_status", {})
+
+    asyncio.run(
+        server._guard_incoming_sync(
+            job_id="guarded-job",
+            card=opening_card(),
+            launch_delay_ms=0,
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+        )
+    )
+
+    assert scheduler.cancelled == ["guarded-job"]
+    assert server.sync_guard_status["guarded-job"]["status"] == "failed_safe"
+    assert engine.actions[-3:] == ["channel_fader", "eq_low", "cue"]
 
 
 class FakeProfileStore:
