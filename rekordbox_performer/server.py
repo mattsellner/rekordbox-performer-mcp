@@ -294,7 +294,7 @@ def _card_completion_verifier(
                 deck=card.incoming_deck,
                 track_id=card.incoming_track_id,
                 title=profile.title,
-                bpm=profile.bpm,
+                bpm=result["incoming"]["second"].get("bpm") or profile.bpm,
                 playing=True,
                 bar=int(total // profile.time_signature) + 1,
                 beat=int(within_bar) + 1,
@@ -981,7 +981,7 @@ async def launch_verified_hot_cue(
         deck=deck,
         track_id=track_id,
         title=title,
-        bpm=profile.bpm,
+        bpm=second.bpm or profile.bpm,
         playing=True,
         bar=bar,
         beat=int(within_bar) + 1,
@@ -1072,7 +1072,7 @@ async def launch_staged_track(
         deck=deck,
         track_id=track_id,
         title=title,
-        bpm=profile.bpm,
+        bpm=second.bpm or profile.bpm,
         playing=True,
         bar=bar,
         beat=int(within_bar) + 1,
@@ -1091,6 +1091,188 @@ async def launch_staged_track(
         },
         "live_state": live_state.update(observation),
         "effect_verified": True,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def launch_and_schedule_opening_transition(
+    card: TransitionCard,
+    outgoing_title: str,
+    incoming_title: str,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Atomically launch track one and schedule the first handoff.
+
+    The set is not considered started until both stopped decks are verified,
+    the audible deck is established as Master, Sync/Quantize are confirmed on
+    both decks, their displayed playback BPMs agree, and the first transition
+    job exists.  This removes model/tool round-trip latency from the opening
+    transition's runway.
+    """
+    if not execution_id.strip():
+        raise ValueError("execution_id is required")
+    if card.anchor_deck != card.outgoing_deck:
+        raise ValueError("opening transition must use the outgoing deck as anchor")
+    incoming_launches = [
+        event
+        for event in card.events
+        if event.bar_offset == 0
+        and event.beat_offset == 0
+        and event.action == "play_pause"
+        and event.parameters.get("deck") == card.incoming_deck
+    ]
+    if len(incoming_launches) != 1:
+        raise ValueError(
+            "opening transition requires exactly one bar-0 incoming play_pause"
+        )
+    outgoing_profile = profile_store.get(card.outgoing_track_id)
+    incoming_profile = profile_store.get(card.incoming_track_id)
+    if normalize_title(outgoing_profile.title) != normalize_title(outgoing_title):
+        raise ValueError("outgoing_title does not match the card profile")
+    if normalize_title(incoming_profile.title) != normalize_title(incoming_title):
+        raise ValueError("incoming_title does not match the card profile")
+
+    with deck_observer.exclusive_adapter():
+        first_status = rekordbox_ui.status()
+        await asyncio.sleep(1.1)
+        second_status = rekordbox_ui.status()
+    for deck, title in (
+        (card.outgoing_deck, outgoing_title),
+        (card.incoming_deck, incoming_title),
+    ):
+        first = _deck_record(first_status, deck)
+        second = _deck_record(second_status, deck)
+        if normalize_title(second.get("title", "")) != normalize_title(title):
+            raise RuntimeError(f"Deck {deck} loaded the wrong opening track")
+        if _transport_changed(first, second):
+            raise RuntimeError(f"Deck {deck} is already playing")
+        if second.get("elapsed_seconds") is None or second["elapsed_seconds"] > 1:
+            raise RuntimeError(f"Deck {deck} is not staged at file start")
+
+    for deck, profile, title in (
+        (card.outgoing_deck, outgoing_profile, outgoing_title),
+        (card.incoming_deck, incoming_profile, incoming_title),
+    ):
+        record = _deck_record(second_status, deck)
+        live_state.update(
+            observation_from_elapsed(
+                deck=deck,
+                profile=profile,
+                elapsed_seconds=record["elapsed_seconds"],
+                playing=False,
+                sync_enabled=record.get("beat_sync_enabled"),
+                quantize_enabled=record.get("quantize_enabled"),
+                title=title,
+                playback_bpm=record.get("bpm"),
+            )
+        )
+
+    master_messages = await engine.send_action(
+        "master", {"deck": card.outgoing_deck}
+    )
+    outgoing_modes = await ensure_deck_modes(
+        deck=card.outgoing_deck,
+        beat_sync=True if card.beat_sync_required else None,
+        quantize=True if card.quantize_required else None,
+    )
+    incoming_modes = await ensure_deck_modes(
+        deck=card.incoming_deck,
+        beat_sync=True if card.beat_sync_required else None,
+        quantize=True if card.quantize_required else None,
+    )
+    if outgoing_modes["changed"] or incoming_modes["changed"]:
+        await asyncio.sleep(1.2)
+
+    with deck_observer.exclusive_adapter():
+        mode_status = rekordbox_ui.status()
+    for deck, profile, title in (
+        (card.outgoing_deck, outgoing_profile, outgoing_title),
+        (card.incoming_deck, incoming_profile, incoming_title),
+    ):
+        record = _deck_record(mode_status, deck)
+        live_state.update(
+            observation_from_elapsed(
+                deck=deck,
+                profile=profile,
+                elapsed_seconds=record["elapsed_seconds"],
+                playing=False,
+                sync_enabled=record.get("beat_sync_enabled"),
+                quantize_enabled=record.get("quantize_enabled"),
+                title=title,
+                playback_bpm=record.get("bpm"),
+            )
+        )
+    outgoing_state = live_state.get(card.outgoing_deck)
+    incoming_state = live_state.get(card.incoming_deck)
+    mode_errors = []
+    if card.beat_sync_required:
+        if outgoing_state["sync_enabled"] is not True:
+            mode_errors.append("outgoing Beat Sync is not confirmed on")
+        if incoming_state["sync_enabled"] is not True:
+            mode_errors.append("incoming Beat Sync is not confirmed on")
+        if abs(outgoing_state["bpm"] - incoming_state["bpm"]) > 0.05:
+            mode_errors.append(
+                "displayed deck BPMs do not match "
+                f"({outgoing_state['bpm']:.2f} vs {incoming_state['bpm']:.2f})"
+            )
+    if card.quantize_required:
+        if outgoing_state["quantize_enabled"] is not True:
+            mode_errors.append("outgoing Quantize is not confirmed on")
+        if incoming_state["quantize_enabled"] is not True:
+            mode_errors.append("incoming Quantize is not confirmed on")
+    if mode_errors:
+        return {
+            "ready": False,
+            "started": False,
+            "errors": mode_errors,
+            "master_messages": master_messages,
+            "outgoing_modes": outgoing_modes,
+            "incoming_modes": incoming_modes,
+            "observed": mode_status,
+        }
+
+    launch = await launch_staged_track(
+        deck=card.outgoing_deck,
+        track_id=card.outgoing_track_id,
+        title=outgoing_title,
+    )
+    refreshed = await refresh_transition_state(
+        outgoing_deck=card.outgoing_deck,
+        outgoing_track_id=card.outgoing_track_id,
+        outgoing_title=outgoing_title,
+        incoming_deck=card.incoming_deck,
+        incoming_track_id=card.incoming_track_id,
+        incoming_title=incoming_title,
+    )
+    scheduled = await perform_transition_card(
+        card=card,
+        commit=True,
+        execution_id=execution_id,
+    )
+    if not scheduled.get("ready") or "job" not in scheduled:
+        # Preserve audible runway for recovery instead of letting track one end.
+        rescue_messages = await engine.send_action(
+            "loop_8", {"deck": card.outgoing_deck}
+        )
+        return {
+            "ready": False,
+            "started": True,
+            "errors": scheduled.get("errors", ["first transition was not scheduled"]),
+            "launch": launch,
+            "refresh": refreshed,
+            "schedule": scheduled,
+            "rescue_loop_messages": rescue_messages,
+        }
+    return {
+        "ready": True,
+        "started": True,
+        "session": set_sessions.start(),
+        "master_messages": master_messages,
+        "outgoing_modes": outgoing_modes,
+        "incoming_modes": incoming_modes,
+        "launch": launch,
+        "refresh": refreshed,
+        "schedule": scheduled,
     }
 
 
@@ -1160,6 +1342,7 @@ async def refresh_transition_state(
         sync_enabled=outgoing_second.get("beat_sync_enabled"),
         quantize_enabled=outgoing_second.get("quantize_enabled"),
         title=outgoing_title,
+        playback_bpm=outgoing_second.get("bpm"),
     )
     incoming_profile = profile_store.get(incoming_track_id)
     incoming_elapsed = incoming_second.get("elapsed_seconds")
@@ -1173,6 +1356,7 @@ async def refresh_transition_state(
         sync_enabled=incoming_second.get("beat_sync_enabled"),
         quantize_enabled=incoming_second.get("quantize_enabled"),
         title=incoming_title,
+        playback_bpm=incoming_second.get("bpm"),
     )
     return {
         "outgoing": live_state.update(outgoing_observation),

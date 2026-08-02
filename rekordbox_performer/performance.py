@@ -24,6 +24,7 @@ def observation_from_elapsed(
     sync_enabled: bool | None,
     quantize_enabled: bool | None,
     title: str | None = None,
+    playback_bpm: float | None = None,
 ) -> DeckObservation:
     """Convert Rekordbox's transport time into an analyzed-track clock."""
     elapsed_ms = max(0.0, elapsed_seconds * 1000.0)
@@ -43,7 +44,9 @@ def observation_from_elapsed(
         deck=deck,
         track_id=profile.track_id,
         title=title or profile.title,
-        bpm=bpm,
+        # The analyzed grid BPM locates the track beat.  The displayed deck BPM
+        # is the actual scheduler clock after tempo/master-sync changes.
+        bpm=playback_bpm if playback_bpm is not None else bpm,
         playing=playing,
         bar=whole // profile.time_signature + 1,
         beat=beat_in_bar,

@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+import asyncio
 import time
 
 import pytest
@@ -56,6 +57,142 @@ def card() -> TransitionCard:
             ),
         ],
     )
+
+
+def opening_card() -> TransitionCard:
+    transition = card()
+    transition.events[0] = MusicalEvent(
+        bar_offset=0,
+        action="play_pause",
+        parameters={"deck": 2},
+    )
+    return transition
+
+
+class OpeningProfileStore:
+    def get(self, track_id: str):
+        titles = {"a": "Outgoing", "b": "Incoming"}
+        return SimpleNamespace(
+            track_id=track_id,
+            title=titles[track_id],
+            bpm=128.0,
+            time_signature=4,
+            beat_grid=[],
+        )
+
+
+class OpeningUI:
+    def __init__(self, incoming_bpm: float = 128.0) -> None:
+        self.incoming_bpm = incoming_bpm
+
+    def status(self) -> dict:
+        return {
+            "decks": [
+                {
+                    "deck": 1,
+                    "title": "Outgoing",
+                    "elapsed_seconds": 0,
+                    "bpm": 128.0,
+                    "beat_sync_enabled": True,
+                    "quantize_enabled": True,
+                },
+                {
+                    "deck": 2,
+                    "title": "Incoming",
+                    "elapsed_seconds": 0,
+                    "bpm": self.incoming_bpm,
+                    "beat_sync_enabled": True,
+                    "quantize_enabled": True,
+                },
+            ]
+        }
+
+
+class OpeningEngine:
+    def __init__(self) -> None:
+        self.actions: list[str] = []
+
+    async def send_action(self, action: str, parameters: dict) -> list[str]:
+        self.actions.append(action)
+        return [action]
+
+
+class OpeningSession:
+    def start(self) -> dict:
+        return {"status": "running"}
+
+
+def _install_opening_fakes(monkeypatch, *, incoming_bpm: float = 128.0):
+    engine = OpeningEngine()
+    monkeypatch.setattr(server, "profile_store", OpeningProfileStore())
+    monkeypatch.setattr(server, "rekordbox_ui", OpeningUI(incoming_bpm))
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server, "live_state", server.LiveState())
+    monkeypatch.setattr(server, "set_sessions", OpeningSession())
+
+    async def modes(**kwargs):
+        return {"deck": kwargs["deck"], "changed": False, "actions": []}
+
+    monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    return engine
+
+
+def test_atomic_opening_enters_rescue_loop_when_job_is_not_scheduled(
+    monkeypatch,
+) -> None:
+    engine = _install_opening_fakes(monkeypatch)
+
+    async def launch(**kwargs):
+        return {"live_state": {"playing": True}}
+
+    async def refresh(**kwargs):
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def schedule(**kwargs):
+        return {"ready": False, "errors": ["scheduler unavailable"]}
+
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            execution_id="opening-1",
+        )
+    )
+
+    assert result["ready"] is False
+    assert result["started"] is True
+    assert "loop_8" in engine.actions
+
+
+def test_atomic_opening_refuses_to_start_when_displayed_bpms_disagree(
+    monkeypatch,
+) -> None:
+    engine = _install_opening_fakes(monkeypatch, incoming_bpm=129.0)
+
+    async def should_not_launch(**kwargs):
+        raise AssertionError("opening track must not launch")
+
+    monkeypatch.setattr(server, "launch_staged_track", should_not_launch)
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            execution_id="opening-2",
+        )
+    )
+
+    assert result["ready"] is False
+    assert result["started"] is False
+    assert any("BPMs do not match" in error for error in result["errors"])
+    assert engine.actions == ["master"]
 
 
 class FakeProfileStore:
