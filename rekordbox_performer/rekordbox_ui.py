@@ -620,7 +620,9 @@ class RekordboxUIAdapter:
         midpoint = window_width / 2
         title_candidates = []
         artist_candidates = []
-        bpm = None
+        native_bpm = None
+        live_bpm = None
+        pitch_percent = None
         key = None
         elapsed = None
         sync = None
@@ -658,7 +660,7 @@ class RekordboxUIAdapter:
                         pass
                     else:
                         if 40 <= value <= 500:
-                            bpm = value
+                            native_bpm = value
                 else:
                     elapsed = parsed
             if control_type == "Text" and 295 <= top <= 325 and text:
@@ -668,7 +670,7 @@ class RekordboxUIAdapter:
                 except ValueError:
                     numeric = None
                 if numeric is not None and 40 <= numeric <= 500:
-                    bpm = numeric
+                    native_bpm = numeric
                 elif re.fullmatch(
                     r"(?:\d{1,2}[AB]|[A-G](?:#|b)?)",
                     stripped,
@@ -684,8 +686,32 @@ class RekordboxUIAdapter:
                 quantize = blue_ratio(
                     image.crop((left, sample.top, right, sample.bottom))
                 ) >= 0.25
+            # Rekordbox exposes the large jog-display BPM separately from the
+            # analyzed/native BPM in the metadata row.  This is the scheduler
+            # clock after tempo and Beat Sync are applied.
+            if control_type == "Text" and 430 <= top <= 475 and text:
+                try:
+                    numeric = float(text.strip())
+                except ValueError:
+                    numeric = None
+                if numeric is not None and 40 <= numeric <= 500:
+                    live_bpm = numeric
+            # On the left deck Rekordbox's accessibility tree can omit the
+            # large live BPM but still exposes the jog pitch percentage.
+            if control_type == "Text" and 465 <= top <= 495 and text:
+                try:
+                    numeric = float(text.strip())
+                except ValueError:
+                    numeric = None
+                if numeric is not None and -25 <= numeric <= 25:
+                    pitch_percent = numeric
         title = max(title_candidates, default=(0, ""))[1]
         artist = min(artist_candidates, default=(0, ""))[1]
+        bpm = live_bpm
+        if bpm is None and native_bpm is not None and pitch_percent is not None:
+            bpm = round(native_bpm * (1.0 + pitch_percent / 100.0), 2)
+        if bpm is None:
+            bpm = native_bpm
         return DeckSnapshot(
             deck=deck,
             title=title,

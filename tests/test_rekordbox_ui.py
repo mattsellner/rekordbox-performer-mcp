@@ -4,6 +4,7 @@ from PIL import Image
 import pytest
 
 from rekordbox_performer.rekordbox_ui import (
+    ControlSample,
     DeckSnapshot,
     RekordboxUIAdapter,
     blue_ratio,
@@ -11,6 +12,35 @@ from rekordbox_performer.rekordbox_ui import (
     parse_clock_seconds,
     unique_row_tops,
 )
+
+
+def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
+    samples = [
+        ControlSample(None, "Text", "121.00", 180, 302, 224, 316),
+        ControlSample(None, "Text", "123.44", 770, 451, 824, 474),
+        ControlSample(None, "Text", "2.0", 762, 474, 788, 485),
+    ]
+    snapshot = RekordboxUIAdapter()._deck_snapshot(
+        samples,
+        Image.new("RGB", (1920, 1009)),
+        deck=1,
+        window_width=1920,
+    )
+    assert snapshot.bpm == 123.44
+
+
+def test_deck_snapshot_derives_live_bpm_from_pitch_when_jog_bpm_is_omitted() -> None:
+    samples = [
+        ControlSample(None, "Text", "121.00", 180, 302, 224, 316),
+        ControlSample(None, "Text", "2.0", 762, 474, 788, 485),
+    ]
+    snapshot = RekordboxUIAdapter()._deck_snapshot(
+        samples,
+        Image.new("RGB", (1920, 1009)),
+        deck=1,
+        window_width=1920,
+    )
+    assert snapshot.bpm == 123.42
 
 
 def test_parse_clock_seconds() -> None:
