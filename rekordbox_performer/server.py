@@ -40,6 +40,7 @@ from .protocol import (
     ALL_ACTIONS,
     CONTINUOUS_ACTIONS,
     TRIGGER_ACTIONS,
+    STEM_ACTIONS,
     mapping_manifest,
 )
 from .rekordbox_ui import RekordboxUIAdapter, normalize_title
@@ -335,6 +336,26 @@ def _verify_transition_postconditions(
         errors.append("outgoing deck is still playing after retirement")
     if not _transport_changed(incoming_first, incoming_second):
         errors.append("incoming deck did not start playing")
+    stem_fields = {
+        "stem_vocal": "stem_vocal_enabled",
+        "stem_instrumental": "stem_instrumental_enabled",
+        "stem_drums": "stem_drums_enabled",
+    }
+    for action, field in stem_fields.items():
+        for deck in {
+            event.parameters.get("deck")
+            for event in card.events
+            if event.action == action
+        }:
+            record = (
+                outgoing_second
+                if deck == card.outgoing_deck
+                else incoming_second
+            )
+            if record.get(field) is not True:
+                errors.append(
+                    f"deck {deck} {action} was not restored after transition"
+                )
     return {
         "verified": not errors,
         "errors": errors,
@@ -717,6 +738,29 @@ def _compile_card(card: TransitionCard) -> dict[str, Any]:
     return compile_transition_card(card, outgoing, incoming, live_state)
 
 
+def _require_active_stem_preconditions(card: TransitionCard) -> dict[str, Any] | None:
+    requested = {
+        (
+            int(event.parameters["deck"]),
+            f"{event.action}_enabled",
+        )
+        for event in card.events
+        if event.action in STEM_ACTIONS
+    }
+    if not requested:
+        return None
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        status = rekordbox_ui.status()
+    errors = []
+    for deck, field in sorted(requested):
+        if _deck_record(status, deck).get(field) is not True:
+            errors.append(f"deck {deck} {field} is not visually confirmed active")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return status
+
+
 @mcp.tool(annotations={"readOnlyHint": True})
 def preview_transition_card(card: TransitionCard) -> dict[str, Any]:
     """Compile a verified musical transition card against the fresh deck clock."""
@@ -750,6 +794,7 @@ async def perform_transition_card(
             "cannot schedule duplicate performances"
         )
     cue_verification = _require_verified_hot_cue(card)
+    stem_preconditions = _require_active_stem_preconditions(card)
     launch_clock: dict[str, float] = {}
 
     def observe_dispatch(event: dict[str, Any], dispatched: float) -> None:
@@ -781,6 +826,7 @@ async def perform_transition_card(
     return {
         **compiled,
         "cue_verification": cue_verification,
+        "stem_preconditions": stem_preconditions,
         "job": job,
         "sync_guard": guard,
     }
@@ -884,10 +930,14 @@ async def trigger_control(
         raise ValueError(
             f"action must be a trigger action: {', '.join(sorted(TRIGGER_ACTIONS))}"
         )
-    if action in {"sync", "quantize"}:
+    if action in {"sync", "quantize", *STEM_ACTIONS}:
         raise ValueError(
-            f"{action} is a stateful toggle. Use ensure_deck_modes with a fresh "
-            "high-confidence observation."
+            f"{action} is a stateful toggle. Use "
+            + (
+                "ensure_stem_state with a fresh visual observation."
+                if action in STEM_ACTIONS
+                else "ensure_deck_modes with a fresh high-confidence observation."
+            )
         )
     parameters: dict[str, Any] = {}
     if deck is not None:
@@ -1235,9 +1285,9 @@ async def _establish_opening_mixer_contract(
     """
     if audible_deck not in (1, 2):
         raise ValueError("audible_deck must be 1 or 2")
-    actions: list[dict[str, Any]] = [
-        {"action": "crossfader", "parameters": {"value": 0}},
-    ]
+    # The user's crossfader is disabled by design. Never send it as part of
+    # automated mixing; channel faders own all level handoffs.
+    actions: list[dict[str, Any]] = []
     for deck in (1, 2):
         values = {
             "channel_fader": 1 if deck == audible_deck else 0,
@@ -1608,6 +1658,68 @@ async def ensure_deck_modes(
             "Re-observe the deck's Beat Sync and Quantize indicators before "
             "previewing or performing a transition card."
         ),
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def ensure_stem_state(
+    deck: int,
+    vocal: bool | None = None,
+    instrumental: bool | None = None,
+    drums: bool | None = None,
+) -> dict[str, Any]:
+    """Set Rekordbox stem-part state only after observing the current buttons."""
+    if deck not in (1, 2):
+        raise ValueError("deck must be 1 or 2")
+    desired = {
+        "stem_vocal": vocal,
+        "stem_instrumental": instrumental,
+        "stem_drums": drums,
+    }
+    if all(value is None for value in desired.values()):
+        raise ValueError("Request vocal, instrumental, drums, or a combination")
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        before_status = rekordbox_ui.status()
+    before = _deck_record(before_status, deck)
+    actions = []
+    for action, target in desired.items():
+        if target is None:
+            continue
+        field = f"{action}_enabled"
+        actual = before.get(field)
+        if actual is None:
+            raise RuntimeError(f"deck {deck} {field} is not visually observable")
+        if actual != target:
+            actions.append({
+                "action": action,
+                "from": actual,
+                "expected": target,
+                "messages": await engine.send_action(action, {"deck": deck}),
+            })
+    if actions:
+        await asyncio.sleep(0.35)
+    with deck_observer.exclusive_adapter():
+        after_status = rekordbox_ui.status()
+    after = _deck_record(after_status, deck)
+    errors = []
+    for action, target in desired.items():
+        if target is None:
+            continue
+        field = f"{action}_enabled"
+        if after.get(field) is not target:
+            errors.append(
+                f"deck {deck} {field} did not reach requested state {target}"
+            )
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return {
+        "deck": deck,
+        "actions": actions,
+        "changed": bool(actions),
+        "observed_before": before,
+        "observed_after": after,
+        "verified": True,
     }
 
 

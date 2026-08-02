@@ -23,6 +23,9 @@ FX SELECT NEXT,fx_select_next,1,1,note,40,trigger
 FX SELECT BACK,fx_select_back,1,1,note,41,trigger
 FX BEAT UP,fx_beat_up,1,1,note,42,trigger
 FX BEAT DOWN,fx_beat_down,1,1,note,43,trigger
+ACTIVE PART VOCAL,stem_vocal,1,1,note,44,trigger
+ACTIVE PART INST,stem_instrumental,1,1,note,45,trigger
+ACTIVE PART DRUMS,stem_drums,1,1,note,46,trigger
 FX WET/DRY,fx_wet_dry,1,1,cc,32,0..1
 PLAY/PAUSE,play_pause,2,2,note,0,trigger
 CUE,cue,2,2,note,1,trigger
@@ -48,6 +51,9 @@ FX SELECT NEXT,fx_select_next,2,2,note,40,trigger
 FX SELECT BACK,fx_select_back,2,2,note,41,trigger
 FX BEAT UP,fx_beat_up,2,2,note,42,trigger
 FX BEAT DOWN,fx_beat_down,2,2,note,43,trigger
+ACTIVE PART VOCAL,stem_vocal,2,2,note,44,trigger
+ACTIVE PART INST,stem_instrumental,2,2,note,45,trigger
+ACTIVE PART DRUMS,stem_drums,2,2,note,46,trigger
 FX WET/DRY,fx_wet_dry,2,2,cc,32,0..1
 BROWSE UP,browse_up,,3,note,0,trigger
 BROWSE DOWN,browse_down,,3,note,1,trigger

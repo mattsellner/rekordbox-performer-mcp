@@ -154,6 +154,62 @@ def test_ready_profile_requires_vocal_map() -> None:
     assert profile.readiness()["tier"] == "B"
 
 
+def test_card_requires_stem_toggle_to_be_restored() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.events.insert(
+        1,
+        MusicalEvent(
+            bar_offset=1,
+            action="stem_vocal",
+            parameters={"deck": 1},
+        ),
+    )
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert "deck 1 stem_vocal must be restored with a paired toggle" in errors
+
+
+def test_card_accepts_paired_stem_toggle() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.events.insert(
+        1,
+        MusicalEvent(
+            bar_offset=1,
+            action="stem_vocal",
+            parameters={"deck": 1},
+        ),
+    )
+    card.events.insert(
+        4,
+        MusicalEvent(
+            bar_offset=19,
+            action="stem_vocal",
+            parameters={"deck": 1},
+        ),
+    )
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert not any("stem_vocal" in error for error in errors)
+
+
+def test_card_requires_transition_loop_release() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.events.insert(
+        1,
+        MusicalEvent(
+            bar_offset=1,
+            action="loop_16",
+            parameters={"deck": 1},
+        ),
+    )
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert "deck 1 transition loop is not explicitly released" in errors
+
+
 def test_normalize_camelot_accepts_rekordbox_and_note_keys() -> None:
     assert normalize_camelot("7A") == "7A"
     assert normalize_camelot("Ebm") == "2A"

@@ -66,6 +66,23 @@ def blue_ratio(image: Image.Image) -> float:
     return blue / (width * height)
 
 
+def vivid_color_ratio(image: Image.Image) -> float:
+    """Measure Rekordbox's colored active-state outline/text."""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    if width == 0 or height == 0:
+        return 0.0
+    access = rgb.load()
+    vivid = sum(
+        1
+        for y in range(height)
+        for x in range(width)
+        for pixel in (access[x, y],)
+        if max(pixel) > 70 and max(pixel) - min(pixel) > 35
+    )
+    return vivid / (width * height)
+
+
 @dataclass(frozen=True)
 class DeckSnapshot:
     deck: int
@@ -76,6 +93,9 @@ class DeckSnapshot:
     elapsed_seconds: int | None
     beat_sync_enabled: bool | None
     quantize_enabled: bool | None
+    stem_vocal_enabled: bool | None = None
+    stem_instrumental_enabled: bool | None = None
+    stem_drums_enabled: bool | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -87,6 +107,9 @@ class DeckSnapshot:
             "elapsed_seconds": self.elapsed_seconds,
             "beat_sync_enabled": self.beat_sync_enabled,
             "quantize_enabled": self.quantize_enabled,
+            "stem_vocal_enabled": self.stem_vocal_enabled,
+            "stem_instrumental_enabled": self.stem_instrumental_enabled,
+            "stem_drums_enabled": self.stem_drums_enabled,
         }
 
 
@@ -209,7 +232,11 @@ class RekordboxUIAdapter:
                 (control_type == "ComboBox" and 0 <= top <= 70)
                 or (
                     control_type in {"Text", "Edit", "Button", "Custom"}
-                    and (250 <= top <= 335 or 410 <= top <= 510)
+                    and (
+                        250 <= top <= 335
+                        or 360 <= top <= 410
+                        or 410 <= top <= 510
+                    )
                 )
             ):
                 controls.append(control)
@@ -637,6 +664,11 @@ class RekordboxUIAdapter:
         elapsed = None
         sync = None
         quantize = None
+        stems: dict[str, bool | None] = {
+            "VOCAL": None,
+            "INST": None,
+            "DRUMS": None,
+        }
         for sample in samples:
             left = sample.left
             top = sample.top
@@ -696,6 +728,14 @@ class RekordboxUIAdapter:
                 quantize = blue_ratio(
                     image.crop((left, sample.top, right, sample.bottom))
                 ) >= 0.25
+            if (
+                control_type == "Button"
+                and 360 <= top <= 410
+                and text in stems
+            ):
+                stems[text] = vivid_color_ratio(
+                    image.crop((left, sample.top, right, sample.bottom))
+                ) >= 0.08
             # Rekordbox exposes the large jog-display BPM separately from the
             # analyzed/native BPM in the metadata row.  This is the scheduler
             # clock after tempo and Beat Sync are applied.
@@ -731,6 +771,9 @@ class RekordboxUIAdapter:
             elapsed_seconds=elapsed,
             beat_sync_enabled=sync,
             quantize_enabled=quantize,
+            stem_vocal_enabled=stems["VOCAL"],
+            stem_instrumental_enabled=stems["INST"],
+            stem_drums_enabled=stems["DRUMS"],
         )
 
     def deck_snapshot(self, deck: int) -> DeckSnapshot:

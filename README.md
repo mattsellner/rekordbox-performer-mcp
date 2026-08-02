@@ -292,6 +292,14 @@ The dedicated mapping does not replace the DDJ-FLX4 factory mapping.
 
 ## Safety model
 
+- Channel faders own level handoffs. The crossfader is left untouched so it can
+  remain disabled in Rekordbox.
+- Rekordbox Track Separation is supported through visually verified Vocal,
+  Instrumental, and Drums toggles. Import the current MIDI mapping before using
+  stem-dependent transition cards.
+- Prefer a phrase-aligned loop or verified vocal-stem mute when a useful long
+  blend would otherwise create vocal interference. Restore every loop and stem
+  state before the retired deck is reloaded.
 - Live messages are rejected until control is armed.
 - Arming expires automatically after at most 30 minutes.
 - Transition plans default to dry-run preview.

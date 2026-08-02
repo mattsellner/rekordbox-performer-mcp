@@ -8,6 +8,7 @@ from rekordbox_performer.rekordbox_ui import (
     DeckSnapshot,
     RekordboxUIAdapter,
     blue_ratio,
+    vivid_color_ratio,
     normalize_title,
     parse_clock_seconds,
     unique_row_tops,
@@ -308,3 +309,10 @@ def test_blue_ratio_distinguishes_active_rekordbox_blue() -> None:
     inactive = Image.new("RGB", (10, 10), (78, 78, 78))
     assert blue_ratio(active) > 0.9
     assert blue_ratio(inactive) == 0
+
+
+def test_vivid_color_ratio_distinguishes_active_stem_button() -> None:
+    active = Image.new("RGB", (10, 10), (18, 170, 45))
+    inactive = Image.new("RGB", (10, 10), (78, 78, 78))
+    assert vivid_color_ratio(active) > 0.9
+    assert vivid_color_ratio(inactive) == 0

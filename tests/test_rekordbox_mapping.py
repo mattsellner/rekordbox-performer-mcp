@@ -30,4 +30,5 @@ def test_mapping_has_rekordbox_shape() -> None:
     } <= functions
     assert {
         "MixPointSelectPrev", "MixPointSelectNext", "MixPointLink",
+        "ActivePartVocal", "ActivePartInst", "ActivePartDrums",
     } <= names

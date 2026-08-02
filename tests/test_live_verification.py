@@ -203,7 +203,6 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
     assert result["started"] is True
     assert result["schedule"]["job"]["id"] == "job-1"
     assert engine.actions == [
-        "crossfader",
         "channel_fader",
         "gain",
         "eq_high",
@@ -222,6 +221,45 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
         "fx_wet_dry",
         "master",
     ]
+
+
+def test_ensure_stem_state_observes_toggles_and_verifies(monkeypatch) -> None:
+    class StemUI:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invalidate_status_cache(self) -> None:
+            pass
+
+        def status(self) -> dict:
+            self.calls += 1
+            vocal = self.calls == 1
+            return {
+                "decks": [
+                    {"deck": 1},
+                    {
+                        "deck": 2,
+                        "stem_vocal_enabled": vocal,
+                        "stem_instrumental_enabled": True,
+                        "stem_drums_enabled": True,
+                    },
+                ]
+            }
+
+    async def no_sleep(_seconds):
+        return None
+
+    engine = OpeningEngine()
+    monkeypatch.setattr(server, "rekordbox_ui", StemUI())
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(server.ensure_stem_state(deck=2, vocal=False))
+
+    assert result["verified"] is True
+    assert result["changed"] is True
+    assert engine.actions == ["stem_vocal"]
 
 
 def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(

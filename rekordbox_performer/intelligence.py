@@ -1138,6 +1138,34 @@ def validate_transition_card(
             errors.append(
                 "outgoing FX plan must toggle off and reset wet/dry to zero"
             )
+    stem_events: dict[tuple[int, str], int] = {}
+    for event in card.events:
+        if event.action not in {
+            "stem_vocal",
+            "stem_instrumental",
+            "stem_drums",
+        }:
+            continue
+        key = (int(event.parameters.get("deck", 0)), event.action)
+        stem_events[key] = stem_events.get(key, 0) + 1
+    for (deck, action), count in stem_events.items():
+        if count % 2:
+            errors.append(
+                f"deck {deck} {action} must be restored with a paired toggle"
+            )
+
+    for index, event in enumerate(card.events):
+        if event.action not in {"loop_4", "loop_8", "loop_16"}:
+            continue
+        deck = event.parameters.get("deck")
+        if not any(
+            later.action == "loop_toggle"
+            and later.parameters.get("deck") == deck
+            for later in card.events[index + 1:]
+        ):
+            errors.append(
+                f"deck {deck} transition loop is not explicitly released"
+            )
     return errors
 
 

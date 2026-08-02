@@ -67,3 +67,12 @@ def test_full_fx_actions_have_stable_controls() -> None:
     assert (select_next.channel, select_next.note) == (0, 40)
     assert (select_back.channel, select_back.note) == (1, 41)
     assert (beat_up.channel, beat_up.note) == (0, 42)
+
+
+def test_stem_toggles_have_stable_deck_scoped_notes() -> None:
+    vocal = encode_action("stem_vocal", {"deck": 1})[0].message
+    instrumental = encode_action("stem_instrumental", {"deck": 2})[0].message
+    drums = encode_action("stem_drums", {"deck": 1})[0].message
+    assert (vocal.channel, vocal.note) == (0, 44)
+    assert (instrumental.channel, instrumental.note) == (1, 45)
+    assert (drums.channel, drums.note) == (0, 46)
