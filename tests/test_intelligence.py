@@ -809,6 +809,62 @@ def test_card_rejects_unobserved_or_disabled_sync() -> None:
     assert "incoming Beat Sync is off" in compiled["errors"]
 
 
+def test_card_rejects_disabled_outgoing_sync() -> None:
+    state = LiveState()
+    for deck, track_id, playing, sync_enabled in (
+        (1, "a", True, False),
+        (2, "b", False, True),
+    ):
+        state.update(
+            DeckObservation(
+                deck=deck,
+                track_id=track_id,
+                title=track_id.upper(),
+                bpm=128,
+                playing=playing,
+                bar=1,
+                beat=1,
+                source="native",
+                confidence="verified",
+                sync_enabled=sync_enabled,
+                quantize_enabled=True,
+            )
+        )
+    compiled = compile_transition_card(
+        valid_card(), prepared_profile("a", "A"), prepared_profile("b", "B"), state
+    )
+    assert compiled["ready"] is False
+    assert "outgoing Beat Sync is off" in compiled["errors"]
+
+
+def test_card_rejects_sync_indicator_when_deck_bpms_do_not_match() -> None:
+    state = LiveState()
+    for deck, track_id, playing, bpm in (
+        (1, "a", True, 123),
+        (2, "b", False, 124),
+    ):
+        state.update(
+            DeckObservation(
+                deck=deck,
+                track_id=track_id,
+                title=track_id.upper(),
+                bpm=bpm,
+                playing=playing,
+                bar=1,
+                beat=1,
+                source="native",
+                confidence="verified",
+                sync_enabled=True,
+                quantize_enabled=True,
+            )
+        )
+    compiled = compile_transition_card(
+        valid_card(), prepared_profile("a", "A"), prepared_profile("b", "B"), state
+    )
+    assert compiled["ready"] is False
+    assert any("deck BPMs do not match" in error for error in compiled["errors"])
+
+
 def test_card_rejects_bass_swap_split_across_critical_bar() -> None:
     card = valid_card()
     card.events[2].beat_offset = 2

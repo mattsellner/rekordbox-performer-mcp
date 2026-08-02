@@ -1222,10 +1222,19 @@ def compile_transition_card(
         if incoming_state["playing"]:
             errors.append("incoming deck must be stopped before its scheduled launch")
         if card.beat_sync_required:
+            if state["sync_enabled"] is None:
+                errors.append("outgoing Beat Sync state is unobserved")
+            elif not state["sync_enabled"]:
+                errors.append("outgoing Beat Sync is off")
             if incoming_state["sync_enabled"] is None:
                 errors.append("incoming Beat Sync state is unobserved")
             elif not incoming_state["sync_enabled"]:
                 errors.append("incoming Beat Sync is off")
+            if abs(float(state["bpm"]) - float(incoming_state["bpm"])) > 0.05:
+                errors.append(
+                    "Beat Sync is indicated but deck BPMs do not match "
+                    f"({state['bpm']:.2f} vs {incoming_state['bpm']:.2f})"
+                )
         if card.quantize_required:
             if incoming_state["quantize_enabled"] is None:
                 errors.append("incoming Quantize state is unobserved")

@@ -1386,12 +1386,26 @@ async def stage_and_schedule_transition_card(
         incoming_title=incoming_title,
         incoming_hot_cue=incoming_cue,
     )
+    master_result = None
+    outgoing_mode_result = None
+    if card.beat_sync_required:
+        # Establish the audible deck as Rekordbox's tempo/phase authority before
+        # enabling Sync on the staged deck.  A lit incoming Sync button alone is
+        # insufficient: Rekordbox can leave the stopped deck at its native BPM.
+        master_result = await trigger_control("master", deck=card.outgoing_deck)
+        outgoing_mode_result = await ensure_deck_modes(
+            deck=card.outgoing_deck,
+            beat_sync=True,
+            quantize=True if card.quantize_required else None,
+        )
     mode_result = await ensure_deck_modes(
         deck=card.incoming_deck,
         beat_sync=True if card.beat_sync_required else None,
         quantize=True if card.quantize_required else None,
     )
-    if mode_result["changed"]:
+    if mode_result["changed"] or (
+        outgoing_mode_result is not None and outgoing_mode_result["changed"]
+    ):
         # Rekordbox's indicator paint trails the MIDI command.  Re-observe only
         # inside this transaction, then compile immediately from that proof.
         await asyncio.sleep(1.2)
@@ -1416,6 +1430,8 @@ async def stage_and_schedule_transition_card(
             "cue_verification": cue_verification,
             "refresh_before": refresh_before,
             "mode_result": mode_result,
+            "outgoing_mode_result": outgoing_mode_result,
+            "master_result": master_result,
             "refresh_after": refresh_after,
             "schedule": scheduled,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
@@ -1425,6 +1441,8 @@ async def stage_and_schedule_transition_card(
         "stage": staged,
         "cue_verification": cue_verification,
         "mode_result": mode_result,
+        "outgoing_mode_result": outgoing_mode_result,
+        "master_result": master_result,
         "refresh": refresh_after,
         "schedule": scheduled,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
