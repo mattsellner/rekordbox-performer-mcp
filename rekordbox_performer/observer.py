@@ -156,7 +156,15 @@ class SharedDeckObserver:
         # UI Automation can take several seconds on a large Rekordbox tree.
         # The worker remains demand-bounded by idle_seconds; this longer wait
         # merely lets the caller receive the one scan already in progress.
-        self.activate()
+        # Give a newly restarted worker enough scheduling runway to complete
+        # at least one scan.  A very short idle window can otherwise expire
+        # while the caller is waiting and leave only the stale pre-idle file.
+        self.activate(
+            max(
+                self.idle_seconds,
+                self.interval_seconds + 0.1,
+            )
+        )
         snapshot = self._read()
         if snapshot and snapshot["age_ms"] <= max_age_ms:
             return snapshot

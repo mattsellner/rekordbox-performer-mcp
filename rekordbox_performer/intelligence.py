@@ -383,7 +383,10 @@ class TransitionCard(BaseModel):
     vocal_risk_accepted: bool = False
     harmonic_risk_accepted: bool = False
     bass_plan_verified: bool = False
+    loop_plan_verified: bool = False
     incoming_loaded_verified: bool = False
+    max_tempo_stretch_percent: float = Field(default=4.0, gt=0, le=10)
+    tempo_risk_accepted: bool = False
     intended_vocal_owner: Literal["outgoing", "incoming", "none", "intentional_overlap"]
     critical_bar_offset: int = Field(ge=0)
     events: list[MusicalEvent]
@@ -931,12 +934,22 @@ def validate_transition_card(
         errors.append("outgoing profile does not match card")
     if card.incoming_track_id != incoming.track_id:
         errors.append("incoming profile does not match card")
-    if (
-        abs(outgoing.bpm - incoming.bpm) > 0.05
-        and not card.beat_sync_required
-    ):
+    bpm_delta = abs(outgoing.bpm - incoming.bpm)
+    stretch_percent = bpm_delta / outgoing.bpm * 100.0
+    if bpm_delta > 0.05 and not card.beat_sync_required:
         errors.append(
             "tempo-mismatched tracks require verified Beat Sync"
+        )
+    if (
+        stretch_percent > card.max_tempo_stretch_percent
+        and not card.tempo_risk_accepted
+    ):
+        errors.append(
+            "native BPM move requires a verified tempo ramp or compatible "
+            "bridge track "
+            f"({outgoing.bpm:.2f} -> {incoming.bpm:.2f}, "
+            f"{stretch_percent:.2f}% exceeds "
+            f"{card.max_tempo_stretch_percent:.2f}%)"
         )
     for label, value in (
         ("phrase alignment", card.phrase_alignment_verified),
@@ -987,6 +1000,11 @@ def validate_transition_card(
     if ordered != card.events:
         errors.append("musical events must be ordered by bar_offset and beat_offset")
 
+    drop_anchored = card.transition_family in {
+        "long_blend",
+        "bass_swap",
+        "double_drop",
+    }
     critical = [
         event
         for event in card.events
@@ -1005,7 +1023,7 @@ def validate_transition_card(
         and float(event.parameters.get("value", -1)) >= -0.1
         for event in critical
     )
-    if not (outgoing_low_cut and incoming_low_open):
+    if drop_anchored and not (outgoing_low_cut and incoming_low_open):
         errors.append(
             "critical downbeat lacks a simultaneous two-deck bass swap"
         )
@@ -1032,11 +1050,6 @@ def validate_transition_card(
         )
     else:
         launch = launch_events[0]
-        drop_anchored = card.transition_family in {
-            "long_blend",
-            "bass_swap",
-            "double_drop",
-        }
         if drop_anchored and launch.action != "hot_cue":
             errors.append(
                 f"{card.transition_family} requires a verified Hot Cue launch"
@@ -1075,6 +1088,10 @@ def validate_transition_card(
                 None,
             )
             if entry is not None:
+                if (entry.beat or 1) != 1:
+                    errors.append(
+                        "incoming launch cue must mark beat 1 of its phrase"
+                    )
                 entry_beat = (
                     (entry.bar - 1) * incoming.time_signature
                     + (entry.beat or 1)
@@ -1157,6 +1174,10 @@ def validate_transition_card(
     for index, event in enumerate(card.events):
         if event.action not in {"loop_4", "loop_8", "loop_16"}:
             continue
+        if not card.loop_plan_verified:
+            errors.append(
+                "transition loop requires verified observable loop state"
+            )
         deck = event.parameters.get("deck")
         if not any(
             later.action == "loop_toggle"
@@ -1301,6 +1322,14 @@ def compile_transition_card(
                 ],
                 "events": [],
             }
+        if (landmark.beat or 1) != 1:
+            return {
+                "ready": False,
+                "errors": [
+                    "stopped anchor launch cue must mark phrase beat 1"
+                ],
+                "events": [],
+            }
         start_delay_ms = 250
         events = []
         for event in card.events:
@@ -1365,21 +1394,77 @@ def compile_transition_card(
             "events": [],
         }
     chosen_phrase = min(candidates, key=lambda phrase: phrase.start_beat)
+    if chosen_phrase.beat_in_bar != 1:
+        return {
+            "ready": False,
+            "errors": [
+                "selected outgoing phrase must start on beat 1; "
+                f"analysis reports beat {chosen_phrase.beat_in_bar}"
+            ],
+            "events": [],
+        }
     start_beat = chosen_phrase.start_beat
     start_delay_ms = round((start_beat - current_beat) * beat_ms)
 
+    outgoing_stops = [
+        event
+        for event in card.events
+        if event.action == "cue"
+        and event.parameters.get("deck") == card.outgoing_deck
+    ]
+    if anchor_profile.beat_count and outgoing_stops:
+        final_stop = max(
+            outgoing_stops,
+            key=lambda event: (event.bar_offset, event.beat_offset),
+        )
+        retirement_beat = (
+            start_beat
+            + final_stop.bar_offset * beats_per_bar
+            + final_stop.beat_offset
+        )
+        if retirement_beat > anchor_profile.beat_count:
+            return {
+                "ready": False,
+                "errors": [
+                    "outgoing deck would reach the end of its analyzed beat "
+                    "grid before the scheduled silent cue retirement"
+                ],
+                "events": [],
+                "start_track_beat": start_beat,
+                "outgoing_beat_count": anchor_profile.beat_count,
+                "scheduled_retirement_beat": retirement_beat,
+            }
+
+    # A verified Hot Cue on a stopped Rekordbox deck starts immediately even
+    # when Quantize is enabled.  It does not wait for the next master-deck beat.
+    # Pre-arming that trigger therefore moves the incoming phrase off beat 1
+    # by the lead interval itself (347 ms was measured as a ~one-beat miss in
+    # the Jump -> The Rapture rehearsal).  Dispatch stopped-deck transports at
+    # the compiled phrase boundary; Quantize remains a phase-safety net rather
+    # than part of our scheduling calculation.
+    quantized_transport_lead_ms = 0
     events = []
     for event in card.events:
         offset_beats = (
             event.bar_offset * beats_per_bar + event.beat_offset
         )
+        at_ms = start_delay_ms + round(offset_beats * beat_ms)
+        if (
+            quantized_transport_lead_ms
+            and event.bar_offset == 0
+            and event.beat_offset == 0
+            and event.action in {"play_pause", "hot_cue"}
+            and event.parameters.get("deck") == card.incoming_deck
+        ):
+            at_ms = max(0, at_ms - quantized_transport_lead_ms)
         events.append(
             {
-                "at_ms": start_delay_ms + round(offset_beats * beat_ms),
+                "at_ms": at_ms,
                 "action": event.action,
                 "parameters": event.parameters,
             }
         )
+    events.sort(key=lambda item: item["at_ms"])
     return {
         "ready": True,
         "errors": [],
@@ -1396,6 +1481,7 @@ def compile_transition_card(
         "start_bar": chosen_phrase.start_bar,
         "start_beat_in_bar": chosen_phrase.beat_in_bar,
         "start_phrase": chosen_phrase.model_dump(),
+        "quantized_transport_lead_ms": quantized_transport_lead_ms,
         "events": events,
     }
 

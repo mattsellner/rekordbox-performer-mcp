@@ -6,6 +6,10 @@ ActivePartDrums,ActivePartDrums,Pad,,902E,912E,,,,,,,,,Toggle drums stem
 ActivePartInst,ActivePartInst,Pad,,902D,912D,,,,,,,,,Toggle instrumental stem
 ActivePartVocal,ActivePartVocal,Pad,,902C,912C,,,,,,,,,Toggle vocal stem
 Back,Back,Button,9204,,,,,,,,,,,Close current folder
+PAD1_BeatJump,PAD1_BeatJump,Pad,,902F,912F,,,,,,,,,Move a muted incoming deck back 1 beat for bar repair
+PAD2_BeatJump,PAD2_BeatJump,Pad,,9030,9130,,,,,,,,,Move a muted incoming deck forward 1 beat for bar repair
+PAD3_BeatJump,PAD3_BeatJump,Pad,,9031,9131,,,,,,,,,Move a muted incoming deck back 2 beats for bar repair
+PAD4_BeatJump,PAD4_BeatJump,Pad,,9032,9132,,,,,,,,,Move a muted incoming deck forward 2 beats for bar repair
 BrowseDown,BrowseDown,Button,9201,,,,,,,,,,,Browse one item down
 BrowseUp,BrowseUp,Button,9200,,,,,,,,,,,Browse one item up
 CFXParameterCH1,CFXParameterCH1,KnobSlider,B005,,,,,,,,,,Fast;,Deck 1 filter

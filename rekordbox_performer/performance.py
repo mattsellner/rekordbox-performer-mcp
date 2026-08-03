@@ -114,12 +114,21 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
         key=lambda item: (item.bar, item.beat),
     )
     existing = {item.cue for item in profile.landmarks if item.cue is not None}
-    free = [cue for cue in range(1, 9) if cue not in existing]
+    # Reserve the user's A/B/C workflow. Automation-owned preparation uses
+    # only G/H (pads 7/8), as explicitly requested.
+    free = [cue for cue in (7, 8) if cue not in existing]
     suggestions = []
+    phrase_starts = {
+        (phrase.start_bar, phrase.beat_in_bar)
+        for phrase in profile.phrase_boundaries
+        if phrase.confidence in {"verified", "high"}
+    }
     for target in targets:
         for lead in (16, 8):
             cue_bar = target.bar - lead
             if cue_bar < 1:
+                continue
+            if (cue_bar, target.beat) not in phrase_starts:
                 continue
             beat_index = (cue_bar - 1) * profile.time_signature + target.beat
             point = next((p for p in profile.beat_grid if p.index == beat_index), None)
@@ -139,6 +148,7 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
         "suggestions": suggestions,
         "ready": bool(suggestions),
         "mutated_rekordbox": False,
+        "cue_policy": "automation uses Hot Cue G/H only",
     }
 
 
@@ -157,11 +167,33 @@ def sync_report(
         errors.append(f"deck BPM mismatch is {bpm_error:.2f}")
     if phase_ms > 35:
         errors.append(f"beat phase error is {phase_ms:.1f} ms")
+    bar_phase_error_beats = None
+    if outgoing.get("beat") is not None and incoming.get("beat") is not None:
+        outgoing_bar_phase = (
+            float(outgoing["beat"]) - 1.0
+            + float(outgoing.get("beat_phase", 0))
+        ) % 4.0
+        incoming_bar_phase = (
+            float(incoming["beat"]) - 1.0
+            + float(incoming.get("beat_phase", 0))
+        ) % 4.0
+        bar_delta = abs(outgoing_bar_phase - incoming_bar_phase)
+        bar_phase_error_beats = min(bar_delta, 4.0 - bar_delta)
+        if bar_phase_error_beats > 0.15:
+            errors.append(
+                "beat-in-bar alignment error is "
+                f"{bar_phase_error_beats:.2f} beats"
+            )
     return {
         "verified": not errors,
         "errors": errors,
         "bpm_error": round(bpm_error, 3),
         "beat_phase_error_ms": round(phase_ms, 2),
+        "bar_phase_error_beats": (
+            None
+            if bar_phase_error_beats is None
+            else round(bar_phase_error_beats, 3)
+        ),
         "correction": "re-enable Beat Sync and relaunch on the next phrase" if errors else "none",
     }
 
@@ -197,9 +229,18 @@ def fx_recipe(card: TransitionCard) -> dict[str, Any]:
 
 def transition_qa(job: dict[str, Any]) -> dict[str, Any]:
     verification = job.get("verification") or {}
-    phase_ms = float(verification.get("sync", {}).get("beat_phase_error_ms", 0))
+    sync = verification.get("sync") or {}
+    phase_ms = float(sync.get("beat_phase_error_ms", 0))
     late = float(job.get("p99_event_lateness_ms", 0))
     faults = list(verification.get("errors", []))
+    # Transport and mixer postconditions can pass even when the musical
+    # handoff is audibly off-grid. Sync verification is therefore a hard QA
+    # gate, not just a score penalty. Without this, an 83 ms phase error (or
+    # even a one-beat cue mistake) can be reported as a successful transition
+    # and advance the rolling set.
+    if sync and sync.get("verified") is not True:
+        sync_errors = sync.get("errors") or ["beat sync was not verified"]
+        faults.extend(error for error in sync_errors if error not in faults)
     if late > 20:
         faults.append(f"p99 MIDI dispatch lateness was {late:.1f} ms")
     score = 100 - min(30, late) - min(35, phase_ms / 2) - 20 * len(faults)

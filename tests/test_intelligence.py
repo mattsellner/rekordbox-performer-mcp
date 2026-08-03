@@ -208,6 +208,163 @@ def test_card_requires_transition_loop_release() -> None:
     )
     errors = validate_transition_card(card, outgoing, incoming)
     assert "deck 1 transition loop is not explicitly released" in errors
+    assert any("requires verified observable loop state" in error for error in errors)
+
+
+def test_verified_transition_loop_is_allowed_when_released() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    card = valid_card()
+    card.loop_plan_verified = True
+    card.events.insert(
+        1,
+        MusicalEvent(
+            bar_offset=1,
+            action="loop_16",
+            parameters={"deck": 1},
+        ),
+    )
+    card.events.insert(
+        2,
+        MusicalEvent(
+            bar_offset=8,
+            action="loop_toggle",
+            parameters={"deck": 1},
+        ),
+    )
+
+    errors = validate_transition_card(card, outgoing, incoming)
+
+    assert not any("loop" in error for error in errors)
+
+
+def test_simple_file_start_echo_exit_does_not_require_fake_drop_swap() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    incoming.landmarks = [
+        TrackLandmark(
+            name="file start",
+            kind="phrase_start",
+            bar=1,
+            beat=1,
+            confidence="high",
+        ),
+        TrackLandmark(
+            name="bass entry",
+            kind="bass_in",
+            bar=1,
+            confidence="high",
+        ),
+        TrackLandmark(
+            name="clean exit",
+            kind="mix_out",
+            bar=65,
+            confidence="high",
+        ),
+    ]
+    card = TransitionCard(
+        name="simple reset",
+        outgoing_track_id="a",
+        incoming_track_id="b",
+        anchor_deck=1,
+        outgoing_deck=1,
+        incoming_deck=2,
+        transition_family="echo_exit",
+        phrase_alignment_verified=True,
+        vocal_plan_verified=True,
+        bass_plan_verified=True,
+        incoming_loaded_verified=True,
+        intended_vocal_owner="incoming",
+        critical_bar_offset=1,
+        abort_plan="Keep the outgoing deck audible.",
+        events=[
+            MusicalEvent(
+                bar_offset=0,
+                action="play_pause",
+                parameters={"deck": 2},
+            ),
+            MusicalEvent(
+                bar_offset=0,
+                action="eq_low",
+                parameters={"deck": 1, "value": -1},
+            ),
+            MusicalEvent(
+                bar_offset=1,
+                action="channel_fader",
+                parameters={"deck": 1, "value": 0},
+            ),
+            MusicalEvent(
+                bar_offset=1,
+                action="cue",
+                parameters={"deck": 1},
+            ),
+        ],
+    )
+
+    errors = validate_transition_card(card, outgoing, incoming)
+
+    assert "critical downbeat lacks a simultaneous two-deck bass swap" not in errors
+    assert not any("drop" in error for error in errors)
+
+
+def test_large_bpm_move_requires_bridge_or_explicit_tempo_risk() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    incoming.bpm = 135
+    card = valid_card()
+
+    errors = validate_transition_card(card, outgoing, incoming)
+
+    assert any("verified tempo ramp or compatible bridge" in error for error in errors)
+    card.tempo_risk_accepted = True
+    errors = validate_transition_card(card, outgoing, incoming)
+    assert not any("verified tempo ramp or compatible bridge" in error for error in errors)
+
+
+def test_card_rejects_retirement_after_outgoing_grid_end() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    outgoing = prepared_profile("a", "A")
+    outgoing.beat_count = 128
+
+    compiled = compile_transition_card(
+        valid_card(),
+        outgoing,
+        prepared_profile("b", "B"),
+        state,
+    )
+
+    assert compiled["ready"] is False
+    assert "outgoing deck would reach the end" in compiled["errors"][0]
 
 
 def test_normalize_camelot_accepts_rekordbox_and_note_keys() -> None:
@@ -337,6 +494,9 @@ def test_card_compiles_to_next_phrase_boundary() -> None:
     assert compiled["ready"] is True
     assert compiled["start_basis"] == "rekordbox_phrase_analysis"
     assert compiled["start_track_beat"] == 65
+    assert compiled["quantized_transport_lead_ms"] == 0
+    assert compiled["events"][0]["action"] == "hot_cue"
+    assert compiled["events"][0]["at_ms"] == compiled["start_delay_ms"]
     assert compiled["events"][1]["at_ms"] > compiled["events"][0]["at_ms"]
 
 
@@ -1060,7 +1220,7 @@ def test_card_rejects_manual_clock_and_playing_incoming_deck() -> None:
     assert "incoming deck must be stopped before its scheduled launch" in compiled["errors"]
 
 
-def test_phrase_compiler_respects_non_bar_one_boundary() -> None:
+def test_phrase_compiler_rejects_non_bar_one_boundary() -> None:
     outgoing = prepared_profile("a", "A")
     outgoing.phrase_boundaries = [
         PhraseBoundary(
@@ -1123,9 +1283,60 @@ def test_phrase_compiler_respects_non_bar_one_boundary() -> None:
         prepared_profile("b", "B"),
         state,
     )
-    assert compiled["ready"] is True
-    assert compiled["start_track_beat"] == 67
-    assert compiled["start_beat_in_bar"] == 3
+    assert compiled["ready"] is False
+    assert (
+        "selected outgoing phrase must start on beat 1; analysis reports beat 3"
+        in compiled["errors"]
+    )
+
+
+def test_drop_anchored_hot_cue_must_mark_phrase_beat_one() -> None:
+    outgoing = prepared_profile("a", "A")
+    incoming = prepared_profile("b", "B")
+    entry = next(
+        landmark
+        for landmark in incoming.landmarks
+        if landmark.kind in {"mix_in", "phrase_start"}
+        and landmark.cue is not None
+    )
+    entry.beat = 3
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=1,
+            beat=1,
+            track_beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+
+    compiled = compile_transition_card(valid_card(), outgoing, incoming, state)
+
+    assert compiled["ready"] is False
+    assert "incoming launch cue must mark beat 1 of its phrase" in compiled["errors"]
 
 
 def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:

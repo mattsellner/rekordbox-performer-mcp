@@ -8,7 +8,7 @@ Safety-first live Rekordbox control over a dedicated virtual MIDI port.
 
 ## Signal path
 
-`MCP client -> verified transition card -> quantized scheduler -> loopMIDI -> Rekordbox MIDI Learn`
+`DJ/TransitionKing plan -> autonomous set runner -> verified transition cards -> quantized scheduler -> loopMIDI -> Rekordbox MIDI Learn`
 
 The DDJ-FLX4 remains connected as the Hardware Unlock device and manual control
 surface. This server does not modify the Rekordbox database or process audio.
@@ -23,15 +23,21 @@ low-level testing. Live musical handoffs must use the guarded workflow:
    pass its result to `ingest_rekordbox_analysis`.
 3. Ingest native `PVDI` vocal spans and `PWV7` low-band spans when available;
    use `upsert_track_profile` only for additional verified landmarks.
-4. Require `audit_track_profiles` and `preview_set_plan` to pass before track one.
-5. Launch the first deck with `launch_staged_track` or
-   `launch_verified_hot_cue`, then call `refresh_transition_state`. Do not
-   promote an outbound MIDI command into an observation.
-6. Express the transition in bars and beats with a `TransitionCard`.
-7. Call `preview_transition_card`, arm control, then call
-   `perform_transition_card` with a unique `execution_id` for that one live
-   pass. Reuse the same ID only when retrying a lost MCP response.
-8. Grade the practice pass with `record_rehearsal`.
+4. Require `audit_track_profiles` and `preflight_autonomous_set` to pass before
+   track one. Preflight validates every primary and fallback branch, warms each
+   exact browser/load route, and proves only the Hot Cues a card actually uses.
+5. Express the first handoff in bars and beats with a `TransitionCard`, including
+   an explicit analyzed `start_phrase_index` and any verified incoming Hot Cue.
+6. Arm control, then call `start_autonomous_set`. It stages Track 1 and starts it
+   only after the opening handoff is accepted by the local scheduler. Never
+   manually launch Track 1 before that atomic call.
+7. The local runner owns all later stage/load/verify/schedule/QA/advance work.
+   It does not wait for a model or MCP round trip between songs. Use
+   `autonomous_set_status` to monitor it and `stop_autonomous_set` to stop it.
+8. `stage_and_schedule_transition_card` remains the atomic primitive for a
+   supervised one-off rolling handoff. Use a unique `execution_id`; reuse it
+   only when retrying a lost MCP response.
+9. Grade the practice pass with `record_rehearsal`.
 
 For measured practice passes, install `.[rehearsal]`, call
 `start_rehearsal_capture`, perform the mix, and call
@@ -54,13 +60,18 @@ The card validator rejects:
 - an incompatible Camelot move outside same-key, relative-major/minor, or
   adjacent-wheel relationships unless harmonic risk is explicitly accepted;
 - events that are not ordered musically;
-- a critical handoff without both bass moves on the same downbeat;
+- a drop-oriented handoff without both bass moves on the same downbeat;
+- an unaccepted tempo stretch above 4 percent;
+- a loop action whose creation and release were not both verified/planned;
 - an outgoing deck that is not faded to zero and stopped.
 
 Simple `phrase_cut`, `echo_exit`, and `breakdown_handoff` cards may launch a
 stopped deck with `play_pause` only when the incoming profile has a
-high-confidence file-start phrase landmark. Drop-anchored blends and bass swaps
-still require a verified Hot Cue.
+high-confidence file-start phrase landmark. This is the cue-agnostic fallback:
+the runner can keep a set moving even when a track has no prepared Hot Cue.
+Drop-anchored blends and bass swaps still require a verified Hot Cue. When a
+new automation-only cue is useful, reserve pads G and H; pads A, B, and C are
+treated as the DJ's existing cues.
 
 The scheduler reports average and maximum event lateness for diagnostics.
 Events sharing one musical timestamp dispatch concurrently, so two-deck Hot
@@ -79,6 +90,14 @@ Codex may launch more than one stdio MCP client. Read-only clients can coexist,
 but an OS-backed lease allows only one process to own the live MIDI output.
 `control_status` reports the current lease owner. The lease is released on
 disconnect or process exit.
+
+The configured MCP command is a stable stdio supervisor. After the one
+initial Codex restart that activates this version, call `restart_performer`
+between sets to load changed Performer code without closing Codex or Rekordbox.
+The tool refuses to run while a transition job is active, disarms and
+disconnects MIDI, replaces only the Performer child process, replays the MCP
+handshake, and asks the client to refresh its tool list. Reconnect MIDI and arm
+control again before performing; session-only Hot Cue proofs must be repeated.
 
 Performance profiles and rehearsal reviews use a shared SQLite database in WAL
 mode. Legacy `track-profiles.json` and `rehearsals.jsonl` data is imported once,
@@ -118,6 +137,13 @@ the performer after the native launch.
 
 Enable MIX POINT LINK in Rekordbox Preferences and re-import the current mapping
 file after upgrading from the prototype.
+
+The mapping also includes dedicated one- and two-beat jump controls used only
+while the incoming channel fader is at zero. After launch, the Sync guard reads
+the red downbeat markers in Rekordbox's stacked waveforms. A clean integer
+one- or two-beat bar error is corrected on the muted incoming deck and observed
+again; an unavailable or still-misaligned grid cancels the job before the first
+audible fader rise.
 
 ## Safe Beat Sync and Quantize
 
@@ -198,10 +224,11 @@ adapter confidence; an ad-hoc screenshot estimate cannot authorize a card.
 
 Use `verify_hot_cue` before committing a Hot Cue card. Verification is
 session-scoped and proves the loaded title, recalled position, and advancing
-transport while the deck is muted. Use `launch_staged_track` for a verified
-file-start launch and `refresh_transition_state` immediately before previewing
-and committing the card. Raw `trigger_control` responses explicitly report
-`effect_verified=false`.
+transport while the deck is muted. `launch_staged_track` remains available for
+single-track playback and diagnostics, but a live set opening must use
+`launch_and_schedule_opening_transition`; this prevents audible playback from
+continuing without an accepted transition job. Raw `trigger_control` responses
+explicitly report `effect_verified=false`.
 
 After a transition completes, the verifier promotes the incoming deck's exact
 scheduled Hot Cue dispatch time into the next authoritative live clock. This
@@ -220,36 +247,54 @@ blocks a card; phrase, bass, transport, and harmonic checks remain enforced.
 
 ## Continuous-set performance workflow
 
-The reliability upgrade adds a restart-safe three-track horizon and measured
-handoffs:
+The reliability upgrade moves lifecycle ownership into Performer:
 
-1. Call `prepare_set_session` with the ordered track IDs, then
-   `start_set_session`. `set_session_status` always exposes current, next, and
-   following tracks, even after the MCP process restarts.
-2. Use `prepare_track_cues` offline to find a phrase-safe cue 16 bars (or 8 bars
-   when necessary) before each verified drop. This produces a plan only; set
-   the cue in Rekordbox and prove it with `verify_hot_cue`.
-3. Use `plan_vocal_handoff` or the vocal-aware candidate ranker to choose a
-   vocal owner without treating overlap as a hard failure.
-4. Call `recommend_transition_fx` for Echo, Reverb, Spiral, or Vinyl Brake
-   recommendations. Every recipe includes wet/dry and a mandatory off/reset
-   tail. Rekordbox exposes Select Next/Back and Beat Up/Down through MIDI Learn,
-   not fixed-effect selectors, so observe the current effect before cycling to
-   the recommendation. Map those controls from
-   `mapping/rekordbox-midi-learn.csv` before using them live.
-5. Stage and schedule with `stage_and_schedule_transition_card`. The scheduler
-   now reserves the existing user authorization for the complete job, so a
-   long transition cannot lose control halfway through merely because the
-   original arming timer expires.
-6. After completion, call `transition_quality_report`, then
-   `settle_set_transition`. The queue advances only after postconditions and QA
-   pass; failures preserve the current/next pair for recovery.
+1. DJ and TransitionKing produce an `AutonomousSetPlan`: one opening track and
+   a directed set of transition options. Every option contains the exact load
+   identity, a verified transition card, a priority, and an optional post-mix
+   `TempoPlan`. Multiple options from one outgoing track are ordered fallbacks.
+2. Call `preflight_autonomous_set`. It validates the complete reachable path,
+   preparation tier, phrase/drop evidence, harmonic safety, tempo stretch,
+   load identity, and cue requirements. It then warms deterministic load
+   routes and restores the opening pair to stopped decks.
+3. Call `start_autonomous_set` once. Performer persists the plan/state, reserves
+   control for the estimated set duration, starts the opening track atomically,
+   and adopts the first scheduler job.
+4. After each verified handoff, the runner immediately selects, stages, and
+   schedules the next option locally. It advances only after transport,
+   fader/EQ, effects/stems cleanup, and pre-audible bar-alignment QA pass.
+5. Before every staging retry, the runner measures remaining bars. At eight
+   bars or less it creates a 4-, 8-, or 16-beat loop on the next phrase
+   downbeat and verifies actual transport repetition. The accepted transition
+   card releases that loop on bar 0 beat 1. This prevents an exhausted outgoing
+   track from reaching silence while loading or verification recovers.
+6. A failed primary option is retried only within its explicit budget; then the
+   runner selects the next prepared fallback. State and failures are visible in
+   `autonomous_set_status` and survive a Performer process restart. Because
+   scheduler jobs themselves are process-local, do not restart Performer during
+   an active handoff.
+7. Optional `TempoPlan` ramps only the new, verified Master deck after the old
+   deck is retired. Candidate selection and card validation reject more than a
+   4 percent stretch by default. Use an intermediate BPM bridge or explicitly
+   accept the risk; do not leave a 130 BPM track parked at 121 BPM.
+
+For a manually supervised one-off handoff, the older
+`stage_and_schedule_transition_card` -> `transition_quality_report` ->
+`settle_set_transition` path remains supported.
+
+Use `plan_vocal_handoff` or the vocal-aware candidate ranker to choose a vocal
+owner without treating overlap as a hard failure. `recommend_transition_fx`
+provides Echo, Reverb, Spiral, or Vinyl Brake recipes with mandatory off/reset
+tails. Rekordbox exposes Select Next/Back and Beat Up/Down through MIDI Learn,
+so observe the current effect before cycling to a recommendation.
 
 `refresh_transition_state` now reconciles both decks from Rekordbox's displayed
 elapsed time and the analyzed beat grid. This corrects absolute bar position
 after a long-running track instead of copying a stale launch-relative clock.
-The UI clock is whole-second precision, so exact phase is reported as telemetry;
-Beat Sync, Quantize, and verified grid-aligned launch remain the phase authority.
+The elapsed-time UI clock is whole-second precision, so it is transport evidence
+rather than phase authority. Exact beat-in-bar acceptance comes from the visible
+downbeat-marker alignment; Beat Sync alone is insufficient because it can lock
+beats while beat 1 on one deck is aligned with beat 3 on the other.
 
 For the current Rekordbox 7 setup, MIX POINT LINK is the preferred precise
 launch mechanism. A future native or vision adapter can provide continuous deck
@@ -281,12 +326,10 @@ py -3.12 -m venv .venv
 7. Register `rekordbox-performer` as a stdio MCP server in your MCP client.
 8. Call `list_midi_outputs`, `connect_midi`, and `control_status`.
 9. Enable MIX POINT LINK in Preferences when available.
-10. Preflight profiles and a complete set plan.
-11. Before track one, cycle every planned incoming track through its assigned
-    deck and verify its Hot Cue for the current session; then restage the first
-    two tracks. This keeps expensive cue audits out of the live retirement
-    window.
-12. Preview a transition card, arm control, then perform it.
+10. Build an `AutonomousSetPlan` and call `preflight_autonomous_set` while both
+    decks are stopped. This warms loads and verifies required Hot Cues.
+11. Confirm the FLX4 is the audio device and PC MASTER OUT is off.
+12. Arm control and call `start_autonomous_set`.
 
 The dedicated mapping does not replace the DDJ-FLX4 factory mapping.
 
@@ -301,7 +344,10 @@ The dedicated mapping does not replace the DDJ-FLX4 factory mapping.
   blend would otherwise create vocal interference. Restore every loop and stem
   state before the retired deck is reloaded.
 - Live messages are rejected until control is armed.
-- Arming expires automatically after at most 30 minutes.
+- Normal manual arming expires automatically after at most 30 minutes. An
+  explicitly started autonomous set extends that authorization only for its
+  estimated duration (maximum four hours) and releases it on completion,
+  failure, or stop.
 - Transition plans default to dry-run preview.
 - Low-level scheduled events run against a local monotonic clock.
 - Musical cards quantize their start from a fresh beat/bar observation.

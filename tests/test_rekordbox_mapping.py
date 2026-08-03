@@ -31,7 +31,20 @@ def test_mapping_has_rekordbox_shape() -> None:
     assert {
         "MixPointSelectPrev", "MixPointSelectNext", "MixPointLink",
         "ActivePartVocal", "ActivePartInst", "ActivePartDrums",
+        "PAD1_BeatJump", "PAD2_BeatJump",
+        "PAD3_BeatJump", "PAD4_BeatJump",
     } <= names
+
+    beat_jump_rows = {
+        row[0]: row for row in rows[2:] if row[0].endswith("_BeatJump")
+    }
+    assert set(beat_jump_rows) == {
+        "PAD1_BeatJump", "PAD2_BeatJump", "PAD3_BeatJump", "PAD4_BeatJump"
+    }
+    for name, row in beat_jump_rows.items():
+        # Rekordbox resolves the command from the canonical first column.  An
+        # arbitrary label here imports cleanly but produces a dead control.
+        assert row[1] == name
 
     stem_rows = {
         row[0]: row

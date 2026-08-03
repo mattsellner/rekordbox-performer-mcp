@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytest
 
 from rekordbox_performer.rekordbox_ui import (
@@ -8,11 +8,39 @@ from rekordbox_performer.rekordbox_ui import (
     DeckSnapshot,
     RekordboxUIAdapter,
     blue_ratio,
+    analyze_bar_grid_alignment,
     vivid_color_ratio,
     normalize_title,
     parse_clock_seconds,
     unique_row_tops,
 )
+
+
+def test_visual_bar_grid_alignment_detects_two_beat_offset() -> None:
+    image = Image.new("RGB", (1672, 566))
+    draw = ImageDraw.Draw(image)
+    for x in range(141, 1672, 159):
+        draw.rectangle((x - 1, 118, x + 1, 121), fill=(255, 0, 0))
+    for x in range(62, 1672, 159):
+        draw.rectangle((x - 1, 187, x + 1, 190), fill=(255, 0, 0))
+
+    result = analyze_bar_grid_alignment(image)
+
+    assert result["verified"] is True
+    assert result["error_beats"] == pytest.approx(2.0, abs=0.03)
+
+
+def test_visual_bar_grid_alignment_accepts_matching_downbeats() -> None:
+    image = Image.new("RGB", (1672, 566))
+    draw = ImageDraw.Draw(image)
+    for y in (118, 187):
+        for x in range(141, 1672, 159):
+            draw.rectangle((x - 1, y, x + 1, y + 3), fill=(255, 0, 0))
+
+    result = analyze_bar_grid_alignment(image)
+
+    assert result["verified"] is True
+    assert result["error_beats"] == pytest.approx(0.0, abs=0.03)
 
 
 def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
@@ -71,6 +99,23 @@ def test_deck_snapshot_derives_live_bpm_from_pitch_when_jog_bpm_is_omitted() -> 
         window_width=1920,
     )
     assert snapshot.bpm == 123.42
+
+
+def test_deck_snapshot_observes_master_button_state() -> None:
+    image = Image.new("RGB", (1920, 1009))
+    ImageDraw.Draw(image).rectangle((817, 305, 887, 318), fill=(0, 120, 255))
+    samples = [
+        ControlSample(None, "Button", "MASTER", 817, 305, 887, 318),
+    ]
+
+    snapshot = RekordboxUIAdapter()._deck_snapshot(
+        samples,
+        image,
+        deck=1,
+        window_width=1920,
+    )
+
+    assert snapshot.master_enabled is True
 
 
 def test_parse_clock_seconds() -> None:

@@ -83,6 +83,140 @@ def vivid_color_ratio(image: Image.Image) -> float:
     return vivid / (width * height)
 
 
+def _red_marker_centers(image: Image.Image, y: int) -> list[float]:
+    """Return horizontal centers of Rekordbox's red beat-grid markers."""
+    rgb = image.convert("RGB")
+    runs: list[list[int]] = []
+    for x in range(rgb.width):
+        red, green, blue = rgb.getpixel((x, y))
+        if red < 180 or green > 70 or blue > 70:
+            continue
+        if not runs or x > runs[-1][-1] + 1:
+            runs.append([x])
+        else:
+            runs[-1].append(x)
+    return [(run[0] + run[-1]) / 2.0 for run in runs]
+
+
+def _marker_lattice(
+    image: Image.Image,
+    start_y: int,
+    end_y: int,
+) -> dict[str, Any] | None:
+    """Fit the cleanest regularly spaced downbeat-marker row in one deck."""
+    width = image.width
+    best: tuple[tuple[float, int, float], dict[str, Any]] | None = None
+    for y in range(max(0, start_y), min(image.height, end_y)):
+        centers = _red_marker_centers(image, y)
+        if len(centers) < 6:
+            continue
+        for left_index, left in enumerate(centers):
+            for right in centers[left_index + 1:]:
+                step = right - left
+                if not width * 0.07 <= step <= width * 0.12:
+                    continue
+                by_index: dict[int, tuple[float, float]] = {}
+                for center in centers:
+                    index = round((center - left) / step)
+                    residual = abs(center - (left + index * step))
+                    if residual > 2.5:
+                        continue
+                    previous = by_index.get(index)
+                    if previous is None or residual < previous[1]:
+                        by_index[index] = (center, residual)
+                if len(by_index) < 6:
+                    continue
+                ordered = sorted(by_index.items())
+                longest: list[tuple[int, tuple[float, float]]] = []
+                current: list[tuple[int, tuple[float, float]]] = []
+                for item in ordered:
+                    if current and item[0] != current[-1][0] + 1:
+                        if len(current) > len(longest):
+                            longest = current
+                        current = []
+                    current.append(item)
+                if len(current) > len(longest):
+                    longest = current
+                if len(longest) < 6:
+                    continue
+                xs = [item[1][0] for item in longest]
+                qs = [item[0] for item in longest]
+                q_mean = sum(qs) / len(qs)
+                x_mean = sum(xs) / len(xs)
+                denominator = sum((q - q_mean) ** 2 for q in qs)
+                if denominator == 0:
+                    continue
+                fitted_step = sum(
+                    (q - q_mean) * (x - x_mean)
+                    for q, x in zip(qs, xs)
+                ) / denominator
+                intercept = x_mean - fitted_step * q_mean
+                rms = (
+                    sum(
+                        (x - (intercept + fitted_step * q)) ** 2
+                        for q, x in zip(qs, xs)
+                    ) / len(qs)
+                ) ** 0.5
+                coverage = len(xs) / len(centers)
+                score = (coverage, len(xs), -rms)
+                result = {
+                    "y": y,
+                    "marker_count": len(xs),
+                    "spacing_px": fitted_step,
+                    "intercept_px": intercept,
+                    "rms_px": rms,
+                }
+                if best is None or score > best[0]:
+                    best = (score, result)
+    return None if best is None else best[1]
+
+
+def analyze_bar_grid_alignment(image: Image.Image) -> dict[str, Any]:
+    """Measure deck-to-deck beat-in-bar alignment from visible downbeats.
+
+    Rekordbox paints red downbeat triangles above each stacked enlarged
+    waveform. Their horizontal phase is authoritative for bar alignment and
+    catches the exact failure that Beat Sync alone cannot: beats can be phase
+    locked while beat 1 on one deck is aligned to beat 3 on the other.
+    """
+    outgoing = _marker_lattice(
+        image,
+        108,
+        132,
+    )
+    incoming = _marker_lattice(
+        image,
+        184,
+        196,
+    )
+    if outgoing is None or incoming is None:
+        return {
+            "verified": False,
+            "error": "visible downbeat marker rows were not detected",
+        }
+    first_step = float(outgoing["spacing_px"])
+    second_step = float(incoming["spacing_px"])
+    spacing = (first_step + second_step) / 2.0
+    if spacing <= 0 or abs(first_step - second_step) / spacing > 0.05:
+        return {
+            "verified": False,
+            "error": "deck waveform zoom levels do not match",
+            "outgoing": outgoing,
+            "incoming": incoming,
+        }
+    raw = float(incoming["intercept_px"]) - float(outgoing["intercept_px"])
+    phase_px = (raw + spacing / 2.0) % spacing - spacing / 2.0
+    error_beats = abs(phase_px) / spacing * 4.0
+    return {
+        "verified": True,
+        "error_beats": round(error_beats, 3),
+        "signed_error_beats": round(phase_px / spacing * 4.0, 3),
+        "spacing_px": round(spacing, 3),
+        "outgoing": outgoing,
+        "incoming": incoming,
+    }
+
+
 @dataclass(frozen=True)
 class DeckSnapshot:
     deck: int
@@ -93,6 +227,7 @@ class DeckSnapshot:
     elapsed_seconds: int | None
     beat_sync_enabled: bool | None
     quantize_enabled: bool | None
+    master_enabled: bool | None = None
     stem_vocal_enabled: bool | None = None
     stem_instrumental_enabled: bool | None = None
     stem_drums_enabled: bool | None = None
@@ -107,6 +242,7 @@ class DeckSnapshot:
             "elapsed_seconds": self.elapsed_seconds,
             "beat_sync_enabled": self.beat_sync_enabled,
             "quantize_enabled": self.quantize_enabled,
+            "master_enabled": self.master_enabled,
             "stem_vocal_enabled": self.stem_vocal_enabled,
             "stem_instrumental_enabled": self.stem_instrumental_enabled,
             "stem_drums_enabled": self.stem_drums_enabled,
@@ -230,6 +366,7 @@ class RekordboxUIAdapter:
             top = rectangle.top - window.top
             if (
                 (control_type == "ComboBox" and 0 <= top <= 70)
+                or (control_type == "Button" and 0 <= top <= 70)
                 or (
                     control_type in {"Text", "Edit", "Button", "Custom"}
                     and (
@@ -635,6 +772,77 @@ class RekordboxUIAdapter:
         left, top, right, bottom = self._relative_rectangle(root, control)
         return blue_ratio(image.crop((left, top, right, bottom))) >= 0.25
 
+    def _pc_master_out_button(self, root, descendants=None):
+        """Locate Rekordbox's top-bar PC MASTER OUT toggle.
+
+        Rekordbox exposes this icon as an unnamed button.  Anchor it between
+        the named Free-plan button and AudioCpuGraphButton so the lookup is
+        independent of absolute screen resolution.
+        """
+        descendants = descendants or root.descendants()
+        free = next(
+            (
+                control
+                for control in descendants
+                if control.element_info.control_type == "Button"
+                and control.window_text().startswith("Free")
+            ),
+            None,
+        )
+        cpu = next(
+            (
+                control
+                for control in descendants
+                if control.element_info.control_type == "Button"
+                and control.window_text() == "AudioCpuGraphButton"
+            ),
+            None,
+        )
+        if free is None or cpu is None:
+            raise RuntimeError("Unable to locate Rekordbox audio-route controls")
+        candidates = [
+            control
+            for control in descendants
+            if control.element_info.control_type == "Button"
+            and not control.window_text()
+            and free.rectangle().right < control.rectangle().left
+            and control.rectangle().right < cpu.rectangle().left
+            and control.rectangle().top < cpu.rectangle().bottom + 12
+        ]
+        if not candidates:
+            raise RuntimeError("Unable to locate Rekordbox PC MASTER OUT")
+        return max(candidates, key=lambda control: control.rectangle().left)
+
+    def pc_master_out_enabled(
+        self,
+        root=None,
+        image: Image.Image | None = None,
+        descendants=None,
+    ) -> bool:
+        root = root or self._root()
+        image = image or self._capture_focused(root)
+        return self._button_active(
+            root,
+            self._pc_master_out_button(root, descendants),
+            image,
+        )
+
+    def ensure_pc_master_out(self, enabled: bool) -> dict[str, Any]:
+        root = self._root()
+        descendants = self._status_controls(root)
+        image = self._capture_focused(root)
+        button = self._pc_master_out_button(root, descendants)
+        before = self._button_active(root, button, image)
+        if before != enabled:
+            button.click_input()
+            time.sleep(0.35)
+        after = self.pc_master_out_enabled(root, descendants=descendants)
+        if after != enabled:
+            raise RuntimeError(
+                "Rekordbox PC MASTER OUT did not reach the requested state"
+            )
+        return {"before": before, "after": after, "changed": before != after}
+
     @staticmethod
     def _capture_focused(root) -> Image.Image:
         # Windows can return a blank/white PrintWindow capture for Rekordbox
@@ -664,6 +872,7 @@ class RekordboxUIAdapter:
         elapsed = None
         sync = None
         quantize = None
+        master = None
         stems: dict[str, bool | None] = {
             "VOCAL": None,
             "INST": None,
@@ -724,6 +933,10 @@ class RekordboxUIAdapter:
                 sync = blue_ratio(
                     image.crop((left, sample.top, right, sample.bottom))
                 ) >= 0.25
+            if text == "MASTER" and control_type == "Button":
+                master = blue_ratio(
+                    image.crop((left, sample.top, right, sample.bottom))
+                ) >= 0.08
             if text == "Q" and 420 <= top <= 500:
                 quantize = blue_ratio(
                     image.crop((left, sample.top, right, sample.bottom))
@@ -771,6 +984,7 @@ class RekordboxUIAdapter:
             elapsed_seconds=elapsed,
             beat_sync_enabled=sync,
             quantize_enabled=quantize,
+            master_enabled=master,
             stem_vocal_enabled=stems["VOCAL"],
             stem_instrumental_enabled=stems["INST"],
             stem_drums_enabled=stems["DRUMS"],
@@ -842,8 +1056,18 @@ class RekordboxUIAdapter:
         descendants = self._status_controls(root)
         samples, window_width = self._sample_controls(root, descendants)
         image = self._capture_focused(root)
+        try:
+            pc_master_out_enabled = self.pc_master_out_enabled(
+                root,
+                image,
+                descendants,
+            )
+        except RuntimeError:
+            pc_master_out_enabled = None
         return {
             "mode": self._mode_from_samples(samples),
+            "pc_master_out_enabled": pc_master_out_enabled,
+            "bar_alignment": analyze_bar_grid_alignment(image),
             "decks": [
                 self._deck_snapshot(
                     samples,

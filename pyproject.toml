@@ -19,9 +19,6 @@ rehearsal = [
     "soundfile>=0.13,<0.14",
 ]
 
-[project.scripts]
-rekordbox-performer = "rekordbox_performer.server:main"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

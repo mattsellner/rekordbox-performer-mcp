@@ -31,6 +31,7 @@ class MidiEngine:
         self.port_name: str | None = None
         self.armed_until = 0.0
         self.job_armed_until = 0.0
+        self.set_armed_until = 0.0
         self.sent_messages = 0
         self.continuous_control_state: dict[str, dict[str, Any]] = {}
         self.lease = lease or ControlLease(
@@ -89,11 +90,33 @@ class MidiEngine:
     def disarm(self) -> dict[str, Any]:
         self.armed_until = 0.0
         self.job_armed_until = 0.0
+        self.set_armed_until = 0.0
         return self.status()
 
     def is_armed(self) -> bool:
-        deadline = max(self.armed_until, self.job_armed_until)
+        deadline = max(
+            self.armed_until,
+            self.job_armed_until,
+            self.set_armed_until,
+        )
         return self.output is not None and time.monotonic() < deadline
+
+    def authorize_set(self, duration_seconds: float) -> float:
+        """Reserve control for one explicitly started autonomous set."""
+        if self.output is None or not self.is_armed():
+            raise RuntimeError(
+                "Connect and arm live MIDI before authorizing an autonomous set"
+            )
+        if duration_seconds <= 0 or duration_seconds > 4 * 60 * 60:
+            raise ValueError("set duration must be between 1 second and 4 hours")
+        self.set_armed_until = max(
+            self.set_armed_until,
+            time.monotonic() + duration_seconds,
+        )
+        return self.set_armed_until
+
+    def release_set_control(self) -> None:
+        self.set_armed_until = 0.0
 
     def reserve_job_control(self, duration_seconds: float) -> float:
         """Keep an already-authorized scheduled job armed through verification."""
@@ -175,12 +198,14 @@ class MidiEngine:
     def status(self) -> dict[str, Any]:
         remaining = max(0.0, self.armed_until - time.monotonic())
         job_remaining = max(0.0, self.job_armed_until - time.monotonic())
+        set_remaining = max(0.0, self.set_armed_until - time.monotonic())
         return {
             "connected": self.output is not None,
             "port_name": self.port_name,
             "armed": self.is_armed(),
             "armed_seconds_remaining": round(remaining, 1),
             "job_armed_seconds_remaining": round(job_remaining, 1),
+            "set_armed_seconds_remaining": round(set_remaining, 1),
             "sent_messages": self.sent_messages,
             "continuous_control_state": dict(self.continuous_control_state),
             "control_lease": self.lease.status(),

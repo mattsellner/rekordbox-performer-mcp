@@ -63,6 +63,65 @@ class AutoStartUI(FakeUI):
         return self.play_checks >= 3
 
 
+class AlreadyLoadedUI(FakeUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_attempted = False
+
+    def deck_snapshot(self, deck: int) -> DeckSnapshot:
+        return DeckSnapshot(
+            deck=deck,
+            title="Track",
+            artist="Artist",
+            bpm=128,
+            key="5A",
+            elapsed_seconds=0,
+            beat_sync_enabled=True,
+            quantize_enabled=True,
+        )
+
+    def select_exact_track(self, *args, **kwargs):
+        self.search_attempted = True
+        raise AssertionError("resident track must not trigger browser search")
+
+
+class ShrinkingResultsUI(FakeUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.select_calls = 0
+
+    def select_exact_track(
+        self,
+        title: str,
+        search_query=None,
+        result_index=0,
+    ):
+        self.select_calls += 1
+        if result_index == 1:
+            raise ValueError("result_index must be between 0 and 0")
+        return {
+            "title": title,
+            "search_query": search_query,
+            "result_count": 2 if self.select_calls == 1 else 1,
+            "result_index": result_index,
+            "selected_row_top": 800,
+            "focused": True,
+        }
+
+    def wait_for_deck_title(self, deck: int, title: str, timeout_seconds: float):
+        self.wait_calls += 1
+        return DeckSnapshot(
+            deck=deck,
+            title=title,
+            artist="Wrong Artist" if self.wait_calls == 1 else "Artist",
+            bpm=128,
+            key="5A",
+            elapsed_seconds=0,
+            beat_sync_enabled=True,
+            quantize_enabled=True,
+        )
+
+
 class FakeEngine:
     def __init__(self) -> None:
         self.actions = []
@@ -113,6 +172,37 @@ def test_stage_track_uses_verified_drag_fallback(monkeypatch) -> None:
         ("cue", {"deck": 1}),
     ]
     assert result["transport_verified_stopped"] is True
+
+
+def test_stage_track_skips_search_when_exact_track_is_already_loaded(
+    monkeypatch,
+) -> None:
+    ui = AlreadyLoadedUI()
+    observer = FakeObserver()
+    engine = FakeEngine()
+    monkeypatch.setattr(server, "rekordbox_ui", ui)
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server, "deck_observer", observer)
+
+    result = asyncio.run(
+        server._stage_track(
+            deck=2,
+            track_id="rekordbox:resident",
+            title="Track",
+            artist="Artist",
+            source="local",
+        )
+    )
+
+    assert result["verified"] is True
+    assert result["already_loaded"] is True
+    assert result["browser_search_skipped"] is True
+    assert result["selection"] is None
+    assert ui.search_attempted is False
+    assert engine.actions == [
+        ("channel_fader", {"deck": 2, "value": 0}),
+        ("cue", {"deck": 2}),
+    ]
 
 
 def test_stage_track_broadens_parenthetical_search(monkeypatch) -> None:
@@ -245,3 +335,58 @@ def test_stage_track_reuses_verified_search_and_drag_route(monkeypatch) -> None:
     assert second["route_cache_hit"] is True
     assert second["attempts"][0]["method"] == "drag_to_deck"
     assert not any(action == "load_deck_1" for action, _ in engine.actions)
+
+
+def test_stage_track_recovers_when_duplicate_results_shrink_during_load(
+    monkeypatch,
+) -> None:
+    ui = ShrinkingResultsUI()
+    monkeypatch.setattr(server, "rekordbox_ui", ui)
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    monkeypatch.setattr(server, "deck_observer", FakeObserver())
+
+    result = asyncio.run(
+        server._stage_track(
+            deck=1,
+            track_id="rekordbox:shrinking-results",
+            title="Track",
+            artist="Artist",
+        )
+    )
+
+    assert result["verified"] is True
+    assert result["observed"]["artist"] == "Artist"
+    assert result["selection"]["result_index"] == 0
+
+
+def test_stage_track_retries_transient_empty_collection(monkeypatch) -> None:
+    ui = FakeUI()
+    ui.expected_artist = "Levi"
+    original = ui.select_exact_track
+    attempts = 0
+
+    def select(title, search_query=None, result_index=0):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise RuntimeError(
+                f"Exact search for {title!r} returned no visible rows"
+            )
+        return original(title, search_query=search_query, result_index=result_index)
+
+    ui.select_exact_track = select
+    monkeypatch.setattr(server, "rekordbox_ui", ui)
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    monkeypatch.setattr(server, "deck_observer", FakeObserver())
+
+    result = asyncio.run(
+        server._stage_track(
+            deck=1,
+            track_id="rekordbox:transient-empty",
+            title="Jump",
+            artist="Levi",
+        )
+    )
+
+    assert result["verified"] is True
+    assert attempts == 3

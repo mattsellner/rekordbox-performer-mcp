@@ -3,6 +3,7 @@ from pathlib import Path
 from rekordbox_performer.intelligence import (
     AnalysisBeatGridPoint,
     MusicalEvent,
+    PhraseBoundary,
     TrackLandmark,
     TrackProfile,
     TrackSegment,
@@ -30,7 +31,22 @@ def profile(track_id: str) -> TrackProfile:
         vocal_confidence="high",
         beat_grid=[
             AnalysisBeatGridPoint(index=1, bar=1, beat=1, bpm=120, time_ms=0),
+            AnalysisBeatGridPoint(index=65, bar=17, beat=1, bpm=120, time_ms=32000),
             AnalysisBeatGridPoint(index=241, bar=61, beat=1, bpm=120, time_ms=120000),
+        ],
+        phrase_boundaries=[
+            PhraseBoundary(
+                index=1,
+                start_beat=65,
+                end_beat=96,
+                start_bar=17,
+                beat_in_bar=1,
+                length_beats=32,
+                length_bars=8,
+                kind_code=1,
+                label="UP 1",
+                confidence="high",
+            ),
         ],
         landmarks=[
             TrackLandmark(name="drop", kind="drop", bar=33, confidence="high"),
@@ -87,6 +103,22 @@ def test_cue_plan_selects_sixteen_bars_before_drop() -> None:
     result = cue_preparation_plan(profile("a"))
     assert result["suggestions"][0]["bar"] == 17
     assert result["suggestions"][0]["role"] == "16_bars_before_drop"
+    assert result["suggestions"][0]["cue"] == 7
+    assert result["cue_policy"] == "automation uses Hot Cue G/H only"
+
+
+def test_cue_plan_rejects_non_phrase_downbeats_and_never_uses_user_cues() -> None:
+    candidate = profile("a")
+    candidate.landmarks = [
+        TrackLandmark(name="early bass", kind="bass_in", bar=29, confidence="high"),
+        TrackLandmark(name="verified bass", kind="bass_in", bar=33, confidence="high"),
+        TrackLandmark(name="user cue A", kind="phrase_start", bar=1, cue=1, confidence="verified"),
+    ]
+
+    result = cue_preparation_plan(candidate)
+
+    assert [item["bar"] for item in result["suggestions"]] == [17]
+    assert [item["cue"] for item in result["suggestions"]] == [7]
 
 
 def test_sync_report_flags_phase_or_mode() -> None:
@@ -96,6 +128,18 @@ def test_sync_report_flags_phase_or_mode() -> None:
     )
     assert report["verified"] is False
     assert report["beat_phase_error_ms"] == 125
+
+
+def test_sync_report_rejects_matching_beats_on_different_bar_positions() -> None:
+    report = sync_report(
+        {"bpm": 120, "beat": 3, "beat_phase": 0.02},
+        {"bpm": 120, "beat": 1, "beat_phase": 0.02, "sync_enabled": True},
+    )
+
+    assert report["verified"] is False
+    assert report["beat_phase_error_ms"] == 0
+    assert report["bar_phase_error_beats"] == 2
+    assert "beat-in-bar alignment error is 2.00 beats" in report["errors"]
 
 
 def test_fx_recipe_has_explicit_reset() -> None:
@@ -127,3 +171,25 @@ def test_transition_qa_fails_bad_dispatch() -> None:
     })
     assert report["passed"] is False
     assert report["score"] < 100
+
+
+def test_transition_qa_fails_unverified_beat_phase() -> None:
+    report = transition_qa({
+        "id": "job-phase-error",
+        "status": "completed",
+        "p99_event_lateness_ms": 2,
+        "completed_events": 17,
+        "verification": {
+            "verified": True,
+            "errors": [],
+            "sync": {
+                "verified": False,
+                "errors": ["beat phase error is 83.1 ms"],
+                "beat_phase_error_ms": 83.1,
+            },
+        },
+    })
+
+    assert report["passed"] is False
+    assert "beat phase error is 83.1 ms" in report["faults"]
+    assert report["metrics"]["beat_phase_error_ms"] == 83.1

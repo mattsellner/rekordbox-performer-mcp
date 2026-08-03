@@ -281,3 +281,18 @@ def test_scheduler_reserves_control_for_entire_job() -> None:
         scheduler.cancel_all()
 
     asyncio.run(scenario())
+
+
+def test_explicit_autonomous_set_authorization_outlives_short_arm() -> None:
+    engine = MidiEngine()
+    output = FakeOutput()
+    engine.output = output
+    engine.port_name = output.name
+    engine.arm(10)
+
+    deadline = engine.authorize_set(3600)
+
+    assert deadline > engine.armed_until
+    assert engine.status()["set_armed_seconds_remaining"] > 3500
+    engine.release_set_control()
+    assert engine.status()["set_armed_seconds_remaining"] == 0

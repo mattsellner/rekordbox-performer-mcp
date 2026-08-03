@@ -61,10 +61,22 @@ def card() -> TransitionCard:
 
 def opening_card() -> TransitionCard:
     transition = card()
+    transition.start_phrase_index = 2
     transition.events[0] = MusicalEvent(
         bar_offset=0,
         action="play_pause",
         parameters={"deck": 2},
+    )
+    return transition
+
+
+def hot_cue_opening_card() -> TransitionCard:
+    transition = card()
+    transition.start_phrase_index = 2
+    transition.events[0] = MusicalEvent(
+        bar_offset=0,
+        action="hot_cue",
+        parameters={"deck": 2, "cue": 7},
     )
     return transition
 
@@ -107,6 +119,10 @@ class OpeningUI:
             ]
         }
 
+    def ensure_pc_master_out(self, enabled: bool) -> dict:
+        assert enabled is False
+        return {"before": True, "after": False, "changed": True}
+
 
 class OpeningEngine:
     def __init__(self) -> None:
@@ -134,11 +150,41 @@ def _install_opening_fakes(monkeypatch, *, incoming_bpm: float = 128.0):
     async def modes(**kwargs):
         return {"deck": kwargs["deck"], "changed": False, "actions": []}
 
+    async def master(deck):
+        return {
+            "deck": deck,
+            "changed": False,
+            "before": {"target": True, "other": False},
+            "after": {"target": True, "other": False},
+            "messages": [],
+        }
+
+    async def stage(**kwargs):
+        return {
+            "deck": kwargs["deck"],
+            "track_id": kwargs["track_id"],
+            "verified": True,
+            "already_loaded": True,
+            "browser_search_skipped": True,
+        }
+
+    async def master(deck):
+        messages = await engine.send_action("master", {"deck": deck})
+        return {
+            "deck": deck,
+            "before": {"target": False, "other": True},
+            "after": {"target": True, "other": False},
+            "changed": True,
+            "messages": messages,
+        }
+
     monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    monkeypatch.setattr(server, "ensure_master_deck", master)
+    monkeypatch.setattr(server, "_stage_track", stage)
     return engine
 
 
-def test_atomic_opening_enters_rescue_loop_when_job_is_not_scheduled(
+def test_atomic_opening_stops_both_decks_when_job_is_not_scheduled(
     monkeypatch,
 ) -> None:
     engine = _install_opening_fakes(monkeypatch)
@@ -166,8 +212,79 @@ def test_atomic_opening_enters_rescue_loop_when_job_is_not_scheduled(
     )
 
     assert result["ready"] is False
-    assert result["started"] is True
-    assert "loop_8" in engine.actions
+    assert result["started"] is False
+    assert result["aborted_after_launch"] is True
+    assert "loop_8" not in engine.actions
+    assert engine.actions[-4:] == [
+        "channel_fader",
+        "cue",
+        "channel_fader",
+        "cue",
+    ]
+
+
+def test_atomic_opening_cancels_unreserved_job_before_stopping_decks(
+    monkeypatch,
+) -> None:
+    _install_opening_fakes(monkeypatch)
+    cancelled = []
+
+    async def launch(**kwargs):
+        return {"live_state": {"playing": True}}
+
+    async def refresh(**kwargs):
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "unreserved-job",
+                "execution_id": "opening-unreserved",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": None,
+            },
+        }
+
+    class CancelScheduler:
+        def cancel(self, job_id):
+            cancelled.append(job_id)
+            return {"id": job_id, "status": "cancelled"}
+
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+    monkeypatch.setattr(server, "scheduler", CancelScheduler())
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            execution_id="opening-unreserved",
+        )
+    )
+
+    assert result["ready"] is False
+    assert result["started"] is False
+    assert cancelled == ["unreserved-job"]
+    assert result["cancelled_job"]["status"] == "cancelled"
+
+
+def test_atomic_opening_requires_an_explicit_analyzed_phrase() -> None:
+    transition = opening_card()
+    transition.start_phrase_index = None
+
+    with pytest.raises(ValueError, match="explicit analyzed start_phrase_index"):
+        asyncio.run(
+            server.launch_and_schedule_opening_transition(
+                card=transition,
+                outgoing_title="Outgoing",
+                incoming_title="Incoming",
+                execution_id="opening-without-phrase",
+            )
+        )
 
 
 def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
@@ -184,7 +301,16 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
         return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
 
     async def schedule(**kwargs):
-        return {"ready": True, "job": {"id": "job-1"}}
+        return {
+            "ready": True,
+            "job": {
+                "id": "job-1",
+                "execution_id": "opening-2",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 123.0,
+            },
+        }
 
     monkeypatch.setattr(server, "launch_staged_track", launch)
     monkeypatch.setattr(server, "refresh_transition_state", refresh)
@@ -201,6 +327,7 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
 
     assert result["ready"] is True
     assert result["started"] is True
+    assert result["audio_route"]["after"] is False
     assert result["schedule"]["job"]["id"] == "job-1"
     assert engine.actions == [
         "channel_fader",
@@ -221,6 +348,282 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
         "fx_wet_dry",
         "master",
     ]
+
+
+def test_atomic_opening_prepares_and_verifies_hot_cue_before_playback(
+    monkeypatch,
+) -> None:
+    _install_opening_fakes(monkeypatch)
+    order = []
+
+    async def stage(**kwargs):
+        order.append("stage")
+        return {"verified": True, "already_loaded": True}
+
+    async def verify(**kwargs):
+        order.append("verify")
+        assert kwargs["cue"] == 7
+        assert kwargs["expected_time_ms"] == 112_087
+        return {"verified": True}
+
+    async def launch(**kwargs):
+        order.append("launch")
+        assert order == ["stage", "verify", "launch"]
+        return {"live_state": {"playing": True}}
+
+    async def refresh(**kwargs):
+        assert kwargs["incoming_hot_cue"] == 7
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "job-hot-cue",
+                "execution_id": "opening-hot-cue",
+                "status": "scheduled",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 456.0,
+            },
+        }
+
+    monkeypatch.setattr(server, "_stage_track", stage)
+    monkeypatch.setattr(server, "verify_hot_cue", verify)
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=hot_cue_opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            incoming_artist="Artist",
+            incoming_cue=7,
+            incoming_cue_time_ms=112_087,
+            execution_id="opening-hot-cue",
+        )
+    )
+
+    assert result["ready"] is True
+    assert result["started"] is True
+    assert result["schedule"]["job"]["id"] == "job-hot-cue"
+
+
+def test_refresh_preserves_native_subsecond_phase_for_running_deck(
+    monkeypatch,
+) -> None:
+    class Profiles:
+        def get(self, track_id: str):
+            return SimpleNamespace(
+                track_id=track_id,
+                title={"a": "Outgoing", "b": "Incoming"}[track_id],
+                bpm=128.0,
+                time_signature=4,
+                beat_grid=[],
+            )
+
+    class CoarseClockUI:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def status(self) -> dict:
+            self.calls += 1
+            outgoing = 12 if self.calls == 1 else 13
+            return {
+                "decks": [
+                    {
+                        "deck": 1,
+                        "title": "Outgoing",
+                        "elapsed_seconds": outgoing,
+                        "bpm": 128.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                    {
+                        "deck": 2,
+                        "title": "Incoming",
+                        "elapsed_seconds": 0,
+                        "bpm": 128.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                ]
+            }
+
+    async def no_sleep(_seconds):
+        return None
+
+    state = server.LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="Outgoing",
+            bpm=128.0,
+            playing=True,
+            bar=7,
+            beat=1,
+            track_beat=25,
+            beat_phase=0.6,
+            sync_enabled=True,
+            quantize_enabled=True,
+            source="native",
+            confidence="high",
+        )
+    )
+    monkeypatch.setattr(server, "profile_store", Profiles())
+    monkeypatch.setattr(server, "rekordbox_ui", CoarseClockUI())
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+    monkeypatch.setattr(server, "live_state", state)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(
+        server.refresh_transition_state(
+            outgoing_deck=1,
+            outgoing_track_id="a",
+            outgoing_title="Outgoing",
+            incoming_deck=2,
+            incoming_track_id="b",
+            incoming_title="Incoming",
+        )
+    )
+
+    # The UI reports only whole seconds (13s would snap near beat 28).  Keep
+    # the native launch clock at beat 25 + its fractional phase instead.
+    assert result["outgoing"]["track_beat"] == 25
+    assert 0.59 <= result["outgoing"]["beat_phase"] <= 0.65
+    assert result["outgoing"]["source"] == "native"
+
+
+def test_rolling_scheduler_skips_blind_master_toggle_and_requires_job(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(server, "profile_store", OpeningProfileStore())
+    master_calls = []
+
+    async def stage(**kwargs):
+        return {"verified": True, "already_loaded": True}
+
+    async def verify(**kwargs):
+        return {"verified": True}
+
+    async def refresh(**kwargs):
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def master(deck):
+        master_calls.append(deck)
+        return {
+            "deck": deck,
+            "changed": False,
+            "before": {"target": True, "other": False},
+            "after": {"target": True, "other": False},
+            "messages": [],
+        }
+
+    async def modes(**kwargs):
+        return {"deck": kwargs["deck"], "changed": False, "actions": []}
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "rolling-job",
+                "execution_id": "rolling-1",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 789.0,
+            },
+        }
+
+    async def blind_toggle(*args, **kwargs):
+        raise AssertionError("Master must never be blindly toggled")
+
+    monkeypatch.setattr(server, "_stage_track", stage)
+    monkeypatch.setattr(server, "verify_hot_cue", verify)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "ensure_master_deck", master)
+    monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+    monkeypatch.setattr(server, "trigger_control", blind_toggle)
+
+    result = asyncio.run(
+        server.stage_and_schedule_transition_card(
+            card=card(),
+            incoming_title="Incoming",
+            incoming_artist="Artist",
+            incoming_cue=1,
+            incoming_cue_time_ms=10_000,
+            execution_id="rolling-1",
+        )
+    )
+
+    assert result["ready"] is True
+    assert result["schedule"]["job"]["id"] == "rolling-job"
+    assert master_calls == [1]
+
+
+def test_rolling_scheduler_accepts_verified_file_start_without_hot_cue(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(server, "profile_store", OpeningProfileStore())
+    transition = opening_card()
+    transition.transition_family = "phrase_cut"
+    refresh_calls = []
+
+    async def stage(**kwargs):
+        return {"verified": True, "already_loaded": True}
+
+    async def refresh(**kwargs):
+        refresh_calls.append(kwargs)
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def modes(**kwargs):
+        return {"deck": kwargs["deck"], "changed": False, "actions": []}
+
+    async def file_start_master(deck):
+        return {
+            "deck": deck,
+            "changed": False,
+            "before": {"target": True, "other": False},
+            "after": {"target": True, "other": False},
+            "messages": [],
+        }
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "file-start-job",
+                "execution_id": "file-start-1",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 789.0,
+            },
+        }
+
+    async def unexpected_cue_verification(**kwargs):
+        raise AssertionError("file-start launch must not verify a Hot Cue")
+
+    monkeypatch.setattr(server, "_stage_track", stage)
+    monkeypatch.setattr(server, "verify_hot_cue", unexpected_cue_verification)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "ensure_master_deck", file_start_master)
+    monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.stage_and_schedule_transition_card(
+            card=transition,
+            incoming_title="Incoming",
+            incoming_artist="Artist",
+            execution_id="file-start-1",
+        )
+    )
+
+    assert result["ready"] is True
+    assert result["cue_verification"] is None
+    assert all(call["incoming_hot_cue"] is None for call in refresh_calls)
 
 
 def test_ensure_stem_state_observes_toggles_and_verifies(monkeypatch) -> None:
@@ -329,6 +732,103 @@ def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(
     assert scheduler.cancelled == ["guarded-job"]
     assert server.sync_guard_status["guarded-job"]["status"] == "failed_safe"
     assert engine.actions[-3:] == ["channel_fader", "eq_low", "cue"]
+
+
+def test_sync_guard_rejects_transport_prearmed_before_phrase_beat_one() -> None:
+    with pytest.raises(RuntimeError, match="exact phrase beat-1 boundary"):
+        server._arm_sync_guard(
+            job_id="early-launch",
+            card=opening_card(),
+            events=[
+                {
+                    "at_ms": 19_653,
+                    "action": "hot_cue",
+                    "parameters": {"deck": 2, "cue": 1},
+                }
+            ],
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            expected_phrase_boundary_ms=20_000,
+        )
+
+
+def test_sync_guard_repairs_two_beat_bar_error_before_fader_rise(
+    monkeypatch,
+) -> None:
+    class GuardUI:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invalidate_status_cache(self) -> None:
+            pass
+
+        def status(self) -> dict:
+            self.calls += 1
+            corrected = self.calls >= 3
+            return {
+                "bar_alignment": {
+                    "verified": True,
+                    "error_beats": 0 if corrected else 2,
+                    "signed_error_beats": 0 if corrected else 2,
+                },
+                "decks": [
+                    {
+                        "deck": 1,
+                        "title": "Outgoing",
+                        "elapsed_seconds": 10 + self.calls,
+                        "bpm": 120.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                    {
+                        "deck": 2,
+                        "title": "Incoming",
+                        "elapsed_seconds": self.calls,
+                        "bpm": 120.0,
+                        "beat_sync_enabled": True,
+                        "quantize_enabled": True,
+                    },
+                ],
+            }
+
+    class GuardScheduler:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+
+        def cancel(self, job_id: str) -> dict:
+            self.cancelled.append(job_id)
+            return {"id": job_id, "status": "cancelled"}
+
+    async def no_sleep(_seconds):
+        return None
+
+    engine = OpeningEngine()
+    scheduler = GuardScheduler()
+    monkeypatch.setattr(server, "rekordbox_ui", GuardUI())
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server, "scheduler", scheduler)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(server, "sync_guard_status", {})
+
+    asyncio.run(
+        server._guard_incoming_sync(
+            job_id="repair-job",
+            card=opening_card(),
+            launch_delay_ms=0,
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+        )
+    )
+
+    assert scheduler.cancelled == []
+    assert "beat_jump_2_forward" in engine.actions
+    assert server.sync_guard_status["repair-job"]["status"] == "passed"
+    assert (
+        server.sync_guard_status["repair-job"]
+        ["bar_alignment_correction"]["after"]["error_beats"]
+        == 0
+    )
 
 
 class FakeProfileStore:

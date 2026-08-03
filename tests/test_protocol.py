@@ -76,3 +76,11 @@ def test_stem_toggles_have_stable_deck_scoped_notes() -> None:
     assert (vocal.channel, vocal.note) == (0, 44)
     assert (instrumental.channel, instrumental.note) == (1, 45)
     assert (drums.channel, drums.note) == (0, 46)
+
+
+def test_bar_repair_beat_jumps_have_stable_deck_scoped_notes() -> None:
+    back_one = encode_action("beat_jump_1_back", {"deck": 1})[0].message
+    forward_two = encode_action("beat_jump_2_forward", {"deck": 2})[0].message
+
+    assert (back_one.channel, back_one.note) == (0, 47)
+    assert (forward_two.channel, forward_two.note) == (1, 50)

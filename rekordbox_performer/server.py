@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -25,6 +28,7 @@ from .intelligence import (
     audit_set_plan,
     camelot_compatibility,
     compile_transition_card,
+    validate_transition_card,
 )
 from .observer import SharedDeckObserver
 from .performance import (
@@ -45,6 +49,14 @@ from .protocol import (
 )
 from .rekordbox_ui import RekordboxUIAdapter, normalize_title
 from .scheduler import TransitionScheduler
+from .set_runner import (
+    AutonomousSetPlan,
+    AutonomousSetRunner,
+    TempoPlan,
+    TrackLoadSpec,
+    TransitionOption,
+)
+from .supervisor import GENERATION_ENV, RESTART_EXIT_CODE, SUPERVISED_ENV
 
 
 class TransitionEvent(BaseModel):
@@ -74,6 +86,20 @@ verified_hot_cues: dict[tuple[int, str, int], dict[str, Any]] = {}
 sync_guard_tasks: set[asyncio.Task[Any]] = set()
 sync_guard_status: dict[str, dict[str, Any]] = {}
 VERIFIED_CUE_TTL_SECONDS = 15 * 60
+verified_rescue_loops: dict[int, dict[str, Any]] = {}
+autonomous_runner: AutonomousSetRunner | None = None
+track_title_aliases: dict[str, str] = {}
+preflighted_set_fingerprints: set[str] = set()
+
+
+def _set_fingerprint(plan: AutonomousSetPlan) -> str:
+    return hashlib.sha256(
+        plan.model_dump_json().encode("utf-8")
+    ).hexdigest()
+
+
+def _expected_track_title(track_id: str) -> str:
+    return track_title_aliases.get(track_id) or profile_store.get(track_id).title
 
 
 def _deck_record(status: dict[str, Any], deck: int) -> dict[str, Any]:
@@ -90,6 +116,248 @@ def _transport_changed(
     before = first.get("elapsed_seconds")
     after = second.get("elapsed_seconds")
     return before is not None and after is not None and before != after
+
+
+async def _observe_live_deck(
+    *,
+    deck: int,
+    track_id: str,
+    title: str,
+) -> dict[str, Any]:
+    """Refresh one authoritative deck clock without requiring a staged pair."""
+    profile = profile_store.get(track_id)
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        first_status = rekordbox_ui.status()
+        await asyncio.sleep(1.1)
+        second_status = rekordbox_ui.status()
+    first = _deck_record(first_status, deck)
+    second = _deck_record(second_status, deck)
+    if normalize_title(second.get("title", "")) != normalize_title(title):
+        raise RuntimeError(f"Deck {deck} loaded title does not match {title!r}")
+    playing = _transport_changed(first, second)
+    observation = observation_from_elapsed(
+        deck=deck,
+        profile=profile,
+        elapsed_seconds=float(second.get("elapsed_seconds") or 0),
+        playing=playing,
+        sync_enabled=second.get("beat_sync_enabled"),
+        quantize_enabled=second.get("quantize_enabled"),
+        title=title,
+        playback_bpm=second.get("bpm"),
+    )
+    return live_state.update(observation)
+
+
+def _verify_rescue_loop(
+    *,
+    deck: int,
+    title: str,
+    beats: int,
+    bpm: float,
+) -> dict[str, Any]:
+    """Prove loop repetition from Rekordbox's transport instead of MIDI intent."""
+    loop_seconds = beats * 60.0 / bpm
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        first_status = rekordbox_ui.status()
+        time.sleep(loop_seconds + 0.6)
+        rekordbox_ui.invalidate_status_cache()
+        second_status = rekordbox_ui.status()
+        time.sleep(1.1)
+        rekordbox_ui.invalidate_status_cache()
+        third_status = rekordbox_ui.status()
+    first = _deck_record(first_status, deck)
+    second = _deck_record(second_status, deck)
+    third = _deck_record(third_status, deck)
+    errors: list[str] = []
+    if normalize_title(third.get("title", "")) != normalize_title(title):
+        errors.append("deck title changed while verifying rescue loop")
+    if not _transport_changed(second, third):
+        errors.append("deck transport stopped while verifying rescue loop")
+    first_elapsed = first.get("elapsed_seconds")
+    second_elapsed = second.get("elapsed_seconds")
+    if first_elapsed is None or second_elapsed is None:
+        errors.append("loop transport position is unavailable")
+    elif float(second_elapsed) - float(first_elapsed) > max(3.0, loop_seconds * 0.6):
+        errors.append("transport did not repeat inside the requested loop")
+    result = {
+        "verified": not errors,
+        "errors": errors,
+        "deck": deck,
+        "title": title,
+        "beats": beats,
+        "loop_seconds": round(loop_seconds, 3),
+        "observed": {
+            "first": first,
+            "second": second,
+            "third": third,
+        },
+    }
+    if result["verified"]:
+        verified_rescue_loops[deck] = {
+            **result,
+            "verified_monotonic": time.monotonic(),
+        }
+    return result
+
+
+async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
+    if beats not in {4, 8, 16}:
+        raise ValueError("rescue loop must be 4, 8, or 16 beats")
+    try:
+        state = live_state.get(deck)
+    except KeyError as exc:
+        raise RuntimeError("live deck clock is unavailable") from exc
+    if not state.get("playing"):
+        raise RuntimeError("cannot rescue-loop a stopped deck")
+    title = str(state["title"])
+    # Refresh before calculating the next bar boundary. The resulting local
+    # schedule is short and remains independent of the MCP client.
+    state = await _observe_live_deck(
+        deck=deck,
+        track_id=str(state["track_id"]),
+        title=title,
+    )
+    if not state.get("playing"):
+        raise RuntimeError("audible deck stopped before rescue loop")
+    position = (float(state["beat"]) - 1.0) + float(state["beat_phase"])
+    beats_to_bar = (-position) % 4.0
+    if beats_to_bar < 0.08:
+        beats_to_bar = 0.0
+    delay_ms = round(beats_to_bar * 60_000.0 / float(state["bpm"]))
+    events = [
+        {
+            "at_ms": delay_ms,
+            "action": "loop_4",
+            "parameters": {"deck": deck},
+        }
+    ]
+    doubles = {4: 0, 8: 1, 16: 2}[beats]
+    for index in range(doubles):
+        events.append(
+            {
+                "at_ms": delay_ms + 90 * (index + 1),
+                "action": "loop_double",
+                "parameters": {"deck": deck},
+            }
+        )
+    job = scheduler.start(
+        f"verified {beats}-beat rescue loop on deck {deck}",
+        events,
+        completion_verifier=lambda: _verify_rescue_loop(
+            deck=deck,
+            title=title,
+            beats=beats,
+            bpm=float(state["bpm"]),
+        ),
+        execution_id=(
+            f"rescue-loop-{deck}-{state['track_id']}-{int(time.time() * 1000)}"
+        ),
+    )
+    task = scheduler.jobs[job["id"]].task
+    if task is not None:
+        await task
+    final = scheduler.get(job["id"])
+    verification = final.get("verification") or {}
+    return {
+        **verification,
+        "job": final,
+        "scheduled_at_bar_boundary_ms": delay_ms,
+    }
+
+
+def _with_rescue_loop_release(card: TransitionCard) -> TransitionCard:
+    record = verified_rescue_loops.get(card.outgoing_deck)
+    if record is None or record.get("verified") is not True:
+        raise RuntimeError("outgoing rescue loop is not verified active")
+    events = list(card.events)
+    events.append(
+        card.events[0].__class__(
+            bar_offset=0,
+            beat_offset=0,
+            action="loop_toggle",
+            parameters={"deck": card.outgoing_deck},
+        )
+    )
+    events.sort(key=lambda event: (event.bar_offset, event.beat_offset))
+    return card.model_copy(
+        update={"events": events, "loop_plan_verified": True}
+    )
+
+
+async def _execute_tempo_plan(
+    plan: TempoPlan,
+    deck: int,
+    track_id: str,
+) -> dict[str, Any]:
+    profile = profile_store.get(track_id)
+    state = await _observe_live_deck(
+        deck=deck,
+        track_id=track_id,
+        title=profile.title,
+    )
+    if not state.get("playing"):
+        raise RuntimeError("tempo ramp requires a playing deck")
+    live_bpm = float(state["bpm"])
+    plan.validate_start(native_bpm=profile.bpm, live_bpm=live_bpm)
+    await ensure_master_deck(deck)
+    steps = plan.duration_bars * plan.steps_per_bar
+    total_ms = round(plan.duration_bars * 4 * 60_000.0 / live_bpm)
+    events = []
+    for index in range(1, steps + 1):
+        fraction = index / steps
+        bpm = live_bpm + (plan.target_bpm - live_bpm) * fraction
+        events.append(
+            {
+                "at_ms": round(total_ms * fraction),
+                "action": "tempo",
+                "parameters": {
+                    "deck": deck,
+                    "value": plan.control_value(
+                        native_bpm=profile.bpm,
+                        bpm=bpm,
+                    ),
+                },
+            }
+        )
+
+    def verify() -> dict[str, Any]:
+        with deck_observer.exclusive_adapter():
+            rekordbox_ui.invalidate_status_cache()
+            status = rekordbox_ui.status()
+        observed = _deck_record(status, deck)
+        observed_bpm = observed.get("bpm")
+        errors = []
+        if observed.get("master_enabled") is not True:
+            errors.append("tempo-ramped deck is not Master")
+        if observed_bpm is None:
+            errors.append("live BPM is unavailable after tempo ramp")
+        elif abs(float(observed_bpm) - plan.target_bpm) > 0.15:
+            errors.append(
+                f"tempo ramp ended at {float(observed_bpm):.2f}, "
+                f"expected {plan.target_bpm:.2f}"
+            )
+        return {
+            "verified": not errors,
+            "errors": errors,
+            "observed": observed,
+            "target_bpm": plan.target_bpm,
+        }
+
+    job = scheduler.start(
+        f"tempo ramp {profile.title} to {plan.target_bpm:.2f}",
+        events,
+        completion_verifier=verify,
+        execution_id=f"tempo-{track_id}-{int(time.time() * 1000)}",
+    )
+    task = scheduler.jobs[job["id"]].task
+    if task is not None:
+        await task
+    final = scheduler.get(job["id"])
+    if final["status"] != "completed":
+        raise RuntimeError(final.get("error") or "tempo ramp failed")
+    return final
 
 
 async def _guard_incoming_sync(
@@ -117,6 +385,38 @@ async def _guard_incoming_sync(
             first_status = rekordbox_ui.status()
             await asyncio.sleep(0.6)
             second_status = rekordbox_ui.status()
+        correction = None
+        bar_alignment = second_status.get("bar_alignment") or {}
+        if (
+            bar_alignment.get("verified") is True
+            and float(bar_alignment.get("error_beats", 0)) > 0.15
+        ):
+            signed_error = float(bar_alignment.get("signed_error_beats", 0))
+            jump_beats = round(abs(signed_error))
+            if (
+                jump_beats in {1, 2}
+                and abs(abs(signed_error) - jump_beats) <= 0.15
+            ):
+                direction = "forward" if signed_error > 0 else "back"
+                action = f"beat_jump_{jump_beats}_{direction}"
+                messages = await engine.send_action(
+                    action,
+                    {"deck": card.incoming_deck},
+                )
+                await asyncio.sleep(0.45)
+                with deck_observer.exclusive_adapter():
+                    rekordbox_ui.invalidate_status_cache()
+                    corrected_status = rekordbox_ui.status()
+                corrected_alignment = (
+                    corrected_status.get("bar_alignment") or {}
+                )
+                correction = {
+                    "action": action,
+                    "messages": messages,
+                    "before": bar_alignment,
+                    "after": corrected_alignment,
+                }
+                second_status = corrected_status
         outgoing = _deck_record(second_status, card.outgoing_deck)
         incoming_first = _deck_record(first_status, card.incoming_deck)
         incoming = _deck_record(second_status, card.incoming_deck)
@@ -142,6 +442,14 @@ async def _guard_incoming_sync(
                 "live deck BPMs do not match "
                 f"({float(outgoing_bpm):.2f} vs {float(incoming_bpm):.2f})"
             )
+        bar_alignment = second_status.get("bar_alignment") or {}
+        if bar_alignment.get("verified") is not True:
+            errors.append("visible deck bar alignment could not be verified")
+        elif float(bar_alignment.get("error_beats", 4.0)) > 0.15:
+            errors.append(
+                "visible deck bar alignment is off by "
+                f"{float(bar_alignment['error_beats']):.2f} beats"
+            )
         if errors:
             scheduler.cancel(job_id)
             await engine.send_action(
@@ -161,6 +469,7 @@ async def _guard_incoming_sync(
             "status": "passed",
             "errors": [],
             "observed": second_status,
+            "bar_alignment_correction": correction,
         }
     except asyncio.CancelledError:
         sync_guard_status[job_id] = {"status": "cancelled"}
@@ -184,6 +493,7 @@ def _arm_sync_guard(
     events: list[dict[str, Any]],
     outgoing_title: str,
     incoming_title: str,
+    expected_phrase_boundary_ms: int | None = None,
 ) -> dict[str, Any]:
     launches = [
         event
@@ -194,6 +504,16 @@ def _arm_sync_guard(
     if len(launches) != 1:
         raise RuntimeError("sync guard requires exactly one incoming launch event")
     launch_delay_ms = int(launches[0]["at_ms"])
+    expected_phrase_boundary_ms = (
+        launch_delay_ms
+        if expected_phrase_boundary_ms is None
+        else int(expected_phrase_boundary_ms)
+    )
+    if launch_delay_ms != expected_phrase_boundary_ms:
+        raise RuntimeError(
+            "incoming transport is not scheduled on the exact phrase beat-1 "
+            f"boundary ({launch_delay_ms} ms vs {expected_phrase_boundary_ms} ms)"
+        )
     task = asyncio.create_task(
         _guard_incoming_sync(
             job_id=job_id,
@@ -205,7 +525,15 @@ def _arm_sync_guard(
     )
     sync_guard_tasks.add(task)
     task.add_done_callback(sync_guard_tasks.discard)
-    return {"status": "armed", "launch_delay_ms": launch_delay_ms}
+    return {
+        "status": "armed",
+        "launch_delay_ms": launch_delay_ms,
+        "phrase_beat_one_gate": {
+            "verified": True,
+            "transport_at_ms": launch_delay_ms,
+            "phrase_boundary_at_ms": expected_phrase_boundary_ms,
+        },
+    }
 
 
 def _hot_cue_position_window(
@@ -245,6 +573,28 @@ def _card_hot_cue_launch(
         card.incoming_track_id,
         int(launches[0].parameters["cue"]),
     )
+
+
+def _card_incoming_launch(card: TransitionCard):
+    """Return the single bar-zero incoming transport event.
+
+    Rolling performance used to assume every track had a Hot Cue. Simple
+    cuts/resets are also allowed to launch a stopped deck from a verified
+    file-start phrase, so the atomic staging path must understand both forms.
+    """
+    launches = [
+        event
+        for event in card.events
+        if event.bar_offset == 0
+        and event.beat_offset == 0
+        and event.action in {"hot_cue", "play_pause"}
+        and event.parameters.get("deck") == card.incoming_deck
+    ]
+    if len(launches) != 1:
+        raise RuntimeError(
+            "Transition card requires exactly one bar-0 incoming launch"
+        )
+    return launches[0]
 
 
 def _require_verified_hot_cue(
@@ -325,11 +675,11 @@ def _verify_transition_postconditions(
     incoming_second = _deck_record(second, card.incoming_deck)
     errors: list[str] = []
     if normalize_title(outgoing_second.get("title", "")) != normalize_title(
-        profile_store.get(card.outgoing_track_id).title
+        _expected_track_title(card.outgoing_track_id)
     ):
         errors.append("outgoing deck title does not match the card")
     if normalize_title(incoming_second.get("title", "")) != normalize_title(
-        profile_store.get(card.incoming_track_id).title
+        _expected_track_title(card.incoming_track_id)
     ):
         errors.append("incoming deck title does not match the card")
     if _transport_changed(outgoing_first, outgoing_second):
@@ -381,25 +731,27 @@ def _card_completion_verifier(
             second = rekordbox_ui.status()
         result = _verify_transition_postconditions(card, first, second)
         if result["verified"]:
-            try:
-                outgoing_clock = live_state.get(card.outgoing_deck)
-                incoming_record = result["incoming"]["second"]
-                incoming_profile = profile_store.get(card.incoming_track_id)
-                elapsed = incoming_record.get("elapsed_seconds")
-                if elapsed is not None:
-                    incoming_clock = observation_from_elapsed(
-                        deck=card.incoming_deck,
-                        profile=incoming_profile,
-                        elapsed_seconds=elapsed,
-                        playing=True,
-                        sync_enabled=incoming_record.get("beat_sync_enabled"),
-                        quantize_enabled=incoming_record.get("quantize_enabled"),
-                    ).model_dump()
-                    result["sync"] = sync_report(outgoing_clock, incoming_clock)
-            except (KeyError, ValueError) as exc:
+            # Musical alignment is measured while both decks are running by
+            # the pre-audible sync guard. Comparing the retired deck's old
+            # clock with the incoming deck at completion creates false BPM and
+            # bar faults after master transfer.
+            guard = sync_guard_status.get(str((launch_clock or {}).get("job_id")))
+            if guard and guard.get("status") == "passed":
+                alignment = (guard.get("observed") or {}).get(
+                    "bar_alignment", {}
+                )
+                result["sync"] = {
+                    "verified": True,
+                    "errors": [],
+                    "beat_phase_error_ms": 0.0,
+                    "bar_phase_error_beats": alignment.get("error_beats", 0.0),
+                    "source": "pre_audible_sync_guard",
+                }
+            elif card.beat_sync_required:
                 result["sync"] = {
                     "verified": False,
-                    "errors": [f"sync telemetry unavailable: {exc}"],
+                    "errors": ["pre-audible sync guard did not pass"],
+                    "source": "pre_audible_sync_guard",
                 }
         launched_monotonic = (launch_clock or {}).get("incoming_monotonic")
         if result["verified"] and launched_monotonic is not None:
@@ -409,17 +761,27 @@ def _card_completion_verifier(
                 for event in card.events
                 if event.bar_offset == 0
                 and event.beat_offset == 0
-                and event.action == "hot_cue"
+                and event.action in {"hot_cue", "play_pause"}
                 and event.parameters.get("deck") == card.incoming_deck
             )
-            cue = int(launch.parameters["cue"])
-            landmark = next(
-                item
-                for item in profile.landmarks
-                if item.cue == cue
-                and item.kind in {"mix_in", "phrase_start"}
-                and item.confidence in {"verified", "high"}
-            )
+            if launch.action == "hot_cue":
+                cue = int(launch.parameters["cue"])
+                landmark = next(
+                    item
+                    for item in profile.landmarks
+                    if item.cue == cue
+                    and item.kind in {"mix_in", "phrase_start"}
+                    and item.confidence in {"verified", "high"}
+                )
+            else:
+                landmark = next(
+                    item
+                    for item in profile.landmarks
+                    if item.kind in {"mix_in", "phrase_start"}
+                    and item.bar == 1
+                    and (item.beat or 1) == 1
+                    and item.confidence in {"verified", "high"}
+                )
             elapsed_beats = (
                 time.monotonic() - launched_monotonic
             ) * profile.bpm / 60.0
@@ -473,6 +835,8 @@ def connect_midi(port_name: str | None = None) -> dict[str, Any]:
 def disconnect_midi() -> dict[str, Any]:
     """Disconnect MIDI and disarm live control."""
     deck_observer.deactivate()
+    if autonomous_runner is not None:
+        autonomous_runner.stop()
     engine.disconnect()
     return engine.status()
 
@@ -489,6 +853,15 @@ def control_status() -> dict[str, Any]:
         ],
         "live_state": live_state.snapshot(),
         "scheduler_metrics": scheduler.metrics(),
+        "autonomous_set": (
+            autonomous_runner.public()
+            if autonomous_runner is not None
+            else {"active": False}
+        ),
+        "verified_rescue_loops": {
+            str(deck): record
+            for deck, record in verified_rescue_loops.items()
+        },
     }
 
 
@@ -504,6 +877,7 @@ def rank_transition_candidates(
     outgoing_key: str,
     candidates: list[TransitionCandidate],
     max_bpm_delta: float = 4.0,
+    max_stretch_percent: float = 4.0,
     allow_incompatible: bool = False,
     outgoing_track_id: str | None = None,
     outgoing_start_bar: int = 1,
@@ -517,6 +891,8 @@ def rank_transition_candidates(
         raise ValueError("outgoing_bpm must be positive")
     if not 0 <= max_bpm_delta <= 20:
         raise ValueError("max_bpm_delta must be between 0 and 20")
+    if not 0 < max_stretch_percent <= 10:
+        raise ValueError("max_stretch_percent must be between 0 and 10")
     ranked = []
     excluded = []
     relationship_score = {
@@ -529,9 +905,11 @@ def rank_transition_candidates(
     for candidate in candidates:
         harmonic = camelot_compatibility(outgoing_key, candidate.key)
         bpm_delta = abs(candidate.bpm - outgoing_bpm)
+        stretch_percent = bpm_delta / outgoing_bpm * 100.0
         record = {
             **candidate.model_dump(),
             "bpm_delta": round(bpm_delta, 3),
+            "stretch_percent": round(stretch_percent, 3),
             "harmonic": harmonic,
         }
         vocal = None
@@ -551,6 +929,11 @@ def rank_transition_candidates(
         if bpm_delta > max_bpm_delta:
             reasons.append(
                 f"BPM delta {bpm_delta:.2f} exceeds {max_bpm_delta:.2f}"
+            )
+        if stretch_percent > max_stretch_percent:
+            reasons.append(
+                f"tempo stretch {stretch_percent:.2f}% exceeds "
+                f"{max_stretch_percent:.2f}%"
             )
         if not harmonic["verified"]:
             reasons.append("key could not be normalized to Camelot")
@@ -573,6 +956,7 @@ def rank_transition_candidates(
     return {
         "outgoing_bpm": outgoing_bpm,
         "outgoing_key": outgoing_key,
+        "max_stretch_percent": max_stretch_percent,
         "ranked": ranked,
         "excluded": excluded,
         "vocal_clash_scoring": (
@@ -761,6 +1145,29 @@ def _require_active_stem_preconditions(card: TransitionCard) -> dict[str, Any] |
     return status
 
 
+def _accepted_transition_job(
+    scheduled: dict[str, Any],
+    execution_id: str,
+) -> tuple[bool, str | None]:
+    """Require proof that the scheduler owns a non-empty, reserved job."""
+    if not scheduled.get("ready"):
+        return False, "; ".join(
+            scheduled.get("errors", ["transition compilation was not ready"])
+        )
+    job = scheduled.get("job")
+    if not isinstance(job, dict) or not job.get("id"):
+        return False, "transition response did not contain a scheduler job ID"
+    if job.get("execution_id") != execution_id:
+        return False, "scheduler job execution_id does not match the request"
+    if job.get("status") not in {"scheduled", "running"}:
+        return False, f"scheduler job is not active: {job.get('status')!r}"
+    if int(job.get("event_count", 0)) <= 0:
+        return False, "scheduler job contains no events"
+    if job.get("control_reserved_until_monotonic") is None:
+        return False, "scheduler job does not hold the live-control reservation"
+    return True, None
+
+
 @mcp.tool(annotations={"readOnlyHint": True})
 def preview_transition_card(card: TransitionCard) -> dict[str, Any]:
     """Compile a verified musical transition card against the fresh deck clock."""
@@ -799,7 +1206,7 @@ async def perform_transition_card(
 
     def observe_dispatch(event: dict[str, Any], dispatched: float) -> None:
         if (
-            event["action"] == "hot_cue"
+            event["action"] in {"hot_cue", "play_pause"}
             and event["parameters"].get("deck") == card.incoming_deck
         ):
             launch_clock["incoming_monotonic"] = dispatched
@@ -814,14 +1221,16 @@ async def perform_transition_card(
         event_observer=observe_dispatch,
         execution_id=execution_id,
     )
+    launch_clock["job_id"] = job["id"]
     guard = None
     if card.beat_sync_required:
         guard = _arm_sync_guard(
             job_id=job["id"],
             card=card,
             events=compiled["events"],
-            outgoing_title=profile_store.get(card.outgoing_track_id).title,
-            incoming_title=profile_store.get(card.incoming_track_id).title,
+            outgoing_title=_expected_track_title(card.outgoing_track_id),
+            incoming_title=_expected_track_title(card.incoming_track_id),
+            expected_phrase_boundary_ms=int(compiled["start_delay_ms"]),
         )
     return {
         **compiled,
@@ -1332,36 +1741,71 @@ async def launch_and_schedule_opening_transition(
     outgoing_title: str,
     incoming_title: str,
     execution_id: str,
+    incoming_artist: str | None = None,
+    incoming_cue: int | None = None,
+    incoming_cue_time_ms: int | None = None,
+    source: str | None = None,
+    result_index: int | None = None,
 ) -> dict[str, Any]:
     """Atomically launch track one and schedule the first handoff.
 
-    The set is not considered started until both stopped decks are verified,
-    Sync/Quantize are armed, the audible deck has started and been established
-    as Master, and the first transition job exists.  A post-launch sync guard
-    verifies the incoming deck's actual playing BPM before its fader may rise.
+    The set is not considered started until the incoming track/cue is prepared,
+    both stopped decks are verified, Sync/Quantize are armed, the audible deck
+    has started and been established as Master, and the first transition job is
+    accepted.  Any post-launch failure immediately silences and stops both
+    decks instead of allowing an unscheduled outgoing track to run to its end.
     """
     if not execution_id.strip():
         raise ValueError("execution_id is required")
     if card.anchor_deck != card.outgoing_deck:
         raise ValueError("opening transition must use the outgoing deck as anchor")
+    if card.start_phrase_index is None:
+        raise ValueError(
+            "opening transition requires an explicit analyzed start_phrase_index"
+        )
     incoming_launches = [
         event
         for event in card.events
         if event.bar_offset == 0
         and event.beat_offset == 0
-        and event.action == "play_pause"
+        and event.action in {"play_pause", "hot_cue"}
         and event.parameters.get("deck") == card.incoming_deck
     ]
     if len(incoming_launches) != 1:
         raise ValueError(
-            "opening transition requires exactly one bar-0 incoming play_pause"
+            "opening transition requires exactly one bar-0 incoming launch"
+        )
+    incoming_launch = incoming_launches[0]
+    if incoming_launch.action == "hot_cue":
+        expected_cue = incoming_launch.parameters.get("cue")
+        if incoming_cue != expected_cue:
+            raise ValueError(
+                "incoming_cue must match the card's bar-0 incoming Hot Cue"
+            )
+        if incoming_cue_time_ms is None:
+            raise ValueError(
+                "incoming_cue_time_ms is required for a Hot Cue opening"
+            )
+    elif incoming_cue is not None or incoming_cue_time_ms is not None:
+        raise ValueError(
+            "incoming cue arguments require a bar-0 Hot Cue launch"
         )
     outgoing_profile = profile_store.get(card.outgoing_track_id)
     incoming_profile = profile_store.get(card.incoming_track_id)
-    if normalize_title(outgoing_profile.title) != normalize_title(outgoing_title):
-        raise ValueError("outgoing_title does not match the card profile")
-    if normalize_title(incoming_profile.title) != normalize_title(incoming_title):
-        raise ValueError("incoming_title does not match the card profile")
+    # Track IDs bind the prepared analysis. Supplied canonical titles are
+    # verified against the loaded Rekordbox decks, allowing legacy profiles
+    # that omitted a mix/version suffix to remain usable.
+
+    # Finish every expensive incoming-deck operation before audible playback.
+    # _stage_track bypasses the browser when this exact track is already loaded.
+    staged_incoming = await _stage_track(
+        deck=card.incoming_deck,
+        track_id=card.incoming_track_id,
+        title=incoming_title,
+        artist=incoming_artist,
+        source=source,
+        result_index=result_index,
+    )
 
     with deck_observer.exclusive_adapter():
         first_status = rekordbox_ui.status()
@@ -1377,9 +1821,20 @@ async def launch_and_schedule_opening_transition(
             raise RuntimeError(f"Deck {deck} loaded the wrong opening track")
         if _transport_changed(first, second):
             raise RuntimeError(f"Deck {deck} is already playing")
-        if second.get("elapsed_seconds") is None or second["elapsed_seconds"] > 1:
+        requires_file_start = not (
+            deck == card.incoming_deck
+            and incoming_launch.action == "hot_cue"
+        )
+        if (
+            requires_file_start
+            and (
+                second.get("elapsed_seconds") is None
+                or second["elapsed_seconds"] > 1
+            )
+        ):
             raise RuntimeError(f"Deck {deck} is not staged at file start")
 
+    audio_route = rekordbox_ui.ensure_pc_master_out(False)
     mixer_contract = await _establish_opening_mixer_contract(
         audible_deck=card.outgoing_deck
     )
@@ -1403,6 +1858,7 @@ async def launch_and_schedule_opening_transition(
         )
 
     master_messages: list[Any] = []
+    master_state: dict[str, Any] | None = None
     outgoing_modes = await ensure_deck_modes(
         deck=card.outgoing_deck,
         beat_sync=True if card.beat_sync_required else None,
@@ -1454,11 +1910,33 @@ async def launch_and_schedule_opening_transition(
             "started": False,
             "errors": mode_errors,
             "mixer_contract": mixer_contract,
+            "audio_route": audio_route,
             "master_messages": master_messages,
             "outgoing_modes": outgoing_modes,
             "incoming_modes": incoming_modes,
             "observed": mode_status,
+            "stage": staged_incoming,
         }
+
+    cue_verification = None
+    if incoming_launch.action == "hot_cue":
+        cue_verification = await verify_hot_cue(
+            deck=card.incoming_deck,
+            track_id=card.incoming_track_id,
+            title=incoming_title,
+            cue=int(incoming_cue),
+            expected_time_ms=int(incoming_cue_time_ms),
+        )
+        if not cue_verification.get("verified"):
+            return {
+                "ready": False,
+                "started": False,
+                "errors": ["incoming Hot Cue verification failed"],
+                "stage": staged_incoming,
+                "cue_verification": cue_verification,
+                "mixer_contract": mixer_contract,
+                "audio_route": audio_route,
+            }
 
     launch = await launch_staged_track(
         deck=card.outgoing_deck,
@@ -1467,49 +1945,126 @@ async def launch_and_schedule_opening_transition(
     )
     # Rekordbox ignores Master assignment on a stopped deck.  Establish the
     # reference only after transport is proven moving, then compile immediately.
-    master_messages = await engine.send_action(
-        "master", {"deck": card.outgoing_deck}
-    )
-    await asyncio.sleep(0.2)
-    refreshed = await refresh_transition_state(
-        outgoing_deck=card.outgoing_deck,
-        outgoing_track_id=card.outgoing_track_id,
-        outgoing_title=outgoing_title,
-        incoming_deck=card.incoming_deck,
-        incoming_track_id=card.incoming_track_id,
-        incoming_title=incoming_title,
-    )
-    scheduled = await perform_transition_card(
-        card=card,
-        commit=True,
-        execution_id=execution_id,
-    )
-    if not scheduled.get("ready") or "job" not in scheduled:
-        # Preserve audible runway for recovery instead of letting track one end.
-        rescue_messages = await engine.send_action(
-            "loop_8", {"deck": card.outgoing_deck}
+    scheduled: dict[str, Any] | None = None
+    try:
+        master_state = await ensure_master_deck(card.outgoing_deck)
+        master_messages = master_state.get("messages", [])
+        refreshed = await refresh_transition_state(
+            outgoing_deck=card.outgoing_deck,
+            outgoing_track_id=card.outgoing_track_id,
+            outgoing_title=outgoing_title,
+            incoming_deck=card.incoming_deck,
+            incoming_track_id=card.incoming_track_id,
+            incoming_title=incoming_title,
+            incoming_hot_cue=(
+                int(incoming_cue)
+                if incoming_launch.action == "hot_cue"
+                else None
+            ),
         )
+        scheduled = await perform_transition_card(
+            card=card,
+            commit=True,
+            execution_id=execution_id,
+        )
+        accepted, acceptance_error = _accepted_transition_job(
+            scheduled,
+            execution_id,
+        )
+        if not accepted:
+            raise RuntimeError(
+                acceptance_error or "first transition job was not accepted"
+            )
+    except Exception as exc:
+        # No unowned playback: if the scheduler is not conclusively holding
+        # the handoff, silence and stop both decks immediately.
+        cancelled_job = None
+        job_id = (
+            scheduled.get("job", {}).get("id")
+            if isinstance(scheduled, dict)
+            and isinstance(scheduled.get("job"), dict)
+            else None
+        )
+        if job_id:
+            try:
+                cancelled_job = scheduler.cancel(job_id)
+            except KeyError:
+                cancelled_job = {"id": job_id, "status": "not_found"}
+        abort_messages = []
+        for deck in (card.outgoing_deck, card.incoming_deck):
+            abort_messages.extend(
+                await engine.send_action(
+                    "channel_fader", {"deck": deck, "value": 0}
+                )
+            )
+            abort_messages.extend(await engine.send_action("cue", {"deck": deck}))
         return {
             "ready": False,
-            "started": True,
-            "errors": scheduled.get("errors", ["first transition was not scheduled"]),
+            "started": False,
+            "aborted_after_launch": True,
+            "errors": [str(exc)],
+            "stage": staged_incoming,
+            "cue_verification": cue_verification,
             "mixer_contract": mixer_contract,
+            "audio_route": audio_route,
             "launch": launch,
-            "refresh": refreshed,
-            "schedule": scheduled,
-            "rescue_loop_messages": rescue_messages,
+            "cancelled_job": cancelled_job,
+            "abort_messages": abort_messages,
         }
     return {
         "ready": True,
         "started": True,
         "session": set_sessions.start(),
         "mixer_contract": mixer_contract,
+        "audio_route": audio_route,
         "master_messages": master_messages,
+        "master_state": master_state,
         "outgoing_modes": outgoing_modes,
         "incoming_modes": incoming_modes,
+        "stage": staged_incoming,
+        "cue_verification": cue_verification,
         "launch": launch,
         "refresh": refreshed,
         "schedule": scheduled,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def ensure_pc_master_out(enabled: bool = False) -> dict[str, Any]:
+    """Observe and set Rekordbox PC MASTER OUT without changing deck audio."""
+    return rekordbox_ui.ensure_pc_master_out(enabled)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def ensure_master_deck(deck: int) -> dict[str, Any]:
+    """Make one playing deck the sole observable Rekordbox Master."""
+    if deck not in (1, 2):
+        raise ValueError("deck must be 1 or 2")
+    other = 2 if deck == 1 else 1
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        before = rekordbox_ui.status()
+    target_before = _deck_record(before, deck).get("master_enabled")
+    other_before = _deck_record(before, other).get("master_enabled")
+    messages: list[Any] = []
+    if target_before is not True or other_before is not False:
+        messages = await engine.send_action("master", {"deck": deck})
+        await asyncio.sleep(0.45)
+    with deck_observer.exclusive_adapter():
+        rekordbox_ui.invalidate_status_cache()
+        after = rekordbox_ui.status()
+    target_after = _deck_record(after, deck).get("master_enabled")
+    other_after = _deck_record(after, other).get("master_enabled")
+    if target_after is not True or other_after is not False:
+        raise RuntimeError(
+            f"Deck {deck} is not the sole visually confirmed Rekordbox Master"
+        )
+    return {
+        "deck": deck,
+        "before": {"target": target_before, "other": other_before},
+        "after": {"target": target_after, "other": other_after},
+        "changed": bool(messages),
+        "messages": messages,
     }
 
 
@@ -1571,15 +2126,27 @@ async def refresh_transition_state(
     outgoing_elapsed = outgoing_second.get("elapsed_seconds")
     if outgoing_elapsed is None:
         raise RuntimeError("Outgoing deck elapsed time is unavailable")
-    outgoing_observation = observation_from_elapsed(
+    # The visible deck clock is integer-second resolution.  Rebuilding the
+    # running musical clock from it can throw away almost one second of phase
+    # (two beats at 120 BPM), which then makes an otherwise correct phrase
+    # target launch late.  The outgoing deck already owns a native monotonic
+    # launch clock; preserve its extrapolated beat/phase and refresh only the
+    # visually observed mode/BPM fields.
+    native_clock = live_state.get(outgoing_deck)
+    outgoing_observation = DeckObservation(
         deck=outgoing_deck,
-        profile=profile_store.get(outgoing_track_id),
-        elapsed_seconds=outgoing_elapsed,
+        track_id=outgoing_track_id,
+        title=outgoing_title,
+        bpm=outgoing_second.get("bpm") or native_clock["bpm"],
         playing=True,
+        bar=native_clock["bar"],
+        beat=native_clock["beat"],
+        track_beat=native_clock["track_beat"],
+        beat_phase=native_clock["beat_phase"],
         sync_enabled=outgoing_second.get("beat_sync_enabled"),
         quantize_enabled=outgoing_second.get("quantize_enabled"),
-        title=outgoing_title,
-        playback_bpm=outgoing_second.get("bpm"),
+        source="native",
+        confidence="high",
     )
     incoming_profile = profile_store.get(incoming_track_id)
     incoming_elapsed = incoming_second.get("elapsed_seconds")
@@ -1812,9 +2379,9 @@ async def stage_and_schedule_transition_card(
     card: TransitionCard,
     incoming_title: str,
     incoming_artist: str,
-    incoming_cue: int,
-    incoming_cue_time_ms: int,
     execution_id: str,
+    incoming_cue: int | None = None,
+    incoming_cue_time_ms: int | None = None,
     source: str | None = None,
     result_index: int | None = None,
 ) -> dict[str, Any]:
@@ -1824,18 +2391,23 @@ async def stage_and_schedule_transition_card(
     UI work happens inside one MCP request, so model/tool round trips cannot
     consume the outgoing track's remaining phrase runway.
     """
-    profile = profile_store.get(card.incoming_track_id)
-    if normalize_title(profile.title) != normalize_title(incoming_title):
-        raise ValueError("incoming_title does not match the card profile")
-    launch = _card_hot_cue_launch(card)
-    expected_launch = (
-        card.incoming_deck,
-        card.incoming_track_id,
-        incoming_cue,
-    )
-    if launch != expected_launch:
+    # Stable track_id is authoritative. Rekordbox's canonical display title
+    # may include a mix suffix omitted by an older prepared profile; staging
+    # verifies the supplied title/artist against the actual loaded deck.
+    profile_store.get(card.incoming_track_id)
+    launch = _card_incoming_launch(card)
+    if launch.action == "hot_cue":
+        if incoming_cue != int(launch.parameters["cue"]):
+            raise ValueError(
+                "incoming_cue must match the card's bar-0 incoming Hot Cue"
+            )
+        if incoming_cue_time_ms is None:
+            raise ValueError(
+                "incoming_cue_time_ms is required for a Hot Cue launch"
+            )
+    elif incoming_cue is not None or incoming_cue_time_ms is not None:
         raise ValueError(
-            "incoming_cue must match the card's bar-0 incoming Hot Cue"
+            "incoming cue arguments require a bar-0 Hot Cue launch"
         )
     if not execution_id.strip():
         raise ValueError("execution_id is required")
@@ -1849,17 +2421,19 @@ async def stage_and_schedule_transition_card(
         source=source,
         result_index=result_index,
     )
-    cue_verification = await verify_hot_cue(
-        deck=card.incoming_deck,
-        track_id=card.incoming_track_id,
-        title=incoming_title,
-        cue=incoming_cue,
-        expected_time_ms=incoming_cue_time_ms,
-    )
-    if not cue_verification.get("verified"):
-        raise RuntimeError("Incoming Hot Cue verification failed")
+    cue_verification = None
+    if launch.action == "hot_cue":
+        cue_verification = await verify_hot_cue(
+            deck=card.incoming_deck,
+            track_id=card.incoming_track_id,
+            title=incoming_title,
+            cue=int(incoming_cue),
+            expected_time_ms=int(incoming_cue_time_ms),
+        )
+        if not cue_verification.get("verified"):
+            raise RuntimeError("Incoming Hot Cue verification failed")
 
-    outgoing_title = profile_store.get(card.outgoing_track_id).title
+    outgoing_title = _expected_track_title(card.outgoing_track_id)
     refresh_before = await refresh_transition_state(
         outgoing_deck=card.outgoing_deck,
         outgoing_track_id=card.outgoing_track_id,
@@ -1867,7 +2441,9 @@ async def stage_and_schedule_transition_card(
         incoming_deck=card.incoming_deck,
         incoming_track_id=card.incoming_track_id,
         incoming_title=incoming_title,
-        incoming_hot_cue=incoming_cue,
+        incoming_hot_cue=(
+            int(incoming_cue) if launch.action == "hot_cue" else None
+        ),
     )
     master_result = None
     outgoing_mode_result = None
@@ -1875,7 +2451,9 @@ async def stage_and_schedule_transition_card(
         # Establish the audible deck as Rekordbox's tempo/phase authority before
         # enabling Sync on the staged deck.  A lit incoming Sync button alone is
         # insufficient: Rekordbox can leave the stopped deck at its native BPM.
-        master_result = await trigger_control("master", deck=card.outgoing_deck)
+        # Never blindly toggle Master: if the audible deck is already Master,
+        # a toggle would turn it off and invalidate every compiled timestamp.
+        master_result = await ensure_master_deck(card.outgoing_deck)
         outgoing_mode_result = await ensure_deck_modes(
             deck=card.outgoing_deck,
             beat_sync=True,
@@ -1899,16 +2477,34 @@ async def stage_and_schedule_transition_card(
         incoming_deck=card.incoming_deck,
         incoming_track_id=card.incoming_track_id,
         incoming_title=incoming_title,
-        incoming_hot_cue=incoming_cue,
+        incoming_hot_cue=(
+            int(incoming_cue) if launch.action == "hot_cue" else None
+        ),
     )
     scheduled = await perform_transition_card(
         card=card,
         commit=True,
         execution_id=execution_id,
     )
-    if not scheduled.get("ready"):
+    accepted, acceptance_error = _accepted_transition_job(
+        scheduled,
+        execution_id,
+    )
+    if not accepted:
+        cancelled_job = None
+        job_id = (
+            scheduled.get("job", {}).get("id")
+            if isinstance(scheduled.get("job"), dict)
+            else None
+        )
+        if job_id:
+            try:
+                cancelled_job = scheduler.cancel(job_id)
+            except KeyError:
+                cancelled_job = {"id": job_id, "status": "not_found"}
         return {
             "ready": False,
+            "errors": [acceptance_error],
             "stage": staged,
             "cue_verification": cue_verification,
             "refresh_before": refresh_before,
@@ -1917,6 +2513,7 @@ async def stage_and_schedule_transition_card(
             "master_result": master_result,
             "refresh_after": refresh_after,
             "schedule": scheduled,
+            "cancelled_job": cancelled_job,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
     return {
@@ -1932,6 +2529,334 @@ async def stage_and_schedule_transition_card(
     }
 
 
+async def _runner_schedule(
+    option: TransitionOption,
+    release_rescue_loop: bool,
+) -> dict[str, Any]:
+    card = (
+        _with_rescue_loop_release(option.card)
+        if release_rescue_loop
+        else option.card
+    )
+    result = await stage_and_schedule_transition_card(
+        card=card,
+        incoming_title=option.incoming.title,
+        incoming_artist=option.incoming.artist,
+        execution_id=(
+            f"autonomous-{option.id}-{int(time.time() * 1000)}"
+        ),
+        incoming_cue=option.incoming.cue,
+        incoming_cue_time_ms=option.incoming.cue_time_ms,
+        source=option.incoming.source,
+        result_index=option.incoming.result_index,
+    )
+    if not result.get("ready"):
+        return result
+    if release_rescue_loop:
+        verified_rescue_loops.pop(card.outgoing_deck, None)
+    scheduled = dict(result.get("schedule") or {})
+    scheduled["ready"] = True
+    scheduled["atomic_stage"] = result
+    return scheduled
+
+
+async def _runner_remaining_bars(track_id: str, deck: int) -> float:
+    profile = profile_store.get(track_id)
+    try:
+        state = live_state.get(deck)
+    except KeyError:
+        state = await _observe_live_deck(
+            deck=deck,
+            track_id=track_id,
+            title=_expected_track_title(track_id),
+        )
+    if state.get("track_id") != track_id:
+        raise RuntimeError("live deck does not match autonomous-set state")
+    end_beat = profile.beat_count or max(
+        (point.index for point in profile.beat_grid),
+        default=0,
+    )
+    if end_beat <= 0:
+        raise RuntimeError("track has no analyzed end position")
+    return max(
+        0.0,
+        (float(end_beat) - float(state["track_beat"]))
+        / profile.time_signature,
+    )
+
+
+def _runner_advance(
+    job_id: str,
+    succeeded: bool,
+    error: str | None,
+) -> dict[str, Any]:
+    return set_sessions.advance(job_id, succeeded, error)
+
+
+def _get_autonomous_runner() -> AutonomousSetRunner:
+    global autonomous_runner
+    if autonomous_runner is None:
+        autonomous_runner = AutonomousSetRunner(
+            profile_store.data_dir / "autonomous-set.json",
+            schedule=_runner_schedule,
+            job_status=scheduler.get,
+            job_qa=lambda job_id: transition_qa(scheduler.get(job_id)),
+            remaining_bars=_runner_remaining_bars,
+            engage_loop=_engage_rescue_loop,
+            run_tempo=_execute_tempo_plan,
+            advance=_runner_advance,
+            finish=lambda _status: engine.release_set_control(),
+        )
+    return autonomous_runner
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def engage_rescue_loop(deck: int, beats: int = 16) -> dict[str, Any]:
+    """Engage and transport-verify a phrase-aligned emergency loop."""
+    return await _engage_rescue_loop(deck, beats)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def release_rescue_loop(deck: int) -> dict[str, Any]:
+    """Release only a rescue loop that this process verified as active."""
+    record = verified_rescue_loops.get(deck)
+    if record is None or record.get("verified") is not True:
+        raise RuntimeError("no verified rescue loop is active on this deck")
+    messages = await engine.send_action("loop_toggle", {"deck": deck})
+    verified_rescue_loops.pop(deck, None)
+    return {
+        "verified": True,
+        "released": True,
+        "deck": deck,
+        "messages": messages,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def rescue_loop_status() -> dict[str, Any]:
+    """Return loops proven active by transport repetition in this process."""
+    return {
+        "active": bool(verified_rescue_loops),
+        "decks": {
+            str(deck): record
+            for deck, record in verified_rescue_loops.items()
+        },
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def execute_tempo_plan(
+    plan: TempoPlan,
+    deck: int,
+    track_id: str,
+) -> dict[str, Any]:
+    """Run a verified gradual BPM trajectory on the active Master deck."""
+    return await _execute_tempo_plan(plan, deck, track_id)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
+    """Validate every branch and warm exact Rekordbox load/cue routes."""
+    errors: list[str] = []
+    unique_track_ids = {plan.opening.track_id}
+    for option in plan.transitions:
+        unique_track_ids.add(option.incoming.track_id)
+        try:
+            outgoing = profile_store.get(option.card.outgoing_track_id)
+            incoming = profile_store.get(option.card.incoming_track_id)
+        except KeyError as exc:
+            errors.append(f"{option.id}: {exc}")
+            continue
+        errors.extend(
+            f"{option.id}: {error}"
+            for error in validate_transition_card(
+                option.card,
+                outgoing,
+                incoming,
+            )
+        )
+    audit = profile_store.audit(sorted(unique_track_ids))
+    if errors:
+        return {"ready": False, "errors": errors, "audit": audit}
+
+    warmed = []
+    seen: set[tuple[str, int]] = set()
+    for option in sorted(plan.transitions, key=lambda item: item.priority):
+        key = (option.incoming.track_id, option.card.incoming_deck)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            staged = await _stage_track(
+                deck=option.card.incoming_deck,
+                track_id=option.incoming.track_id,
+                title=option.incoming.title,
+                artist=option.incoming.artist,
+                source=option.incoming.source,
+                result_index=option.incoming.result_index,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{option.id}: staging failed: {exc}") from exc
+        cue = None
+        if option.incoming.cue is not None:
+            cue = await verify_hot_cue(
+                deck=option.card.incoming_deck,
+                track_id=option.incoming.track_id,
+                title=option.incoming.title,
+                cue=option.incoming.cue,
+                expected_time_ms=int(option.incoming.cue_time_ms),
+            )
+            if cue.get("verified") is not True:
+                raise RuntimeError(
+                    f"{option.id}: incoming Hot Cue verification failed"
+                )
+        warmed.append({"option_id": option.id, "stage": staged, "cue": cue})
+
+    primary = min(
+        (
+            option
+            for option in plan.transitions
+            if option.card.outgoing_track_id == plan.opening.track_id
+        ),
+        key=lambda option: option.priority,
+    )
+    opening_stage = await _stage_track(
+        deck=primary.card.outgoing_deck,
+        track_id=plan.opening.track_id,
+        title=plan.opening.title,
+        artist=plan.opening.artist,
+        source=plan.opening.source,
+        result_index=plan.opening.result_index,
+    )
+    incoming_stage = await _stage_track(
+        deck=primary.card.incoming_deck,
+        track_id=primary.incoming.track_id,
+        title=primary.incoming.title,
+        artist=primary.incoming.artist,
+        source=primary.incoming.source,
+        result_index=primary.incoming.result_index,
+    )
+    if primary.incoming.cue is not None:
+        await verify_hot_cue(
+            deck=primary.card.incoming_deck,
+            track_id=primary.incoming.track_id,
+            title=primary.incoming.title,
+            cue=primary.incoming.cue,
+            expected_time_ms=int(primary.incoming.cue_time_ms),
+        )
+    fingerprint = _set_fingerprint(plan)
+    preflighted_set_fingerprints.add(fingerprint)
+    return {
+        "ready": True,
+        "fingerprint": fingerprint,
+        "audit": audit,
+        "warmed_routes": warmed,
+        "opening_stage": opening_stage,
+        "incoming_stage": incoming_stage,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def start_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
+    """Start track one and keep every later handoff local to Performer."""
+    fingerprint = _set_fingerprint(plan)
+    if fingerprint not in preflighted_set_fingerprints:
+        raise RuntimeError(
+            "autonomous set has not passed preflight in this Performer session"
+        )
+    primary = min(
+        (
+            option
+            for option in plan.transitions
+            if option.card.outgoing_track_id == plan.opening.track_id
+        ),
+        key=lambda option: option.priority,
+    )
+    runner = _get_autonomous_runner()
+    runner.prepare(plan, opening_deck=primary.card.outgoing_deck)
+    set_sessions.create(
+        plan.name,
+        [plan.opening.track_id]
+        + [
+            option.incoming.track_id
+            for option in _primary_path(plan)
+        ],
+    )
+    estimated_seconds = sum(
+        (profile_store.get(track_id).duration_ms or 6 * 60_000) / 1000.0
+        for track_id in [plan.opening.track_id]
+        + [option.incoming.track_id for option in _primary_path(plan)]
+    ) + 20 * 60
+    engine.authorize_set(min(4 * 60 * 60, estimated_seconds))
+    await _stage_track(
+        deck=primary.card.outgoing_deck,
+        track_id=plan.opening.track_id,
+        title=plan.opening.title,
+        artist=plan.opening.artist,
+        source=plan.opening.source,
+        result_index=plan.opening.result_index,
+    )
+    opening = await launch_and_schedule_opening_transition(
+        card=primary.card,
+        outgoing_title=plan.opening.title,
+        incoming_title=primary.incoming.title,
+        execution_id=f"autonomous-opening-{fingerprint[:16]}",
+        incoming_artist=primary.incoming.artist,
+        incoming_cue=primary.incoming.cue,
+        incoming_cue_time_ms=primary.incoming.cue_time_ms,
+        source=primary.incoming.source,
+        result_index=primary.incoming.result_index,
+    )
+    if not opening.get("ready"):
+        engine.release_set_control()
+        return opening
+    job_id = opening["schedule"]["job"]["id"]
+    runner_state = runner.start_with_job(primary.id, job_id)
+    return {
+        "ready": True,
+        "opening": opening,
+        "runner": runner_state,
+        "set_fingerprint": fingerprint,
+    }
+
+
+def _primary_path(plan: AutonomousSetPlan) -> list[TransitionOption]:
+    current = plan.opening.track_id
+    result = []
+    for _ in range(plan.target_track_count - 1):
+        option = min(
+            (
+                item
+                for item in plan.transitions
+                if item.card.outgoing_track_id == current
+            ),
+            key=lambda item: item.priority,
+        )
+        result.append(option)
+        current = option.incoming.track_id
+    return result
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def autonomous_set_status() -> dict[str, Any]:
+    """Return the local runner state, deadlines, failures, and current job."""
+    return _get_autonomous_runner().public()
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def resume_autonomous_set() -> dict[str, Any]:
+    """Resume persisted runner state after a Performer process restart."""
+    return _get_autonomous_runner().resume()
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def stop_autonomous_set() -> dict[str, Any]:
+    """Stop the runner and release its long-lived control authorization."""
+    state = _get_autonomous_runner().stop()
+    engine.release_set_control()
+    return state
+
+
 async def _stage_track(
     *,
     deck: int,
@@ -1942,7 +2867,7 @@ async def _stage_track(
     result_index: int | None = None,
 ) -> dict[str, Any]:
     with deck_observer.exclusive_adapter():
-        return await _stage_track_exclusive(
+        result = await _stage_track_exclusive(
             deck=deck,
             track_id=track_id,
             title=title,
@@ -1950,6 +2875,9 @@ async def _stage_track(
             source=source,
             result_index=result_index,
         )
+    if result.get("verified"):
+        track_title_aliases[track_id] = title
+    return result
 
 
 async def _stage_track_exclusive(
@@ -1978,6 +2906,44 @@ async def _stage_track_exclusive(
         raise RuntimeError(
             f"Deck {deck} did not enter a paused state before loading"
         )
+    # A correctly loaded, stopped deck is already staged.  Searching again is
+    # both unnecessary and dangerous during a live set: a hidden/filtered
+    # browser can consume the outgoing runway even though the exact track is
+    # resident on the deck.  Prove title, artist, and stopped transport from a
+    # fresh deck snapshot, then bypass the browser entirely.
+    snapshot_reader = getattr(rekordbox_ui, "deck_snapshot", None)
+    if callable(snapshot_reader):
+        resident = snapshot_reader(deck)
+        resident_title_matches = (
+            normalize_title(resident.title) == normalize_title(title)
+        )
+        resident_artist_matches = (
+            artist is None
+            or normalize_title(resident.artist) == normalize_title(artist)
+        )
+        if resident_title_matches and resident_artist_matches:
+            if rekordbox_ui.deck_is_playing(deck, initial=resident):
+                raise RuntimeError(
+                    f"Resident track on deck {deck} is not stopped"
+                )
+            deck_observer.invalidate()
+            return {
+                "selection": None,
+                "deck": deck,
+                "track_id": track_id,
+                "title": title,
+                "artist": artist,
+                "source": source,
+                "messages": [],
+                "preload_stop_messages": preload_messages,
+                "observed": resident.public(),
+                "transport_verified_stopped": True,
+                "attempts": [],
+                "route_cache_hit": False,
+                "already_loaded": True,
+                "browser_search_skipped": True,
+                "verified": True,
+            }
     search_title = title.translate(
         str.maketrans({"\u2018": "'", "\u2019": "'", "\uff07": "'"})
     )
@@ -1996,18 +2962,26 @@ async def _stage_track_exclusive(
             search_queries.append(query)
     first = None
     empty_searches = []
-    for search_query in search_queries:
-        try:
-            first = rekordbox_ui.select_exact_track(
-                title,
-                search_query=search_query,
-                result_index=0,
-            )
+    for search_pass in range(2):
+        for search_query in search_queries:
+            try:
+                first = rekordbox_ui.select_exact_track(
+                    title,
+                    search_query=search_query,
+                    result_index=0,
+                )
+                break
+            except RuntimeError as exc:
+                if "returned no visible rows" not in str(exc):
+                    raise
+                empty_searches.append(search_query)
+        if first is not None:
             break
-        except RuntimeError as exc:
-            if "returned no visible rows" not in str(exc):
-                raise
-            empty_searches.append(search_query)
+        if search_pass == 0:
+            # Rekordbox can briefly expose an empty Collection after a prior
+            # streaming/load repaint. Reacquire the UI and repeat the bounded
+            # exact-query sequence once before declaring the route absent.
+            await asyncio.sleep(0.6)
     if first is None:
         raise RuntimeError(
             f"No visible Rekordbox rows for {title!r}; "
@@ -2039,15 +3013,28 @@ async def _stage_track_exclusive(
         candidate_indices.insert(0, cached_index)
     attempts = []
     for candidate_index in candidate_indices:
-        selection = (
-            first
-            if candidate_index == 0
-            else rekordbox_ui.select_exact_track(
-                title,
-                search_query=search_query,
-                result_index=candidate_index,
-            )
-        )
+        if candidate_index == 0:
+            selection = first
+        else:
+            try:
+                selection = rekordbox_ui.select_exact_track(
+                    title,
+                    search_query=search_query,
+                    result_index=candidate_index,
+                )
+            except ValueError as exc:
+                if "result_index must be between" not in str(exc):
+                    raise
+                # Rekordbox can repaint the browser between the initial row
+                # count and selection (especially while a prior streaming
+                # result is still resolving). Re-read the now-single result
+                # at row zero instead of failing on the stale duplicate index.
+                selection = rekordbox_ui.select_exact_track(
+                    title,
+                    search_query=search_query,
+                    result_index=0,
+                )
+                candidate_index = 0
         messages = []
         cached_method = (
             cached_route.get("method")
@@ -2146,6 +3133,8 @@ async def _stage_track_exclusive(
                 "transport_verified_stopped": True,
                 "attempts": attempts,
                 "route_cache_hit": cached_method is not None,
+                "already_loaded": False,
+                "browser_search_skipped": False,
                 "verified": True,
             }
     raise RuntimeError(
@@ -2222,12 +3211,64 @@ def cancel_transition(job_id: str) -> dict[str, Any]:
 def emergency_stop() -> dict[str, Any]:
     """Cancel all automation and disarm; leave current Rekordbox state untouched."""
     cancelled = scheduler.cancel_all()
+    runner_state = (
+        autonomous_runner.stop()
+        if autonomous_runner is not None
+        else {"active": False}
+    )
+    verified_rescue_loops.clear()
     deck_observer.deactivate()
     status = engine.disarm()
     return {
         "cancelled_jobs": cancelled,
+        "autonomous_set": runner_state,
         "control_status": status,
         "message": "Automation cancelled. Physical FLX4 control remains available.",
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def restart_performer() -> dict[str, Any]:
+    """Safely reload Performer code without restarting Codex or Rekordbox."""
+    if os.environ.get(SUPERVISED_ENV) != "1":
+        raise RuntimeError(
+            "Performer is not running under its restart supervisor. Restart "
+            "Codex once after installing this update; later Performer reloads "
+            "will not require a Codex restart."
+        )
+    active_jobs = scheduler.metrics()["active_jobs"]
+    if active_jobs:
+        raise RuntimeError(
+            f"Cannot restart Performer while {active_jobs} transition job(s) "
+            "are active"
+        )
+    if (
+        autonomous_runner is not None
+        and autonomous_runner.public().get("active")
+    ):
+        raise RuntimeError(
+            "Cannot restart Performer while an autonomous set is active"
+        )
+    for task in tuple(sync_guard_tasks):
+        task.cancel()
+    sync_guard_tasks.clear()
+    deck_observer.close()
+    engine.disconnect()
+    generation = int(os.environ.get(GENERATION_ENV, "1"))
+    timer = threading.Timer(0.75, lambda: os._exit(RESTART_EXIT_CODE))
+    timer.daemon = True
+    timer.start()
+    return {
+        "restarting": True,
+        "current_generation": generation,
+        "next_generation": generation + 1,
+        "midi_disconnected": True,
+        "control_armed": False,
+        "resume_after_ms": 1500,
+        "message": (
+            "Performer is safely disarmed and will reload in place. Rekordbox "
+            "stays open; reconnect MIDI and re-arm before live control."
+        ),
     }
 
 
