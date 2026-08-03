@@ -234,10 +234,14 @@ After a transition completes, the verifier promotes the incoming deck's exact
 scheduled Hot Cue dispatch time into the next authoritative live clock. This
 keeps a multi-song set's timing runway continuous instead of depending on a
 slow post-transition refresh. Any BPM difference greater than 0.05 BPM requires
-Beat Sync in the card. Drop-oriented transition families (`long_blend`,
-`bass_swap`, and `double_drop`) also require their critical bass-swap beat to
-land on a high-confidence or verified incoming `drop` landmark; a merely
-convenient phrase boundary is not sufficient.
+Beat Sync in the card. Any transition that transfers both decks' low EQ on its
+critical downbeat is treated as a real bass handoff regardless of the family
+label. It must launch a verified phrase-start Hot Cue exactly 8 or 16 bars
+before a high-confidence/verified incoming `drop` or `bass_in` landmark, and
+that landmark must itself be a Rekordbox phrase downbeat. A file start, an
+arbitrary elapsed overlap, or a convenient phrase label cannot certify the
+bass swap. `cue_preparation_plan` reserves G/H and works backward from those
+verified bass-phrase landmarks.
 
 `rank_transition_candidates` normalizes Camelot and conventional key labels,
 filters incompatible moves by default, and ranks the remainder by harmonic
@@ -253,6 +257,9 @@ The reliability upgrade moves lifecycle ownership into Performer:
    a directed set of transition options. Every option contains the exact load
    identity, a verified transition card, a priority, and an optional post-mix
    `TempoPlan`. Multiple options from one outgoing track are ordered fallbacks.
+   With the default `tempo_strategy="auto"`, Performer materializes a target
+   for every path depth, interpolating from the opening BPM to the final native
+   BPM (or `tempo_target_bpm`) over the whole set.
 2. Call `preflight_autonomous_set`. It validates the complete reachable path,
    preparation tier, phrase/drop evidence, harmonic safety, tempo stretch,
    load identity, and cue requirements. It then warms deterministic load
@@ -269,14 +276,19 @@ The reliability upgrade moves lifecycle ownership into Performer:
    card releases that loop on bar 0 beat 1. This prevents an exhausted outgoing
    track from reaching silence while loading or verification recovers.
 6. A failed primary option is retried only within its explicit budget; then the
-   runner selects the next prepared fallback. State and failures are visible in
-   `autonomous_set_status` and survive a Performer process restart. Because
-   scheduler jobs themselves are process-local, do not restart Performer during
-   an active handoff.
-7. Optional `TempoPlan` ramps only the new, verified Master deck after the old
-   deck is retired. Candidate selection and card validation reject more than a
-   4 percent stretch by default. Use an intermediate BPM bridge or explicitly
-   accept the risk; do not leave a 130 BPM track parked at 121 BPM.
+   runner selects the next prepared fallback. A transient stale/missing deck
+   observation does not consume that musical retry budget: the runner keeps the
+   route, monitors the deadline, and engages the rescue loop if necessary.
+   State and failures are visible in `autonomous_set_status` and survive a
+   Performer process restart. Because scheduler jobs themselves are
+   process-local, do not restart Performer during an active handoff.
+7. After each verified handoff, the resolved `TempoPlan` ramps only the new,
+   verified Master deck, normally over 32 bars. `tempo_strategy="manual"`
+   requires an explicit ramp when the set spans a material BPM change;
+   `tempo_strategy="hold"` is the deliberate fixed-tempo opt-out. Candidate
+   selection and card validation reject more than a 4 percent stretch by
+   default. Use an intermediate BPM bridge or explicitly accept the risk; do
+   not leave a 130 BPM track parked at 121 BPM.
 
 For a manually supervised one-off handoff, the older
 `stage_and_schedule_transition_card` -> `transition_quality_report` ->

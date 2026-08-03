@@ -98,6 +98,18 @@ def _set_fingerprint(plan: AutonomousSetPlan) -> str:
     ).hexdigest()
 
 
+def _materialize_autonomous_plan(
+    plan: AutonomousSetPlan,
+) -> AutonomousSetPlan:
+    track_ids = {plan.opening.track_id}
+    track_ids.update(option.incoming.track_id for option in plan.transitions)
+    native_bpms = {
+        track_id: profile_store.get(track_id).bpm
+        for track_id in track_ids
+    }
+    return plan.materialize_tempo_arc(native_bpms)
+
+
 def _expected_track_title(track_id: str) -> str:
     return track_title_aliases.get(track_id) or profile_store.get(track_id).title
 
@@ -2658,8 +2670,12 @@ async def execute_tempo_plan(
 async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     """Validate every branch and warm exact Rekordbox load/cue routes."""
     errors: list[str] = []
-    unique_track_ids = {plan.opening.track_id}
-    for option in plan.transitions:
+    try:
+        resolved_plan = _materialize_autonomous_plan(plan)
+    except (KeyError, ValueError) as exc:
+        return {"ready": False, "errors": [f"tempo arc: {exc}"]}
+    unique_track_ids = {resolved_plan.opening.track_id}
+    for option in resolved_plan.transitions:
         unique_track_ids.add(option.incoming.track_id)
         try:
             outgoing = profile_store.get(option.card.outgoing_track_id)
@@ -2681,7 +2697,7 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
 
     warmed = []
     seen: set[tuple[str, int]] = set()
-    for option in sorted(plan.transitions, key=lambda item: item.priority):
+    for option in sorted(resolved_plan.transitions, key=lambda item: item.priority):
         key = (option.incoming.track_id, option.card.incoming_deck)
         if key in seen:
             continue
@@ -2715,18 +2731,18 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     primary = min(
         (
             option
-            for option in plan.transitions
-            if option.card.outgoing_track_id == plan.opening.track_id
+            for option in resolved_plan.transitions
+            if option.card.outgoing_track_id == resolved_plan.opening.track_id
         ),
         key=lambda option: option.priority,
     )
     opening_stage = await _stage_track(
         deck=primary.card.outgoing_deck,
-        track_id=plan.opening.track_id,
-        title=plan.opening.title,
-        artist=plan.opening.artist,
-        source=plan.opening.source,
-        result_index=plan.opening.result_index,
+        track_id=resolved_plan.opening.track_id,
+        title=resolved_plan.opening.title,
+        artist=resolved_plan.opening.artist,
+        source=resolved_plan.opening.source,
+        result_index=resolved_plan.opening.result_index,
     )
     incoming_stage = await _stage_track(
         deck=primary.card.incoming_deck,
@@ -2744,12 +2760,13 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
             cue=primary.incoming.cue,
             expected_time_ms=int(primary.incoming.cue_time_ms),
         )
-    fingerprint = _set_fingerprint(plan)
+    fingerprint = _set_fingerprint(resolved_plan)
     preflighted_set_fingerprints.add(fingerprint)
     return {
         "ready": True,
         "fingerprint": fingerprint,
         "audit": audit,
+        "tempo_arc": resolved_plan.tempo_arc_summary(),
         "warmed_routes": warmed,
         "opening_stage": opening_stage,
         "incoming_stage": incoming_stage,
@@ -2759,7 +2776,8 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def start_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     """Start track one and keep every later handoff local to Performer."""
-    fingerprint = _set_fingerprint(plan)
+    resolved_plan = _materialize_autonomous_plan(plan)
+    fingerprint = _set_fingerprint(resolved_plan)
     if fingerprint not in preflighted_set_fingerprints:
         raise RuntimeError(
             "autonomous set has not passed preflight in this Performer session"
@@ -2767,38 +2785,38 @@ async def start_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     primary = min(
         (
             option
-            for option in plan.transitions
-            if option.card.outgoing_track_id == plan.opening.track_id
+            for option in resolved_plan.transitions
+            if option.card.outgoing_track_id == resolved_plan.opening.track_id
         ),
         key=lambda option: option.priority,
     )
     runner = _get_autonomous_runner()
-    runner.prepare(plan, opening_deck=primary.card.outgoing_deck)
+    runner.prepare(resolved_plan, opening_deck=primary.card.outgoing_deck)
     set_sessions.create(
-        plan.name,
-        [plan.opening.track_id]
+        resolved_plan.name,
+        [resolved_plan.opening.track_id]
         + [
             option.incoming.track_id
-            for option in _primary_path(plan)
+            for option in _primary_path(resolved_plan)
         ],
     )
     estimated_seconds = sum(
         (profile_store.get(track_id).duration_ms or 6 * 60_000) / 1000.0
-        for track_id in [plan.opening.track_id]
-        + [option.incoming.track_id for option in _primary_path(plan)]
+        for track_id in [resolved_plan.opening.track_id]
+        + [option.incoming.track_id for option in _primary_path(resolved_plan)]
     ) + 20 * 60
     engine.authorize_set(min(4 * 60 * 60, estimated_seconds))
     await _stage_track(
         deck=primary.card.outgoing_deck,
-        track_id=plan.opening.track_id,
-        title=plan.opening.title,
-        artist=plan.opening.artist,
-        source=plan.opening.source,
-        result_index=plan.opening.result_index,
+        track_id=resolved_plan.opening.track_id,
+        title=resolved_plan.opening.title,
+        artist=resolved_plan.opening.artist,
+        source=resolved_plan.opening.source,
+        result_index=resolved_plan.opening.result_index,
     )
     opening = await launch_and_schedule_opening_transition(
         card=primary.card,
-        outgoing_title=plan.opening.title,
+        outgoing_title=resolved_plan.opening.title,
         incoming_title=primary.incoming.title,
         execution_id=f"autonomous-opening-{fingerprint[:16]}",
         incoming_artist=primary.incoming.artist,
@@ -2816,6 +2834,7 @@ async def start_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
         "ready": True,
         "opening": opening,
         "runner": runner_state,
+        "tempo_arc": resolved_plan.tempo_arc_summary(),
         "set_fingerprint": fingerprint,
     }
 

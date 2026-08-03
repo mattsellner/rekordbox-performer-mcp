@@ -435,6 +435,7 @@ def test_phrase_cut_can_launch_verified_file_start_without_hot_cue() -> None:
         action="play_pause",
         parameters={"deck": 2},
     )
+    card.events = [event for event in card.events if event.action != "eq_low"]
     errors = validate_transition_card(card, outgoing, incoming)
     assert not any("launch" in error.lower() for error in errors)
 
@@ -1148,7 +1149,7 @@ def test_card_rejects_unverified_incoming_launch_cue() -> None:
     )
 
 
-def test_bass_swap_rejects_critical_bar_without_verified_drop() -> None:
+def test_bass_swap_accepts_verified_bass_phrase_when_drop_label_is_absent() -> None:
     incoming = prepared_profile("b", "B")
     incoming.landmarks = [
         landmark for landmark in incoming.landmarks if landmark.kind != "drop"
@@ -1158,8 +1159,80 @@ def test_bass_swap_rejects_critical_bar_without_verified_drop() -> None:
         prepared_profile("a", "A"),
         incoming,
     )
+    assert not any("critical bass swap" in error for error in errors)
+
+
+def test_bass_swap_rejects_critical_bar_without_verified_bass_phrase() -> None:
+    incoming = prepared_profile("b", "B")
+    incoming.landmarks = [
+        landmark
+        for landmark in incoming.landmarks
+        if landmark.kind not in {"drop", "bass_in"}
+    ]
+    errors = validate_transition_card(
+        valid_card(),
+        prepared_profile("a", "A"),
+        incoming,
+    )
     assert (
-        "critical bass swap does not land on a verified incoming drop"
+        "critical bass swap does not land on the downbeat of a verified "
+        "incoming drop or bass phrase"
+        in errors
+    )
+
+
+def test_breakdown_handoff_with_bass_swap_rejects_file_start_launch() -> None:
+    card = valid_card()
+    card.transition_family = "breakdown_handoff"
+    card.events[0] = MusicalEvent(
+        bar_offset=0,
+        action="play_pause",
+        parameters={"deck": 2},
+    )
+
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        prepared_profile("b", "B"),
+    )
+
+    assert (
+        "a transition with a bass handoff requires a verified Hot Cue "
+        "on a phrase start"
+        in errors
+    )
+
+
+def test_bass_handoff_rejects_arbitrary_ten_bar_swap() -> None:
+    card = valid_card()
+    card.transition_family = "breakdown_handoff"
+    card.critical_bar_offset = 10
+    for event in card.events:
+        if event.action == "eq_low":
+            event.bar_offset = 10
+
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        prepared_profile("b", "B"),
+    )
+
+    assert "bass handoff must land 8 or 16 bars after the incoming cue" in errors
+
+
+def test_breakdown_handoff_rejects_split_low_eq_transfer() -> None:
+    card = valid_card()
+    card.transition_family = "breakdown_handoff"
+    card.events[2].beat_offset = 1
+
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        prepared_profile("b", "B"),
+    )
+
+    assert (
+        "bass handoff must swap both low EQs together on the critical downbeat"
         in errors
     )
 
@@ -1353,13 +1426,27 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
     )
     card = valid_card()
     card.beat_sync_required = False
-    card.critical_bar_offset = 4
+    card.critical_bar_offset = 8
     incoming = prepared_profile("b", "B")
+    incoming.phrase_boundaries.append(
+        PhraseBoundary(
+            index=3,
+            start_beat=33,
+            end_beat=64,
+            start_bar=9,
+            beat_in_bar=1,
+            length_beats=32,
+            length_bars=8,
+            kind_code=5,
+            label="drop",
+            confidence="verified",
+        )
+    )
     incoming.landmarks.append(
         TrackLandmark(
             name="short-entry drop",
             kind="drop",
-            bar=5,
+            bar=9,
             confidence="verified",
         )
     )
@@ -1375,22 +1462,22 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
             parameters={"deck": 2, "cue": 1},
         ),
         MusicalEvent(
-            bar_offset=4,
+            bar_offset=8,
             action="eq_low",
             parameters={"deck": 1, "value": -1},
         ),
         MusicalEvent(
-            bar_offset=4,
+            bar_offset=8,
             action="eq_low",
             parameters={"deck": 2, "value": 0},
         ),
         MusicalEvent(
-            bar_offset=8,
+            bar_offset=12,
             action="channel_fader",
             parameters={"deck": 1, "value": 0},
         ),
         MusicalEvent(
-            bar_offset=8,
+            bar_offset=12,
             beat_offset=1,
             action="cue",
             parameters={"deck": 1},
@@ -1421,4 +1508,4 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
     assert compiled["start_bar"] == 65
     assert compiled["events"][0]["at_ms"] == 250
     assert compiled["events"][1]["at_ms"] == 250
-    assert compiled["events"][2]["at_ms"] == 7750
+    assert compiled["events"][2]["at_ms"] == 15250

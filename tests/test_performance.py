@@ -47,6 +47,18 @@ def profile(track_id: str) -> TrackProfile:
                 label="UP 1",
                 confidence="high",
             ),
+            PhraseBoundary(
+                index=2,
+                start_beat=129,
+                end_beat=192,
+                start_bar=33,
+                beat_in_bar=1,
+                length_beats=64,
+                length_bars=16,
+                kind_code=5,
+                label="DROP",
+                confidence="high",
+            ),
         ],
         landmarks=[
             TrackLandmark(name="drop", kind="drop", bar=33, confidence="high"),
@@ -104,6 +116,7 @@ def test_cue_plan_selects_sixteen_bars_before_drop() -> None:
     assert result["suggestions"][0]["bar"] == 17
     assert result["suggestions"][0]["role"] == "16_bars_before_drop"
     assert result["suggestions"][0]["cue"] == 7
+    assert result["suggestions"][0]["verified_bass_phrase_start"] is True
     assert result["cue_policy"] == "automation uses Hot Cue G/H only"
 
 

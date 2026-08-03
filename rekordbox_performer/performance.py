@@ -105,24 +105,25 @@ def vocal_handoff(
 
 def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
     """Suggest phrase-safe entry cues before drops without mutating Rekordbox."""
+    phrase_starts = {
+        (phrase.start_bar, phrase.beat_in_bar)
+        for phrase in profile.phrase_boundaries
+        if phrase.confidence in {"verified", "high"}
+    }
     targets = sorted(
         (
             item for item in profile.landmarks
             if item.kind in {"drop", "bass_in"}
             and item.confidence in {"verified", "high"}
+            and (item.bar, item.beat) in phrase_starts
         ),
-        key=lambda item: (item.bar, item.beat),
+        key=lambda item: (0 if item.kind == "drop" else 1, item.bar, item.beat),
     )
     existing = {item.cue for item in profile.landmarks if item.cue is not None}
     # Reserve the user's A/B/C workflow. Automation-owned preparation uses
     # only G/H (pads 7/8), as explicitly requested.
     free = [cue for cue in (7, 8) if cue not in existing]
     suggestions = []
-    phrase_starts = {
-        (phrase.start_bar, phrase.beat_in_bar)
-        for phrase in profile.phrase_boundaries
-        if phrase.confidence in {"verified", "high"}
-    }
     for target in targets:
         for lead in (16, 8):
             cue_bar = target.bar - lead
@@ -139,6 +140,7 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
                 "beat": target.beat,
                 "time_ms": point.time_ms if point else round((beat_index - 1) * 60_000 / profile.bpm),
                 "target": target.model_dump(),
+                "verified_bass_phrase_start": True,
                 "requires_rekordbox_verification": True,
             })
             break

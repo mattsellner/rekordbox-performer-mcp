@@ -1023,9 +1023,33 @@ def validate_transition_card(
         and float(event.parameters.get("value", -1)) >= -0.1
         for event in critical
     )
+    any_outgoing_low_cut = any(
+        event.action == "eq_low"
+        and event.parameters.get("deck") == card.outgoing_deck
+        and float(event.parameters.get("value", 0)) <= -0.9
+        for event in card.events
+    )
+    any_incoming_low_open = any(
+        event.action == "eq_low"
+        and event.parameters.get("deck") == card.incoming_deck
+        and float(event.parameters.get("value", -1)) >= -0.1
+        for event in card.events
+    )
+    planned_bass_handoff = any_outgoing_low_cut and any_incoming_low_open
+    critical_bass_handoff = outgoing_low_cut and incoming_low_open
+    verified_bass_anchor_required = drop_anchored or planned_bass_handoff
     if drop_anchored and not (outgoing_low_cut and incoming_low_open):
         errors.append(
             "critical downbeat lacks a simultaneous two-deck bass swap"
+        )
+    if planned_bass_handoff and not critical_bass_handoff:
+        errors.append(
+            "bass handoff must swap both low EQs together on the critical "
+            "downbeat"
+        )
+    if planned_bass_handoff and card.critical_bar_offset not in {8, 16}:
+        errors.append(
+            "bass handoff must land 8 or 16 bars after the incoming cue"
         )
 
     launch_events = [
@@ -1050,9 +1074,10 @@ def validate_transition_card(
         )
     else:
         launch = launch_events[0]
-        if drop_anchored and launch.action != "hot_cue":
+        if verified_bass_anchor_required and launch.action != "hot_cue":
             errors.append(
-                f"{card.transition_family} requires a verified Hot Cue launch"
+                "a transition with a bass handoff requires a verified Hot Cue "
+                "on a phrase start"
             )
         elif (
             launch.action == "hot_cue"
@@ -1076,7 +1101,7 @@ def validate_transition_card(
                     "play_pause launch requires a high-confidence file-start "
                     "mix-in or phrase-start landmark"
                 )
-        if drop_anchored and launch.action == "hot_cue":
+        if verified_bass_anchor_required and launch.action == "hot_cue":
             entry = next(
                 (
                     landmark
@@ -1092,6 +1117,16 @@ def validate_transition_card(
                     errors.append(
                         "incoming launch cue must mark beat 1 of its phrase"
                     )
+                verified_phrase_starts = {
+                    (phrase.start_bar, phrase.beat_in_bar)
+                    for phrase in incoming.phrase_boundaries
+                    if phrase.confidence in {"verified", "high"}
+                }
+                if (entry.bar, entry.beat or 1) not in verified_phrase_starts:
+                    errors.append(
+                        "incoming launch cue does not land on a verified "
+                        "phrase boundary"
+                    )
                 entry_beat = (
                     (entry.bar - 1) * incoming.time_signature
                     + (entry.beat or 1)
@@ -1100,17 +1135,19 @@ def validate_transition_card(
                     entry_beat
                     + card.critical_bar_offset * incoming.time_signature
                 )
-                verified_drops = {
+                verified_bass_phrase_starts = {
                     (landmark.bar - 1) * incoming.time_signature
                     + (landmark.beat or 1)
                     for landmark in incoming.landmarks
-                    if landmark.kind == "drop"
+                    if landmark.kind in {"drop", "bass_in"}
                     and landmark.confidence in {"verified", "high"}
+                    and (landmark.bar, landmark.beat or 1)
+                    in verified_phrase_starts
                 }
-                if critical_beat not in verified_drops:
+                if critical_beat not in verified_bass_phrase_starts:
                     errors.append(
-                        "critical bass swap does not land on a verified "
-                        "incoming drop"
+                        "critical bass swap does not land on the downbeat of "
+                        "a verified incoming drop or bass phrase"
                     )
 
     outgoing_fader_zero: tuple[int, int] | None = None

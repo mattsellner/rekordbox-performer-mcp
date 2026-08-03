@@ -58,11 +58,17 @@ class TempoPlan(BaseModel):
         return value
 
     def validate_start(self, *, native_bpm: float, live_bpm: float) -> None:
-        stretch = abs(live_bpm / native_bpm - 1.0) * 100.0
-        if stretch > self.max_stretch_percent and not self.risk_accepted:
+        initial_stretch = abs(live_bpm / native_bpm - 1.0) * 100.0
+        target_stretch = abs(self.target_bpm / native_bpm - 1.0) * 100.0
+        if (
+            max(initial_stretch, target_stretch) > self.max_stretch_percent
+            and not self.risk_accepted
+        ):
             raise ValueError(
-                f"initial stretch {stretch:.2f}% exceeds "
-                f"{self.max_stretch_percent:.2f}%"
+                "tempo trajectory stretch exceeds the safe limit "
+                f"(initial {initial_stretch:.2f}%, target "
+                f"{target_stretch:.2f}%, limit "
+                f"{self.max_stretch_percent:.2f}%)"
             )
         self.control_value(native_bpm=native_bpm, bpm=self.target_bpm)
 
@@ -106,6 +112,13 @@ class AutonomousSetPlan(BaseModel):
     rescue_loop_trigger_bars: int = Field(default=8, ge=4, le=16)
     rescue_loop_beats: Literal[4, 8, 16] = 16
     retry_limit: int = Field(default=3, ge=1, le=10)
+    tempo_strategy: Literal["auto", "manual", "hold"] = "auto"
+    tempo_target_bpm: float | None = Field(default=None, gt=0)
+    tempo_ramp_bars: int = Field(default=32, ge=8, le=128)
+    tempo_steps_per_bar: int = Field(default=1, ge=1, le=4)
+    tempo_range_percent: float = Field(default=10.0, gt=0, le=100)
+    tempo_max_stretch_percent: float = Field(default=4.0, gt=0, le=10)
+    tempo_arc_minimum_change_bpm: float = Field(default=2.0, ge=0, le=10)
 
     @model_validator(mode="after")
     def reachable_primary_path(self) -> "AutonomousSetPlan":
@@ -137,6 +150,102 @@ class AutonomousSetPlan(BaseModel):
                 raise ValueError("primary transition path contains a cycle")
             visited.add(current)
         return self
+
+    def materialize_tempo_arc(
+        self,
+        native_bpms: dict[str, float],
+    ) -> "AutonomousSetPlan":
+        """Resolve an explicit gradual BPM target for every reachable depth."""
+        required_ids = {self.opening.track_id}
+        required_ids.update(option.incoming.track_id for option in self.transitions)
+        missing = sorted(required_ids - native_bpms.keys())
+        if missing:
+            raise ValueError(f"tempo arc is missing native BPM for {missing}")
+
+        current = self.opening.track_id
+        primary: list[TransitionOption] = []
+        depth_by_track = {current: 0}
+        for depth in range(self.target_track_count - 1):
+            choices = sorted(
+                (
+                    option
+                    for option in self.transitions
+                    if option.card.outgoing_track_id == current
+                ),
+                key=lambda option: option.priority,
+            )
+            option = choices[0]
+            primary.append(option)
+            depth_by_track.setdefault(option.incoming.track_id, depth + 1)
+            current = option.incoming.track_id
+
+        # Assign the same set-position depth to prepared fallback branches.
+        # Do not overwrite an earlier depth: that safely ignores cycles such
+        # as a preflight-only final-track route back to the opener.
+        for depth in range(self.target_track_count - 1):
+            for option in self.transitions:
+                if depth_by_track.get(option.card.outgoing_track_id) != depth:
+                    continue
+                depth_by_track.setdefault(option.incoming.track_id, depth + 1)
+
+        start_bpm = float(native_bpms[self.opening.track_id])
+        target_bpm = float(
+            self.tempo_target_bpm
+            if self.tempo_target_bpm is not None
+            else native_bpms[primary[-1].incoming.track_id]
+        )
+        total_change = target_bpm - start_bpm
+        if self.tempo_strategy == "hold" or abs(total_change) < 0.05:
+            return self
+        if self.tempo_strategy == "manual":
+            if (
+                abs(total_change) >= self.tempo_arc_minimum_change_bpm
+                and not any(option.tempo_after is not None for option in primary)
+            ):
+                raise ValueError(
+                    "manual tempo strategy spans a material BPM change but "
+                    "contains no TempoPlan"
+                )
+            return self
+
+        steps = self.target_track_count - 1
+        updated: list[TransitionOption] = []
+        for option in self.transitions:
+            depth = depth_by_track.get(option.card.outgoing_track_id)
+            incoming_depth = depth_by_track.get(option.incoming.track_id)
+            if (
+                depth is None
+                or depth >= steps
+                or incoming_depth != depth + 1
+                or option.tempo_after is not None
+            ):
+                updated.append(option)
+                continue
+            desired_bpm = start_bpm + total_change * incoming_depth / steps
+            prior_bpm = start_bpm + total_change * depth / steps
+            native_bpm = float(native_bpms[option.incoming.track_id])
+            tempo = TempoPlan(
+                target_bpm=round(desired_bpm, 3),
+                duration_bars=self.tempo_ramp_bars,
+                steps_per_bar=self.tempo_steps_per_bar,
+                tempo_range_percent=self.tempo_range_percent,
+                max_stretch_percent=self.tempo_max_stretch_percent,
+            )
+            tempo.validate_start(native_bpm=native_bpm, live_bpm=prior_bpm)
+            updated.append(option.model_copy(update={"tempo_after": tempo}))
+        return self.model_copy(update={"transitions": updated})
+
+    def tempo_arc_summary(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "option_id": option.id,
+                "incoming_track_id": option.incoming.track_id,
+                "target_bpm": option.tempo_after.target_bpm,
+                "duration_bars": option.tempo_after.duration_bars,
+            }
+            for option in self.transitions
+            if option.tempo_after is not None
+        ]
 
 
 class AutonomousSetState(BaseModel):

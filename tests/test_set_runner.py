@@ -290,6 +290,136 @@ def test_tempo_plan_enforces_stretch_and_maps_slider() -> None:
     try:
         unsafe.validate_start(native_bpm=130, live_bpm=121)
     except ValueError as exc:
-        assert "initial stretch" in str(exc)
+        assert "initial 6.92%" in str(exc)
     else:
         raise AssertionError("expected unsafe stretch to fail")
+
+    unsafe_target = TempoPlan(target_bpm=130, max_stretch_percent=4)
+    try:
+        unsafe_target.validate_start(native_bpm=121, live_bpm=121)
+    except ValueError as exc:
+        assert "target 7.44%" in str(exc)
+    else:
+        raise AssertionError("expected an unsafe target stretch to fail")
+
+
+def test_auto_tempo_arc_rises_gradually_across_the_primary_path() -> None:
+    plan = AutonomousSetPlan(
+        name="rising arc",
+        opening=TrackLoadSpec(track_id="a", title="A"),
+        transitions=[
+            option("a-b", "a", "b", 1),
+            option("b-c", "b", "c", 2),
+            option("c-d", "c", "d", 1),
+        ],
+        target_track_count=4,
+        tempo_ramp_bars=24,
+    )
+
+    resolved = plan.materialize_tempo_arc(
+        {"a": 120, "b": 121, "c": 125, "d": 129}
+    )
+
+    assert [
+        transition.tempo_after.target_bpm
+        for transition in resolved.transitions
+    ] == [123, 126, 129]
+    assert all(
+        transition.tempo_after.duration_bars == 24
+        for transition in resolved.transitions
+    )
+
+
+def test_auto_tempo_arc_applies_to_reachable_fallback_branches() -> None:
+    plan = AutonomousSetPlan(
+        name="fallback arc",
+        opening=TrackLoadSpec(track_id="a", title="A"),
+        transitions=[
+            option("a-b", "a", "b", 1),
+            option("a-x", "a", "x", 1),
+            option("b-c", "b", "c", 2),
+            option("x-y", "x", "y", 2),
+        ],
+        target_track_count=3,
+    )
+
+    resolved = plan.materialize_tempo_arc(
+        {"a": 120, "b": 123, "c": 126, "x": 122, "y": 125}
+    )
+    targets = {
+        transition.id: transition.tempo_after.target_bpm
+        for transition in resolved.transitions
+    }
+
+    assert targets == {"a-b": 123, "a-x": 123, "b-c": 126, "x-y": 126}
+
+
+def test_manual_material_tempo_arc_requires_an_explicit_ramp() -> None:
+    plan = AutonomousSetPlan(
+        name="manual arc",
+        opening=TrackLoadSpec(track_id="a", title="A"),
+        transitions=[option("a-b", "a", "b", 1)],
+        target_track_count=2,
+        tempo_strategy="manual",
+    )
+
+    try:
+        plan.materialize_tempo_arc({"a": 120, "b": 129})
+    except ValueError as exc:
+        assert "contains no TempoPlan" in str(exc)
+    else:
+        raise AssertionError("expected a missing manual tempo ramp to fail")
+
+
+def test_hold_tempo_strategy_does_not_generate_ramps() -> None:
+    plan = AutonomousSetPlan(
+        name="fixed tempo",
+        opening=TrackLoadSpec(track_id="a", title="A"),
+        transitions=[option("a-b", "a", "b", 1)],
+        target_track_count=2,
+        tempo_strategy="hold",
+    )
+
+    resolved = plan.materialize_tempo_arc({"a": 120, "b": 129})
+
+    assert resolved.transitions[0].tempo_after is None
+
+
+def test_runner_executes_post_handoff_tempo_plan(tmp_path) -> None:
+    async def scenario() -> None:
+        transition = option("a-b", "a", "b", 1)
+        transition.tempo_after = TempoPlan(target_bpm=123, duration_bars=16)
+        plan = AutonomousSetPlan(
+            name="tempo execution",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[transition],
+            target_track_count=2,
+        )
+        jobs = {"opening": {"id": "opening", "status": "completed"}}
+        ramps = []
+
+        async def run_tempo(tempo, deck, track_id):
+            ramps.append((tempo.target_bpm, deck, track_id))
+            return {"status": "completed"}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "tempo-execution.json",
+            schedule=lambda next_option, release_loop: asyncio.sleep(0),
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: {"passed": True, "faults": []},
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(
+                0, result={"verified": True}
+            ),
+            run_tempo=run_tempo,
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        assert ramps == [(123, 2, "b")]
+        assert runner.public()["status"] == "completed"
+
+    asyncio.run(scenario())
