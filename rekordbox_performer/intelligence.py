@@ -647,6 +647,30 @@ def incoming_bass_handoff_evidence(
     )
 
 
+def _grid_aligned_phrases(
+    phrases: list[PhraseBoundary],
+    beat_grid: list[AnalysisBeatGridPoint],
+) -> list[PhraseBoundary]:
+    """Map PSSI phrase indices onto PQTZ bar/beat labels.
+
+    PSSI's start_beat is an absolute grid index. Reducing it modulo four
+    silently shifts every phrase on tracks with pickup beats—the recurring
+    one- and two-beat live error this performer must never accept.
+    """
+    grid_by_index = {point.index: point for point in beat_grid}
+    return [
+        phrase.model_copy(
+            update={
+                "start_bar": grid_by_index[phrase.start_beat].bar,
+                "beat_in_bar": grid_by_index[phrase.start_beat].beat,
+            }
+        )
+        if phrase.start_beat in grid_by_index
+        else phrase
+        for phrase in phrases
+    ]
+
+
 class ProfileStore:
     def __init__(self, data_dir: Path | None = None) -> None:
         self.data_dir = data_dir or default_data_dir()
@@ -794,6 +818,10 @@ class ProfileStore:
         """Merge native Rekordbox beat/phrase truth into a performance profile."""
         profiles = self._load_profiles()
         existing_raw = profiles.get(analysis.track_id)
+        phrases = _grid_aligned_phrases(
+            analysis.phrases,
+            analysis.beat_grid,
+        )
         title = display_title or analysis.title
         artist = display_artist or analysis.artist
         if existing_raw:
@@ -820,9 +848,9 @@ class ProfileStore:
                         "high" if analysis.beat_grid else "unknown"
                     ),
                     "phrase_confidence": (
-                        "high" if analysis.phrases else "unknown"
+                        "high" if phrases else "unknown"
                     ),
-                    "phrase_boundaries": analysis.phrases,
+                    "phrase_boundaries": phrases,
                     "bass_energy_by_bar": (
                         analysis.bass_energy_by_bar
                         or existing.bass_energy_by_bar
@@ -867,17 +895,17 @@ class ProfileStore:
                     "high" if analysis.beat_grid else "unknown"
                 ),
                 phrase_confidence=(
-                    "high" if analysis.phrases else "unknown"
+                    "high" if phrases else "unknown"
                 ),
-                phrase_boundaries=analysis.phrases,
+                phrase_boundaries=phrases,
                 bass_energy_by_bar=analysis.bass_energy_by_bar,
                 vocal_confidence=(
                     "high" if analysis.vocal_analysis_available else "unknown"
                 ),
                 segments=analysis.vocal_segments + analysis.bass_segments,
             )
-        if analysis.phrases:
-            first = analysis.phrases[0]
+        if phrases:
+            first = phrases[0]
             first_time_ms = next(
                 (
                     point.time_ms
@@ -902,7 +930,7 @@ class ProfileStore:
             outro = next(
                 (
                     phrase
-                    for phrase in reversed(analysis.phrases)
+                    for phrase in reversed(phrases)
                     if phrase.label.casefold() == "outro"
                 ),
                 None,
@@ -929,14 +957,14 @@ class ProfileStore:
                         confidence="high",
                     )
                 )
-        if analysis.bass_energy_by_bar and analysis.phrases:
+        if analysis.bass_energy_by_bar and phrases:
             profile.landmarks = [
                 landmark
                 for landmark in profile.landmarks
                 if landmark.kind not in {"bass_in", "bass_out"}
             ]
             strong_phrases = []
-            for phrase in analysis.phrases:
+            for phrase in phrases:
                 if (
                     phrase.beat_in_bar != 1
                     or phrase.confidence not in {"verified", "high"}

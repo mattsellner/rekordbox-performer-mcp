@@ -909,6 +909,63 @@ def test_native_analysis_adds_analyzed_outro_mix_out(tmp_path: Path) -> None:
     assert profile.analysis_readiness()["ready"] is True
 
 
+def test_ingest_maps_phrase_indices_to_pickup_beat_grid_labels(
+    tmp_path: Path,
+) -> None:
+    store = ProfileStore(tmp_path)
+    result = store.ingest_analysis(
+        RekordboxAnalysisImport(
+            track_id="pickup",
+            title="Pickup",
+            artist="Artist",
+            bpm=128,
+            beatgrid_available=True,
+            phrase_analysis_available=True,
+            beat_count=3,
+            phrase_count=2,
+            beat_grid=[
+                AnalysisBeatGridPoint(
+                    index=1, bar=1, beat=3, bpm=128, time_ms=0
+                ),
+                AnalysisBeatGridPoint(
+                    index=2, bar=1, beat=4, bpm=128, time_ms=469
+                ),
+                AnalysisBeatGridPoint(
+                    index=3, bar=2, beat=1, bpm=128, time_ms=938
+                ),
+            ],
+            phrases=[
+                PhraseBoundary(
+                    index=1,
+                    start_beat=1,
+                    end_beat=2,
+                    start_bar=1,
+                    beat_in_bar=1,
+                    length_beats=2,
+                    kind_code=1,
+                    label="intro",
+                ),
+                PhraseBoundary(
+                    index=2,
+                    start_beat=3,
+                    end_beat=3,
+                    start_bar=1,
+                    beat_in_bar=3,
+                    length_beats=1,
+                    kind_code=5,
+                    label="chorus",
+                ),
+            ],
+        )
+    )
+
+    profile = TrackProfile.model_validate(result["profile"])
+    assert [
+        (phrase.start_bar, phrase.beat_in_bar)
+        for phrase in profile.phrase_boundaries
+    ] == [(1, 3), (2, 1)]
+
+
 def test_native_vocal_and_low_band_segments_complete_profile_readiness(
     tmp_path: Path,
 ) -> None:
