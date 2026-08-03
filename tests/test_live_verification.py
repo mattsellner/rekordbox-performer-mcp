@@ -902,6 +902,28 @@ def test_transition_postconditions_require_actual_transport_handoff(
     assert result["verified"] is True
 
 
+def test_bar_alignment_consensus_rejects_a_single_unstable_read() -> None:
+    stable = {
+        "bar_alignment": {
+            "verified": True,
+            "error_beats": 0.02,
+            "signed_error_beats": 0.02,
+        }
+    }
+    shifted = {
+        "bar_alignment": {
+            "verified": True,
+            "error_beats": 1.0,
+            "signed_error_beats": 1.0,
+        }
+    }
+
+    result = server._bar_alignment_consensus(stable, shifted)
+
+    assert result["verified"] is False
+    assert "disagree" in result["error"]
+
+
 def test_transition_postconditions_reject_midi_false_success(monkeypatch) -> None:
     monkeypatch.setattr(server, "profile_store", FakeProfileStore())
     result = server._verify_transition_postconditions(

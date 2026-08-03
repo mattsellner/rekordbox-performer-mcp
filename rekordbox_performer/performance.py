@@ -12,7 +12,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .intelligence import DeckObservation, TrackProfile, TransitionCard
+from .intelligence import (
+    DeckObservation,
+    TrackProfile,
+    TransitionCard,
+    bass_phrase_evidence,
+)
 
 
 def observation_from_elapsed(
@@ -110,21 +115,33 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
         for phrase in profile.phrase_boundaries
         if phrase.confidence in {"verified", "high"}
     }
-    targets = sorted(
-        (
-            item for item in profile.landmarks
-            if item.kind in {"drop", "bass_in"}
-            and item.confidence in {"verified", "high"}
-            and (item.bar, item.beat) in phrase_starts
-        ),
-        key=lambda item: (0 if item.kind == "drop" else 1, item.bar, item.beat),
+    target_records = []
+    seen_bars = set()
+    candidates = [
+        item for item in profile.landmarks
+        if item.kind in {"drop", "bass_in"}
+        and item.confidence in {"verified", "high"}
+        and (item.bar, item.beat) in phrase_starts
+    ]
+    candidates.sort(
+        key=lambda item: (
+            -float(bass_phrase_evidence(profile, item.bar).get("score", 0)),
+            0 if item.kind == "drop" else 1,
+            item.bar,
+        )
     )
+    for item in candidates:
+        evidence = bass_phrase_evidence(profile, item.bar)
+        if not evidence["verified"] or item.bar in seen_bars:
+            continue
+        seen_bars.add(item.bar)
+        target_records.append((item, evidence))
     existing = {item.cue for item in profile.landmarks if item.cue is not None}
     # Reserve the user's A/B/C workflow. Automation-owned preparation uses
     # only G/H (pads 7/8), as explicitly requested.
     free = [cue for cue in (7, 8) if cue not in existing]
     suggestions = []
-    for target in targets:
+    for target, bass_evidence in target_records:
         for lead in (16, 8):
             cue_bar = target.bar - lead
             if cue_bar < 1:
@@ -140,7 +157,8 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
                 "beat": target.beat,
                 "time_ms": point.time_ms if point else round((beat_index - 1) * 60_000 / profile.bpm),
                 "target": target.model_dump(),
-                "verified_bass_phrase_start": True,
+                "verified_bass_phrase_start": bass_evidence["verified"],
+                "bass_waveform_evidence": bass_evidence,
                 "requires_rekordbox_verification": True,
             })
             break

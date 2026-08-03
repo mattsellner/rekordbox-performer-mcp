@@ -21,8 +21,12 @@ low-level testing. Live musical handoffs must use the guarded workflow:
 1. Seed candidate metadata with `preflight_playlist`.
 2. Call rekordbox-mcp `get_track_analysis` or `resolve_track_analysis`, then
    pass its result to `ingest_rekordbox_analysis`.
-3. Ingest native `PVDI` vocal spans and `PWV7` low-band spans when available;
-   use `upsert_track_profile` only for additional verified landmarks.
+3. Ingest native `PVDI` vocal spans plus the complete per-bar `PWV7` low-band
+   curve; use `upsert_track_profile` only for additional verified landmarks.
+   Bass swaps fail closed unless the incoming downbeat and following phrase
+   have strong, sustained low-end relative to that track. Use
+   `analyze_incoming_bass_phrase` to inspect the evidence. A deliberate
+   breakdown handoff must set `intentional_energy_drop` explicitly.
 4. Require `audit_track_profiles` and `preflight_autonomous_set` to pass before
    track one. Preflight validates every primary and fallback branch, warms each
    exact browser/load route, and proves only the Hot Cues a card actually uses.
@@ -142,8 +146,10 @@ The mapping also includes dedicated one- and two-beat jump controls used only
 while the incoming channel fader is at zero. After launch, the Sync guard reads
 the red downbeat markers in Rekordbox's stacked waveforms. A clean integer
 one- or two-beat bar error is corrected on the muted incoming deck and observed
-again; an unavailable or still-misaligned grid cancels the job before the first
-audible fader rise.
+again. The detector follows the waveform rows across supported FX-panel heights
+and requires two agreeing screenshots before trusting or correcting the result;
+an unavailable, unstable, or still-misaligned grid cancels the job before the
+first audible fader rise.
 
 ## Safe Beat Sync and Quantize
 

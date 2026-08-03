@@ -26,6 +26,7 @@ from .intelligence import (
     TrackProfile,
     TransitionCard,
     audit_set_plan,
+    bass_phrase_evidence,
     camelot_compatibility,
     compile_transition_card,
     validate_transition_card,
@@ -398,7 +399,7 @@ async def _guard_incoming_sync(
             await asyncio.sleep(0.6)
             second_status = rekordbox_ui.status()
         correction = None
-        bar_alignment = second_status.get("bar_alignment") or {}
+        bar_alignment = _bar_alignment_consensus(first_status, second_status)
         if (
             bar_alignment.get("verified") is True
             and float(bar_alignment.get("error_beats", 0)) > 0.15
@@ -418,9 +419,12 @@ async def _guard_incoming_sync(
                 await asyncio.sleep(0.45)
                 with deck_observer.exclusive_adapter():
                     rekordbox_ui.invalidate_status_cache()
+                    corrected_first_status = rekordbox_ui.status()
+                    await asyncio.sleep(0.3)
                     corrected_status = rekordbox_ui.status()
-                corrected_alignment = (
-                    corrected_status.get("bar_alignment") or {}
+                corrected_alignment = _bar_alignment_consensus(
+                    corrected_first_status,
+                    corrected_status,
                 )
                 correction = {
                     "action": action,
@@ -428,7 +432,15 @@ async def _guard_incoming_sync(
                     "before": bar_alignment,
                     "after": corrected_alignment,
                 }
-                second_status = corrected_status
+                second_status = {
+                    **corrected_status,
+                    "bar_alignment": corrected_alignment,
+                }
+        else:
+            second_status = {
+                **second_status,
+                "bar_alignment": bar_alignment,
+            }
         outgoing = _deck_record(second_status, card.outgoing_deck)
         incoming_first = _deck_record(first_status, card.incoming_deck)
         incoming = _deck_record(second_status, card.incoming_deck)
@@ -496,6 +508,44 @@ async def _guard_incoming_sync(
             "status": "failed_safe",
             "errors": [f"sync guard error: {exc}"],
         }
+
+
+def _bar_alignment_consensus(*statuses: dict[str, Any]) -> dict[str, Any]:
+    """Require repeated waveform captures to agree before trusting or fixing."""
+    alignments = [status.get("bar_alignment") or {} for status in statuses]
+    if len(alignments) < 2 or any(
+        alignment.get("verified") is not True for alignment in alignments
+    ):
+        return {
+            "verified": False,
+            "error": "two verified waveform alignment samples are required",
+            "samples": alignments,
+        }
+    errors = [float(item.get("error_beats", 4.0)) for item in alignments]
+    signed = [float(item.get("signed_error_beats", 4.0)) for item in alignments]
+    if max(errors) - min(errors) > 0.12:
+        return {
+            "verified": False,
+            "error": "waveform alignment samples disagree",
+            "samples": alignments,
+        }
+    near_two = all(abs(value - 2.0) <= 0.15 for value in errors)
+    if not near_two and max(signed) - min(signed) > 0.12:
+        return {
+            "verified": False,
+            "error": "waveform alignment direction is unstable",
+            "samples": alignments,
+        }
+    signed_error = sum(signed) / len(signed)
+    if near_two:
+        signed_error = 2.0
+    return {
+        "verified": True,
+        "error_beats": round(sum(errors) / len(errors), 3),
+        "signed_error_beats": round(signed_error, 3),
+        "sample_count": len(alignments),
+        "samples": alignments,
+    }
 
 
 def _arm_sync_guard(
@@ -1065,6 +1115,20 @@ def plan_vocal_handoff(
 def prepare_track_cues(track_id: str) -> dict[str, Any]:
     """Plan an 8/16-bar pre-drop cue workflow for later Rekordbox verification."""
     return cue_preparation_plan(profile_store.get(track_id))
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def analyze_incoming_bass_phrase(
+    track_id: str,
+    start_bar: int,
+    window_bars: int = 8,
+) -> dict[str, Any]:
+    """Measure whether a phrase has enough low-end to carry a bass swap."""
+    return bass_phrase_evidence(
+        profile_store.get(track_id),
+        start_bar,
+        window_bars,
+    )
 
 
 @mcp.tool(annotations={"readOnlyHint": True})

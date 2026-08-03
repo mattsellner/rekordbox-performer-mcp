@@ -4,6 +4,7 @@ from pathlib import Path
 from rekordbox_performer.intelligence import (
     DeckObservation,
     AnalysisBeatGridPoint,
+    BassEnergyBar,
     LiveState,
     MusicalEvent,
     PlaylistTrackMetadata,
@@ -17,6 +18,7 @@ from rekordbox_performer.intelligence import (
     TransitionCard,
     SetPlan,
     audit_set_plan,
+    bass_phrase_evidence,
     compile_transition_card,
     camelot_compatibility,
     normalize_camelot,
@@ -59,6 +61,10 @@ def prepared_profile(track_id: str, title: str) -> TrackProfile:
                 label="chorus",
                 confidence="verified",
             ),
+        ],
+        bass_energy_by_bar=[
+            BassEnergyBar(bar=bar, median=10, mean=12, peak=20)
+            for bar in range(1, 81)
         ],
         landmarks=[
             TrackLandmark(
@@ -967,6 +973,10 @@ def test_native_vocal_and_low_band_segments_complete_profile_readiness(
                 )
             ],
             bass_analysis_available=True,
+            bass_energy_by_bar=[
+                BassEnergyBar(bar=bar, median=12, mean=14, peak=22)
+                for bar in range(1, 25)
+            ],
             bass_segments=[
                 TrackSegment(
                     kind="bass",
@@ -981,7 +991,56 @@ def test_native_vocal_and_low_band_segments_complete_profile_readiness(
     assert profile.vocal_confidence == "high"
     assert any(item.kind == "bass_in" for item in profile.landmarks)
     assert any(item.kind == "bass_out" for item in profile.landmarks)
+    assert len(profile.bass_energy_by_bar) == 24
     assert profile.readiness()["ready"] is True
+
+
+def test_bass_phrase_evidence_requires_attack_and_sustained_low_end() -> None:
+    candidate = prepared_profile("b", "B")
+    candidate.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=1 if bar == 17 else 20 if bar == 18 else 10,
+            mean=2 if bar == 17 else 22 if bar == 18 else 12,
+            peak=5 if bar == 17 else 30 if bar == 18 else 20,
+        )
+        for bar in range(1, 81)
+    ]
+
+    evidence = bass_phrase_evidence(candidate, 17)
+
+    assert evidence["verified"] is False
+    assert evidence["downbeat_ratio"] < 0.75
+    assert "downbeat" in evidence["reason"]
+
+
+def test_card_rejects_weak_bass_phrase_unless_energy_drop_is_intentional() -> None:
+    incoming = prepared_profile("b", "B")
+    incoming.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=1 if 17 <= bar <= 24 else 10,
+            mean=2 if 17 <= bar <= 24 else 12,
+            peak=5 if 17 <= bar <= 24 else 20,
+        )
+        for bar in range(1, 81)
+    ]
+    card = valid_card()
+
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        incoming,
+    )
+
+    assert any("cannot carry the low-EQ handoff" in error for error in errors)
+    card.intentional_energy_drop = True
+    errors = validate_transition_card(
+        card,
+        prepared_profile("a", "A"),
+        incoming,
+    )
+    assert not any("cannot carry the low-EQ handoff" in error for error in errors)
 
 
 def test_card_rejects_unobserved_or_disabled_sync() -> None:

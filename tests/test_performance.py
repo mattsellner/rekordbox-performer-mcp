@@ -2,6 +2,7 @@ from pathlib import Path
 
 from rekordbox_performer.intelligence import (
     AnalysisBeatGridPoint,
+    BassEnergyBar,
     MusicalEvent,
     PhraseBoundary,
     TrackLandmark,
@@ -59,6 +60,10 @@ def profile(track_id: str) -> TrackProfile:
                 label="DROP",
                 confidence="high",
             ),
+        ],
+        bass_energy_by_bar=[
+            BassEnergyBar(bar=bar, median=10, mean=12, peak=20)
+            for bar in range(1, 81)
         ],
         landmarks=[
             TrackLandmark(name="drop", kind="drop", bar=33, confidence="high"),
@@ -132,6 +137,41 @@ def test_cue_plan_rejects_non_phrase_downbeats_and_never_uses_user_cues() -> Non
 
     assert [item["bar"] for item in result["suggestions"]] == [17]
     assert [item["cue"] for item in result["suggestions"]] == [7]
+
+
+def test_cue_plan_prefers_the_stronger_later_bass_phrase() -> None:
+    candidate = profile("a")
+    candidate.phrase_boundaries.append(
+        PhraseBoundary(
+            index=3,
+            start_beat=193,
+            end_beat=224,
+            start_bar=49,
+            beat_in_bar=1,
+            length_beats=32,
+            length_bars=8,
+            kind_code=5,
+            label="DROP",
+            confidence="high",
+        )
+    )
+    candidate.landmarks.append(
+        TrackLandmark(name="later drop", kind="drop", bar=49, confidence="high")
+    )
+    candidate.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=(2 if 33 <= bar <= 40 else 20 if 49 <= bar <= 56 else 10),
+            mean=(3 if 33 <= bar <= 40 else 22 if 49 <= bar <= 56 else 12),
+            peak=(6 if 33 <= bar <= 40 else 30 if 49 <= bar <= 56 else 20),
+        )
+        for bar in range(1, 81)
+    ]
+
+    result = cue_preparation_plan(candidate)
+
+    assert result["suggestions"][0]["target"]["bar"] == 49
+    assert result["suggestions"][0]["bass_waveform_evidence"]["verified"] is True
 
 
 def test_sync_report_flags_phase_or_mode() -> None:

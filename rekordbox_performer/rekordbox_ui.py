@@ -181,13 +181,17 @@ def analyze_bar_grid_alignment(image: Image.Image) -> dict[str, Any]:
     """
     outgoing = _marker_lattice(
         image,
-        108,
-        132,
+        100,
+        175,
     )
-    incoming = _marker_lattice(
-        image,
-        184,
-        196,
+    incoming = (
+        None
+        if outgoing is None
+        else _marker_lattice(
+            image,
+            int(outgoing["y"]) + 68,
+            int(outgoing["y"]) + 86,
+        )
     )
     if outgoing is None or incoming is None:
         return {

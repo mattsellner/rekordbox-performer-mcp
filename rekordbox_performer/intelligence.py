@@ -173,6 +173,15 @@ class AnalysisBeatGridPoint(BaseModel):
     time_ms: int = Field(ge=0)
 
 
+class BassEnergyBar(BaseModel):
+    """Rekordbox PWV7 low-band energy summarized for one analyzed bar."""
+
+    bar: int = Field(ge=1)
+    median: float = Field(ge=0)
+    mean: float = Field(ge=0)
+    peak: float = Field(ge=0)
+
+
 class RekordboxAnalysisImport(BaseModel):
     track_id: str
     title: str = ""
@@ -191,6 +200,7 @@ class RekordboxAnalysisImport(BaseModel):
     vocal_analysis_available: bool = False
     vocal_segments: list[TrackSegment] = Field(default_factory=list)
     bass_analysis_available: bool = False
+    bass_energy_by_bar: list[BassEnergyBar] = Field(default_factory=list)
     bass_segments: list[TrackSegment] = Field(default_factory=list)
 
 
@@ -213,6 +223,7 @@ class TrackProfile(BaseModel):
     phrase_boundaries: list[PhraseBoundary] = Field(default_factory=list)
     landmarks: list[TrackLandmark] = Field(default_factory=list)
     segments: list[TrackSegment] = Field(default_factory=list)
+    bass_energy_by_bar: list[BassEnergyBar] = Field(default_factory=list)
     notes: str = ""
 
     def readiness(self) -> dict[str, Any]:
@@ -383,6 +394,7 @@ class TransitionCard(BaseModel):
     vocal_risk_accepted: bool = False
     harmonic_risk_accepted: bool = False
     bass_plan_verified: bool = False
+    intentional_energy_drop: bool = False
     loop_plan_verified: bool = False
     incoming_loaded_verified: bool = False
     max_tempo_stretch_percent: float = Field(default=4.0, gt=0, le=10)
@@ -450,6 +462,189 @@ def default_data_dir() -> Path:
         or str(Path.home())
     )
     return Path(base) / "rekordbox-performer"
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def bass_phrase_evidence(
+    profile: TrackProfile,
+    start_bar: int,
+    window_bars: int = 8,
+) -> dict[str, Any]:
+    """Measure whether an incoming phrase can carry a full low-EQ handoff.
+
+    A segment-level "bass present" flag is not enough for a musical swap. This
+    uses Rekordbox's PWV7 low-band curve to require useful energy on the first
+    bar and sustained energy throughout the next phrase. Scores are relative
+    to the track, so quiet masters are not penalized merely for being quiet.
+    """
+    if start_bar < 1:
+        raise ValueError("start_bar must be positive")
+    if window_bars not in {4, 8, 16}:
+        raise ValueError("window_bars must be 4, 8, or 16")
+    curve = {item.bar: item for item in profile.bass_energy_by_bar}
+    if not curve:
+        return {
+            "verified": False,
+            "available": False,
+            "reason": "per-bar Rekordbox PWV7 low-band energy is unavailable",
+            "start_bar": start_bar,
+            "window_bars": window_bars,
+        }
+    track_values = [
+        float(item.median)
+        for item in profile.bass_energy_by_bar
+        if item.median > 0
+    ]
+    reference = _percentile(track_values, 0.60)
+    bars = [curve.get(bar) for bar in range(start_bar, start_bar + window_bars)]
+    available = [item for item in bars if item is not None]
+    coverage_ratio = len(available) / window_bars
+    values = [float(item.median) for item in available]
+    phrase_median = _percentile(values, 0.50)
+    phrase_mean = sum(values) / len(values) if values else 0.0
+    downbeat_energy = float(bars[0].median) if bars[0] is not None else 0.0
+    first_two = [float(item.median) for item in bars[:2] if item is not None]
+    attack_energy = sum(first_two) / len(first_two) if first_two else 0.0
+    strong_floor = reference * 0.90
+    sustained_ratio = (
+        sum(value >= strong_floor for value in values) / len(values)
+        if values and reference > 0
+        else 0.0
+    )
+    previous = [
+        float(curve[bar].median)
+        for bar in range(max(1, start_bar - window_bars), start_bar)
+        if bar in curve
+    ]
+    previous_median = _percentile(previous, 0.50)
+    lift_ratio = (
+        phrase_median / previous_median
+        if previous_median > 0
+        else None
+    )
+    attack_ratio = attack_energy / reference if reference > 0 else 0.0
+    downbeat_ratio = downbeat_energy / reference if reference > 0 else 0.0
+    phrase_ratio = phrase_median / reference if reference > 0 else 0.0
+    verified = (
+        coverage_ratio >= 0.75
+        and reference > 0
+        and downbeat_ratio >= 0.75
+        and attack_ratio >= 0.85
+        and phrase_ratio >= 0.95
+        and sustained_ratio >= 0.625
+    )
+    reasons = []
+    if coverage_ratio < 0.75:
+        reasons.append("fewer than 75% of phrase bars have waveform evidence")
+    if reference <= 0:
+        reasons.append("track has no positive low-band reference energy")
+    if downbeat_ratio < 0.75:
+        reasons.append("phrase downbeat low end is too weak")
+    if attack_ratio < 0.85:
+        reasons.append("first two phrase bars do not establish enough low end")
+    if phrase_ratio < 0.95:
+        reasons.append("phrase median low end is below the track reference")
+    if sustained_ratio < 0.625:
+        reasons.append("low end is not sustained across enough phrase bars")
+    score = max(
+        0.0,
+        min(
+            100.0,
+            20.0 * min(1.25, downbeat_ratio)
+            + 25.0 * min(1.25, attack_ratio)
+            + 30.0 * min(1.25, phrase_ratio)
+            + 25.0 * sustained_ratio,
+        ),
+    )
+    return {
+        "verified": verified,
+        "available": True,
+        "reason": None if verified else "; ".join(reasons),
+        "start_bar": start_bar,
+        "window_bars": window_bars,
+        "bars_observed": len(available),
+        "coverage_ratio": round(coverage_ratio, 3),
+        "track_reference_median": round(reference, 3),
+        "downbeat_energy": round(downbeat_energy, 3),
+        "downbeat_ratio": round(downbeat_ratio, 3),
+        "attack_energy": round(attack_energy, 3),
+        "attack_ratio": round(attack_ratio, 3),
+        "phrase_median": round(phrase_median, 3),
+        "phrase_mean": round(phrase_mean, 3),
+        "phrase_ratio": round(phrase_ratio, 3),
+        "sustained_strong_bar_ratio": round(sustained_ratio, 3),
+        "previous_phrase_median": round(previous_median, 3),
+        "lift_ratio": None if lift_ratio is None else round(lift_ratio, 3),
+        "score": round(score, 1),
+    }
+
+
+def incoming_bass_handoff_evidence(
+    card: TransitionCard,
+    incoming: TrackProfile,
+) -> dict[str, Any] | None:
+    """Resolve a card's critical swap bar and return its waveform evidence."""
+    has_handoff = any(
+        event.action == "eq_low"
+        and event.parameters.get("deck") == card.outgoing_deck
+        and float(event.parameters.get("value", 0)) <= -0.9
+        for event in card.events
+    ) and any(
+        event.action == "eq_low"
+        and event.parameters.get("deck") == card.incoming_deck
+        and float(event.parameters.get("value", -1)) >= -0.1
+        for event in card.events
+    )
+    if not has_handoff:
+        return None
+    launch = next(
+        (
+            event
+            for event in card.events
+            if event.bar_offset == 0
+            and event.beat_offset == 0
+            and event.action == "hot_cue"
+            and event.parameters.get("deck") == card.incoming_deck
+        ),
+        None,
+    )
+    if launch is None:
+        return {
+            "verified": False,
+            "available": bool(incoming.bass_energy_by_bar),
+            "reason": "incoming Hot Cue phrase anchor is unavailable",
+        }
+    entry = next(
+        (
+            landmark
+            for landmark in incoming.landmarks
+            if landmark.cue == launch.parameters.get("cue")
+            and landmark.kind in {"mix_in", "phrase_start"}
+            and landmark.confidence in {"verified", "high"}
+        ),
+        None,
+    )
+    if entry is None:
+        return {
+            "verified": False,
+            "available": bool(incoming.bass_energy_by_bar),
+            "reason": "incoming cue has no verified phrase landmark",
+        }
+    return bass_phrase_evidence(
+        incoming,
+        entry.bar + card.critical_bar_offset,
+        window_bars=8,
+    )
 
 
 class ProfileStore:
@@ -628,6 +823,10 @@ class ProfileStore:
                         "high" if analysis.phrases else "unknown"
                     ),
                     "phrase_boundaries": analysis.phrases,
+                    "bass_energy_by_bar": (
+                        analysis.bass_energy_by_bar
+                        or existing.bass_energy_by_bar
+                    ),
                     "landmarks": first_phrase_landmarks,
                     "vocal_confidence": (
                         "high"
@@ -671,6 +870,7 @@ class ProfileStore:
                     "high" if analysis.phrases else "unknown"
                 ),
                 phrase_boundaries=analysis.phrases,
+                bass_energy_by_bar=analysis.bass_energy_by_bar,
                 vocal_confidence=(
                     "high" if analysis.vocal_analysis_available else "unknown"
                 ),
@@ -729,7 +929,58 @@ class ProfileStore:
                         confidence="high",
                     )
                 )
-        if analysis.bass_segments:
+        if analysis.bass_energy_by_bar and analysis.phrases:
+            profile.landmarks = [
+                landmark
+                for landmark in profile.landmarks
+                if landmark.kind not in {"bass_in", "bass_out"}
+            ]
+            strong_phrases = []
+            for phrase in analysis.phrases:
+                if (
+                    phrase.beat_in_bar != 1
+                    or phrase.confidence not in {"verified", "high"}
+                ):
+                    continue
+                evidence = bass_phrase_evidence(profile, phrase.start_bar)
+                if not evidence["verified"]:
+                    continue
+                point = next(
+                    (
+                        item
+                        for item in analysis.beat_grid
+                        if item.index == phrase.start_beat
+                    ),
+                    None,
+                )
+                strong_phrases.append(
+                    TrackLandmark(
+                        name=(
+                            "Rekordbox PWV7 strong low-energy phrase "
+                            f"({evidence['score']:.1f})"
+                        ),
+                        kind="bass_in",
+                        bar=phrase.start_bar,
+                        beat=1,
+                        time_ms=point.time_ms if point else None,
+                        confidence="high",
+                    )
+                )
+            profile.landmarks.extend(strong_phrases)
+            if analysis.bass_segments:
+                last_bass = max(
+                    analysis.bass_segments,
+                    key=lambda segment: segment.end_bar,
+                )
+                profile.landmarks.append(
+                    TrackLandmark(
+                        name="Rekordbox 3-band low-energy exit",
+                        kind="bass_out",
+                        bar=last_bass.end_bar,
+                        confidence="high",
+                    )
+                )
+        elif analysis.bass_segments:
             first_bass = min(
                 analysis.bass_segments,
                 key=lambda segment: segment.start_bar,
@@ -1050,6 +1301,19 @@ def validate_transition_card(
     if planned_bass_handoff and card.critical_bar_offset not in {8, 16}:
         errors.append(
             "bass handoff must land 8 or 16 bars after the incoming cue"
+        )
+    bass_evidence = incoming_bass_handoff_evidence(card, incoming)
+    if (
+        planned_bass_handoff
+        and bass_evidence is not None
+        and not bass_evidence.get("verified")
+        and not card.intentional_energy_drop
+    ):
+        errors.append(
+            "incoming bass phrase cannot carry the low-EQ handoff: "
+            f"{bass_evidence.get('reason') or 'waveform evidence failed'}; "
+            "choose a stronger phrase or explicitly mark an intentional "
+            "energy drop"
         )
 
     launch_events = [
@@ -1400,6 +1664,9 @@ def compile_transition_card(
             "start_bar": landmark.bar,
             "start_beat_in_bar": landmark.beat or 1,
             "start_phrase": None,
+            "incoming_bass_handoff": incoming_bass_handoff_evidence(
+                card, incoming
+            ),
             "events": events,
         }
     minimum_lead_beats = card.minimum_lead_bars * beats_per_bar
@@ -1518,6 +1785,9 @@ def compile_transition_card(
         "start_bar": chosen_phrase.start_bar,
         "start_beat_in_bar": chosen_phrase.beat_in_bar,
         "start_phrase": chosen_phrase.model_dump(),
+        "incoming_bass_handoff": incoming_bass_handoff_evidence(
+            card, incoming
+        ),
         "quantized_transport_lead_ms": quantized_transport_lead_ms,
         "events": events,
     }

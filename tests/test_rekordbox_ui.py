@@ -43,6 +43,19 @@ def test_visual_bar_grid_alignment_accepts_matching_downbeats() -> None:
     assert result["error_beats"] == pytest.approx(0.0, abs=0.03)
 
 
+def test_visual_bar_grid_alignment_handles_taller_fx_header() -> None:
+    image = Image.new("RGB", (1902, 579))
+    draw = ImageDraw.Draw(image)
+    for y in (164, 232):
+        for x in range(326, 1902, 157):
+            draw.rectangle((x - 1, y, x + 1, y + 3), fill=(255, 0, 0))
+
+    result = analyze_bar_grid_alignment(image)
+
+    assert result["verified"] is True
+    assert result["error_beats"] == pytest.approx(0.0, abs=0.03)
+
+
 def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
     samples = [
         ControlSample(None, "Text", "121.00", 180, 302, 224, 316),
