@@ -30,7 +30,22 @@ DECK_NOTES = {
     "loop_4": 8,
     "loop_8": 9,
     "loop_16": 10,
+    "quantize": 11,
     "fx_toggle": 32,
+    "fx_select_next": 40,
+    "fx_select_back": 41,
+    "fx_beat_up": 42,
+    "fx_beat_down": 43,
+    "stem_vocal": 44,
+    "stem_instrumental": 45,
+    "stem_drums": 46,
+    "beat_jump_1_back": 47,
+    "beat_jump_1_forward": 48,
+    "beat_jump_2_back": 49,
+    "beat_jump_2_forward": 50,
+    "mix_point_previous": 96,
+    "mix_point_next": 97,
+    "mix_point_set": 98,
 }
 
 DECK_CONTROLS = {
@@ -56,6 +71,8 @@ GLOBAL_NOTES = {
 GLOBAL_CONTROLS = {
     "crossfader": (0, "bipolar"),
 }
+
+STEM_ACTIONS = frozenset({"stem_vocal", "stem_instrumental", "stem_drums"})
 
 TRIGGER_ACTIONS = frozenset((*DECK_NOTES, "hot_cue", *GLOBAL_NOTES))
 CONTINUOUS_ACTIONS = frozenset((*DECK_CONTROLS, *GLOBAL_CONTROLS))

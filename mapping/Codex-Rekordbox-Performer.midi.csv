@@ -1,36 +1,55 @@
 @file,1,Codex Rekordbox Performer,,,,,,,,,,,,
 #name,function,type,input,deck1,deck2,deck3,deck4,output,deck1,deck2,deck3,deck4,option,comment
-BrowseUp,BrowseUp,Button,9200,,,,,,,,,,,Browse one item up
-BrowseDown,BrowseDown,Button,9201,,,,,,,,,,,Browse one item down
-Forward,Forward,Button,9205,,,,,,,,,,,Open selected folder
+AutoLoop,AutoLoop,Button,,9005,9105,,,,,,,,,Toggle auto loop
+AutoLoop,4BeatLoop,Button,,9008,9108,,,,,,,,,Set or toggle 4-beat loop
+ActivePartDrums,ActivePartDrums,Pad,,902E,912E,,,,,,,,,Toggle drums stem
+ActivePartInst,ActivePartInst,Pad,,902D,912D,,,,,,,,,Toggle instrumental stem
+ActivePartVocal,ActivePartVocal,Pad,,902C,912C,,,,,,,,,Toggle vocal stem
 Back,Back,Button,9204,,,,,,,,,,,Close current folder
-Load,Load,Button,,9202,9203,,,,,,,,,Load selected track to Deck 1 or Deck 2
-PlayPause,PlayPause,Button,9000,0,1,,,,,,,,Fast;Priority=50,Play or pause
-Cue,Cue,Button,9001,0,1,,,,,,,,Fast;Priority=50,Cue
-Sync,Sync,Button,9002,0,1,,,,,,,,Blink=600,Beat sync
-Master,Master,Button,9003,0,1,,,,,,,,,Master deck
-AutoLoop,AutoLoop,Button,9005,0,1,,,,,,,,,Toggle auto loop
-LoopHalf,LoopHalf,Button,9006,0,1,,,,,,,,Fast,Halve loop length
-LoopDouble,LoopDouble,Button,9007,0,1,,,,,,,,Fast,Double loop length
-AutoLoop,4BeatLoop,Button,9008,0,1,,,,,,,,,Set or toggle 4-beat loop
-ChannelFader,ChannelFader,KnobSlider,B000,0,1,,,,,,,,,Channel fader
-Gain,Gain,KnobSlider,B001,0,1,,,,,,,,Fast,Channel gain
-EQHigh,EQHigh,KnobSlider,B002,0,1,,,,,,,,Fast,High EQ
-EQMid,EQMid,KnobSlider,B003,0,1,,,,,,,,Fast,Mid EQ
-EQLow,EQLow,KnobSlider,B004,0,1,,,,,,,,Fast,Low EQ
-TempoSlider,TempoSlider,KnobSlider,B006,0,1,,,,,,,,Fast,Tempo control
-CFXParameterCH1,CFXParameterCH1,KnobSlider,B005,,,,,,,,,,Fast,Deck 1 filter
-CFXParameterCH2,CFXParameterCH2,KnobSlider,B105,,,,,,,,,,Fast,Deck 2 filter
-CrossFader,CrossFader,KnobSlider,B300,,,,,,,,,,Fast,Crossfader
+PAD1_BeatJump,PAD1_BeatJump,Pad,,902F,912F,,,,,,,,,Move a muted incoming deck back 1 beat for bar repair
+PAD2_BeatJump,PAD2_BeatJump,Pad,,9030,9130,,,,,,,,,Move a muted incoming deck forward 1 beat for bar repair
+PAD3_BeatJump,PAD3_BeatJump,Pad,,9031,9131,,,,,,,,,Move a muted incoming deck back 2 beats for bar repair
+PAD4_BeatJump,PAD4_BeatJump,Pad,,9032,9132,,,,,,,,,Move a muted incoming deck forward 2 beats for bar repair
+BrowseDown,BrowseDown,Button,9201,,,,,,,,,,,Browse one item down
+BrowseUp,BrowseUp,Button,9200,,,,,,,,,,,Browse one item up
+CFXParameterCH1,CFXParameterCH1,KnobSlider,B005,,,,,,,,,,Fast;,Deck 1 filter
+CFXParameterCH2,CFXParameterCH2,KnobSlider,B105,,,,,,,,,,Fast;,Deck 2 filter
+ChannelFader,ChannelFader,KnobSlider,,B000,B100,,,,,,,,,Channel fader
+CrossFader,CrossFader,KnobSlider,B300,,,,,,,,,,Fast;,Crossfader
+Cue,Cue,Button,,9001,9101,,,,,,,,Fast;Priority=50;,Cue
+EQHigh,EQHigh,KnobSlider,,B002,B102,,,,,,,,Fast;,High EQ
+EQLow,EQLow,KnobSlider,,B004,B104,,,,,,,,Fast;,Low EQ
+EQMid,EQMid,KnobSlider,,B003,B103,,,,,,,,Fast;,Mid EQ
+FX1-1,FX1-1,KnobSlider,B020,,,,,,,,,,Fast;,Deck 1 FX wet dry
 FX1-1On,FX1-1On,Button,9020,,,,,,,,,,,Deck 1 FX on or off
+FX1-1BeatDown,,Button,902B,,,,,902B,,,,,,Deck 1 FX beat down
+FX1-1BeatUp,,Button,902A,,,,,902A,,,,,,Deck 1 FX beat up
+FX1-1Select,,Button,9028,,,,,9028,,,,,,Deck 1 FX select next
+FX1-1SelectBack,,Button,9029,,,,,9029,,,,,,Deck 1 FX select back
+FX2-1,FX2-1,KnobSlider,B120,,,,,,,,,,Fast;,Deck 2 FX wet dry
 FX2-1On,FX2-1On,Button,9120,,,,,,,,,,,Deck 2 FX on or off
-FX1-1,FX1-1,KnobSlider,B020,,,,,,,,,,Fast,Deck 1 FX wet dry
-FX2-1,FX2-1,KnobSlider,B120,,,,,,,,,,Fast,Deck 2 FX wet dry
-PAD1_HotCue,PAD1_HotCue,Pad,9010,0,1,,,,,,,,Fast,Hot Cue 1
-PAD2_HotCue,PAD2_HotCue,Pad,9011,0,1,,,,,,,,Fast,Hot Cue 2
-PAD3_HotCue,PAD3_HotCue,Pad,9012,0,1,,,,,,,,Fast,Hot Cue 3
-PAD4_HotCue,PAD4_HotCue,Pad,9013,0,1,,,,,,,,Fast,Hot Cue 4
-PAD5_HotCue,PAD5_HotCue,Pad,9014,0,1,,,,,,,,Fast,Hot Cue 5
-PAD6_HotCue,PAD6_HotCue,Pad,9015,0,1,,,,,,,,Fast,Hot Cue 6
-PAD7_HotCue,PAD7_HotCue,Pad,9016,0,1,,,,,,,,Fast,Hot Cue 7
-PAD8_HotCue,PAD8_HotCue,Pad,9017,0,1,,,,,,,,Fast,Hot Cue 8
+FX2-1BeatDown,,Button,912B,,,,,912B,,,,,,Deck 2 FX beat down
+FX2-1BeatUp,,Button,912A,,,,,912A,,,,,,Deck 2 FX beat up
+FX2-1Select,,Button,9128,,,,,9128,,,,,,Deck 2 FX select next
+FX2-1SelectBack,,Button,9129,,,,,9129,,,,,,Deck 2 FX select back
+Forward,Forward,Button,9205,,,,,,,,,,,Open selected folder
+Gain,Gain,KnobSlider,,B001,B101,,,,,,,,Fast;,Channel gain
+Load,Load,Button,,9202,9203,,,,,,,,,Load selected track to Deck 1 or Deck 2
+LoopDouble,LoopDouble,Button,,9007,9107,,,,,,,,Fast;,Double loop length
+LoopHalf,LoopHalf,Button,,9006,9106,,,,,,,,Fast;,Halve loop length
+Master,Master,Button,,9003,9103,,,,,,,,,Master deck
+MixPointLink,,Button,,9062,9162,,,,,,,,,Arm Rekordbox native Mix Point Link
+MixPointSelectNext,,Button,,9061,9161,,,,,,,,,Select next Mix Point cue
+MixPointSelectPrev,,Button,,9060,9160,,,,,,,,,Select previous Mix Point cue
+PAD1_HotCue,PAD1_HotCue,DdjSxPad,,9010,9110,,,,,,,,Fast;,Hot Cue 1
+PAD2_HotCue,PAD2_HotCue,DdjSxPad,,9011,9111,,,,,,,,Fast;,Hot Cue 2
+PAD3_HotCue,PAD3_HotCue,DdjSxPad,,9012,9112,,,,,,,,Fast;,Hot Cue 3
+PAD4_HotCue,PAD4_HotCue,DdjSxPad,,9013,9113,,,,,,,,Fast;,Hot Cue 4
+PAD5_HotCue,PAD5_HotCue,DdjSxPad,,9014,9114,,,,,,,,Fast;,Hot Cue 5
+PAD6_HotCue,PAD6_HotCue,DdjSxPad,,9015,9115,,,,,,,,Fast;,Hot Cue 6
+PAD7_HotCue,PAD7_HotCue,DdjSxPad,,9016,9116,,,,,,,,Fast;,Hot Cue 7
+PAD8_HotCue,PAD8_HotCue,DdjSxPad,,9017,9117,,,,,,,,Fast;,Hot Cue 8
+PlayPause,PlayPause,Button,,9000,9100,,,,,,,,Fast;Priority=50;,Play or pause
+Quantize,Quantize,Button,,900B,910B,,,,,,,,,Quantize hot cues and loops
+Sync,Sync,Button,,9002,9102,,,,,,,,Blink=600;,Beat sync
+TempoSlider,TempoSlider,KnobSlider,,B006,B106,,,,,,,,Fast;,Tempo control

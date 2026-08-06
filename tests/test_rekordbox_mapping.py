@@ -22,7 +22,40 @@ def test_mapping_has_rekordbox_shape() -> None:
     assert all(len(row) == 15 for row in rows)
 
     functions = {row[1] for row in rows[2:]}
+    names = {row[0] for row in rows[2:]}
     assert {
         "PlayPause", "Cue", "Sync", "ChannelFader", "Gain",
         "EQHigh", "EQMid", "EQLow", "TempoSlider", "CrossFader",
+        "Quantize",
     } <= functions
+    assert {
+        "MixPointSelectPrev", "MixPointSelectNext", "MixPointLink",
+        "ActivePartVocal", "ActivePartInst", "ActivePartDrums",
+        "PAD1_BeatJump", "PAD2_BeatJump",
+        "PAD3_BeatJump", "PAD4_BeatJump",
+    } <= names
+
+    beat_jump_rows = {
+        row[0]: row for row in rows[2:] if row[0].endswith("_BeatJump")
+    }
+    assert set(beat_jump_rows) == {
+        "PAD1_BeatJump", "PAD2_BeatJump", "PAD3_BeatJump", "PAD4_BeatJump"
+    }
+    for name, row in beat_jump_rows.items():
+        # Rekordbox resolves the command from the canonical first column.  An
+        # arbitrary label here imports cleanly but produces a dead control.
+        assert row[1] == name
+
+    stem_rows = {
+        row[0]: row
+        for row in rows[2:]
+        if row[0] in {"ActivePartVocal", "ActivePartInst", "ActivePartDrums"}
+    }
+    assert set(stem_rows) == {
+        "ActivePartVocal", "ActivePartInst", "ActivePartDrums"
+    }
+    for row in stem_rows.values():
+        assert row[2] == "Pad"
+        assert row[3] == ""
+        assert row[4] and row[5]
+        assert row[8:13] == ["", "", "", "", ""]

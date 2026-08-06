@@ -35,3 +35,52 @@ def test_hot_cue_bounds() -> None:
 def test_invalid_deck_rejected() -> None:
     with pytest.raises(ProtocolError):
         encode_action("cue", {"deck": 3})
+
+
+def test_native_mix_point_controls_are_deck_scoped() -> None:
+    quantize = encode_action("quantize", {"deck": 2})[0].message
+    mix_point = encode_action("mix_point_set", {"deck": 1})[0].message
+    assert quantize.channel == 1
+    assert quantize.note == 11
+    assert mix_point.channel == 0
+    assert mix_point.note == 98
+
+
+def test_flx4_browser_encoder_actions_are_global() -> None:
+    up = encode_action("browse_up")[0].message
+    down = encode_action("browse_down")[0].message
+    assert (up.channel, up.note) == (2, 0)
+    assert (down.channel, down.note) == (2, 1)
+
+
+def test_flx4_load_buttons_are_global_and_deck_specific() -> None:
+    load_1 = encode_action("load_deck_1")[0].message
+    load_2 = encode_action("load_deck_2")[0].message
+    assert (load_1.channel, load_1.note) == (2, 2)
+    assert (load_2.channel, load_2.note) == (2, 3)
+
+
+def test_full_fx_actions_have_stable_controls() -> None:
+    select_next = encode_action("fx_select_next", {"deck": 1})[0].message
+    select_back = encode_action("fx_select_back", {"deck": 2})[0].message
+    beat_up = encode_action("fx_beat_up", {"deck": 1})[0].message
+    assert (select_next.channel, select_next.note) == (0, 40)
+    assert (select_back.channel, select_back.note) == (1, 41)
+    assert (beat_up.channel, beat_up.note) == (0, 42)
+
+
+def test_stem_toggles_have_stable_deck_scoped_notes() -> None:
+    vocal = encode_action("stem_vocal", {"deck": 1})[0].message
+    instrumental = encode_action("stem_instrumental", {"deck": 2})[0].message
+    drums = encode_action("stem_drums", {"deck": 1})[0].message
+    assert (vocal.channel, vocal.note) == (0, 44)
+    assert (instrumental.channel, instrumental.note) == (1, 45)
+    assert (drums.channel, drums.note) == (0, 46)
+
+
+def test_bar_repair_beat_jumps_have_stable_deck_scoped_notes() -> None:
+    back_one = encode_action("beat_jump_1_back", {"deck": 1})[0].message
+    forward_two = encode_action("beat_jump_2_forward", {"deck": 2})[0].message
+
+    assert (back_one.channel, back_one.note) == (0, 47)
+    assert (forward_two.channel, forward_two.note) == (1, 50)
