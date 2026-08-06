@@ -11,7 +11,11 @@ from rekordbox_performer.intelligence import (
     MusicalEvent,
     TransitionCard,
 )
-from rekordbox_performer.set_runner import TempoPlan
+from rekordbox_performer.set_runner import (
+    TempoPlan,
+    TrackLoadSpec,
+    TransitionOption,
+)
 
 
 def card() -> TransitionCard:
@@ -80,6 +84,45 @@ def hot_cue_opening_card() -> TransitionCard:
         parameters={"deck": 2, "cue": 7},
     )
     return transition
+
+
+def test_optional_fx_failure_cannot_block_runner_transition(monkeypatch) -> None:
+    transition = card()
+    option = TransitionOption(
+        id="a-b",
+        card=transition,
+        incoming=TrackLoadSpec(
+            track_id="b",
+            title="Incoming",
+            cue=1,
+            cue_time_ms=0,
+        ),
+        technique="vocal_safe_loop_blend",
+        fx_effect="spiral",
+    )
+    staged = []
+
+    async def fail_fx(_card, _effect):
+        raise RuntimeError("Deck 1 first-slot FX selector is not visible")
+
+    async def schedule_dry(**kwargs):
+        staged.append(kwargs)
+        return {"ready": True, "schedule": {"job": {"id": "dry-job"}}}
+
+    monkeypatch.setattr(server, "_prepare_option_fx", fail_fx)
+    monkeypatch.setattr(server, "stage_and_schedule_transition_card", schedule_dry)
+
+    result = asyncio.run(server._runner_schedule(option, False))
+
+    assert result["ready"] is True
+    assert result["job"]["id"] == "dry-job"
+    assert staged[0]["card"] == transition
+    assert result["fx_preparation"] == {
+        "verified": False,
+        "desired": "spiral",
+        "error": "Deck 1 first-slot FX selector is not visible",
+        "fallback": "dry transition card",
+    }
 
 
 class OpeningProfileStore:

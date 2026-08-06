@@ -2847,7 +2847,18 @@ async def _runner_schedule(
     )
     fx_preparation = None
     if option.fx_effect is not None:
-        card, fx_preparation = await _prepare_option_fx(card, option.fx_effect)
+        try:
+            card, fx_preparation = await _prepare_option_fx(card, option.fx_effect)
+        except Exception as exc:  # noqa: BLE001 - optional live decoration
+            # Beat FX are never allowed to own transport continuity.  Any UI
+            # observation, selector, or MIDI-preparation failure preserves the
+            # already validated dry card and proceeds with the handoff.
+            fx_preparation = {
+                "verified": False,
+                "desired": option.fx_effect,
+                "error": str(exc),
+                "fallback": "dry transition card",
+            }
     result = await stage_and_schedule_transition_card(
         card=card,
         incoming_title=option.incoming.title,
@@ -2876,16 +2887,33 @@ async def _prepare_option_fx(
     """Select and verify one outgoing Beat FX, or preserve the dry card."""
     deck = card.outgoing_deck
     await engine.send_action("fx_wet_dry", {"deck": deck, "value": 0})
-    with deck_observer.exclusive_adapter():
-        observed = rekordbox_ui.fx_effect(deck)
+    try:
+        with deck_observer.exclusive_adapter():
+            observed = rekordbox_ui.fx_effect(deck)
+    except Exception as exc:  # noqa: BLE001 - optional effect observation
+        return card, {
+            "verified": False,
+            "desired": desired_effect,
+            "error": str(exc),
+            "fallback": "dry transition card",
+        }
     visited = [observed]
     for _ in range(24):
         if observed == desired_effect:
             break
         await engine.send_action("fx_select_next", {"deck": deck})
         await asyncio.sleep(0.12)
-        with deck_observer.exclusive_adapter():
-            observed = rekordbox_ui.fx_effect(deck)
+        try:
+            with deck_observer.exclusive_adapter():
+                observed = rekordbox_ui.fx_effect(deck)
+        except Exception as exc:  # noqa: BLE001 - optional effect observation
+            return card, {
+                "verified": False,
+                "desired": desired_effect,
+                "error": str(exc),
+                "visited": visited,
+                "fallback": "dry transition card",
+            }
         if observed in visited:
             break
         visited.append(observed)
