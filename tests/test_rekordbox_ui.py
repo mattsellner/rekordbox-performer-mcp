@@ -247,6 +247,34 @@ def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
     assert snapshot.bpm == 123.44
 
 
+def test_fx_effect_reads_first_slot_for_each_deck() -> None:
+    class WindowRect:
+        left = 0
+        top = 0
+
+        @staticmethod
+        def width():
+            return 1920
+
+    class Root:
+        @staticmethod
+        def rectangle():
+            return WindowRect()
+
+    samples = [
+        ControlSample(None, "Button", "REVERB", 334, 53, 438, 71),
+        ControlSample(None, "Button", "ECHO", 477, 53, 581, 71),
+        ControlSample(None, "Button", "SPIRAL", 1175, 53, 1279, 71),
+        ControlSample(None, "Button", "VINYL BRAKE", 1318, 53, 1422, 71),
+    ]
+    adapter = RekordboxUIAdapter()
+    adapter._root = lambda: Root()
+    adapter._sample_controls = lambda _root: (samples, 1920)
+
+    assert adapter.fx_effect(1) == "reverb"
+    assert adapter.fx_effect(2) == "spiral"
+
+
 def test_deck_snapshot_does_not_overwrite_right_jog_bpm_with_file_bpm() -> None:
     samples = [
         ControlSample(None, "Text", "123.44", 1095, 451, 1149, 474),

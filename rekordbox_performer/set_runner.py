@@ -82,6 +82,7 @@ class TransitionOption(BaseModel):
     technique: str = ""
     reason: str = ""
     alternatives: list[str] = Field(default_factory=list)
+    fx_effect: Literal["echo", "reverb", "spiral", "vinyl_brake"] | None = None
 
     @model_validator(mode="after")
     def identity_matches(self) -> "TransitionOption":

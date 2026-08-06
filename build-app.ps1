@@ -13,6 +13,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     --windowed `
     --name "RekordBot" `
     --collect-all pystray `
+    --collect-all pyrekordbox `
     --copy-metadata fastmcp `
     --collect-submodules mido.backends `
     --hidden-import rtmidi `

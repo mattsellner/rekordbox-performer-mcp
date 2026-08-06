@@ -146,11 +146,13 @@ def _packaging_self_test() -> None:
     from importlib.metadata import version
 
     import mido.backends.rtmidi  # noqa: F401
+    import pyrekordbox  # noqa: F401
     import rtmidi  # noqa: F401
 
     from . import server  # noqa: F401
 
     version("fastmcp")
+    version("pyrekordbox")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -196,13 +198,13 @@ def main(argv: list[str] | None = None) -> None:
     root.configure(bg="#090d18")
     root.attributes("-topmost", not args.not_topmost)
     root._rekordbot_expanded_live = False
-    width, height = 620, 730
+    width, height = 620, 820
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     root.geometry(
         f"{width}x{height}+{screen_width - width - 18}+{screen_height - height - 68}"
     )
-    root.minsize(580, 680)
+    root.minsize(580, 780)
 
     def report_error(title: str, message: str) -> None:
         root.after(0, lambda: messagebox.showerror(title, message))
@@ -431,8 +433,17 @@ def main(argv: list[str] | None = None) -> None:
     setup.pack(fill="both", expand=True)
     prepared = engine.profile_store.list_profiles(ready_only=True)
     prepared_labels = [engine.track_label(item) for item in prepared]
+    try:
+        playlists = engine.playlists()
+        playlist_status = f"{len(playlists)} found"
+    except Exception:  # noqa: BLE001 - optional read-only Rekordbox catalog
+        playlists = []
+        playlist_status = "catalog unavailable"
+    playlist_by_label = {item.label: item for item in playlists}
     track_var = tk.StringVar(value=args.track or "")
+    playlist_var = tk.StringVar(value="")
     count_var = tk.IntVar(value=args.count)
+    endless_var = tk.BooleanVar(value=False)
     bpm_var = tk.StringVar(
         value="" if args.target_bpm is None else str(args.target_bpm)
     )
@@ -465,19 +476,42 @@ def main(argv: list[str] | None = None) -> None:
         wraplength=560,
     ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 9))
 
+    ttk.Label(
+        setup,
+        text="REKORDBOX PLAYLIST (OPTIONAL)",
+        style="CardMuted.TLabel",
+        font=("Segoe UI Semibold", 8),
+    ).grid(row=3, column=0, columnspan=2, sticky="w")
+    ttk.Label(
+        setup,
+        text=playlist_status,
+        style="CardMuted.TLabel",
+    ).grid(row=3, column=2, sticky="e")
+    playlist_combo = ttk.Combobox(
+        setup,
+        textvariable=playlist_var,
+        values=["", *playlist_by_label],
+        state="readonly",
+        width=48,
+    )
+    playlist_combo.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(3, 9))
+
     ttk.Label(setup, text="Set length", style="CardMuted.TLabel").grid(
-        row=3, column=0, sticky="w"
+        row=5, column=0, sticky="w"
     )
     ttk.Label(
         setup,
         text="Finish near BPM (optional)",
         style="CardMuted.TLabel",
-    ).grid(row=3, column=1, sticky="w", padx=(8, 0))
-    ttk.Spinbox(setup, from_=2, to=20, textvariable=count_var, width=8).grid(
-        row=4, column=0, sticky="w", pady=(2, 9)
+    ).grid(row=5, column=1, sticky="w", padx=(8, 0))
+    ttk.Spinbox(setup, from_=2, to=100, textvariable=count_var, width=8).grid(
+        row=6, column=0, sticky="w", pady=(2, 9)
     )
     ttk.Entry(setup, textvariable=bpm_var, width=12).grid(
-        row=4, column=1, sticky="w", padx=(8, 0), pady=(2, 9)
+        row=6, column=1, sticky="w", padx=(8, 0), pady=(2, 9)
+    )
+    ttk.Checkbutton(setup, text="Endless set", variable=endless_var).grid(
+        row=6, column=2, sticky="e", padx=(8, 0), pady=(2, 9)
     )
 
     ttk.Label(
@@ -485,9 +519,9 @@ def main(argv: list[str] | None = None) -> None:
         text="DIRECTION / DESTINATION (OPTIONAL)",
         style="CardMuted.TLabel",
         font=("Segoe UI Semibold", 8),
-    ).grid(row=5, column=0, columnspan=3, sticky="w")
+    ).grid(row=7, column=0, columnspan=3, sticky="w")
     ttk.Label(setup, text="Destination track", style="CardMuted.TLabel").grid(
-        row=6, column=0, columnspan=3, sticky="w", pady=(3, 0)
+        row=8, column=0, columnspan=3, sticky="w", pady=(3, 0)
     )
     target_combo = ttk.Combobox(
         setup,
@@ -495,15 +529,15 @@ def main(argv: list[str] | None = None) -> None:
         values=["", *prepared_labels],
         width=48,
     )
-    target_combo.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(2, 6))
+    target_combo.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(2, 6))
     ttk.Label(setup, text="Vibe", style="CardMuted.TLabel").grid(
-        row=8, column=0, sticky="w"
+        row=10, column=0, sticky="w"
     )
     ttk.Label(
         setup,
         text="Arrive over next transitions",
         style="CardMuted.TLabel",
-    ).grid(row=8, column=1, columnspan=2, sticky="w", padx=(8, 0))
+    ).grid(row=10, column=1, columnspan=2, sticky="w", padx=(8, 0))
     vibe_combo = ttk.Combobox(
         setup,
         textvariable=vibe_var,
@@ -511,14 +545,14 @@ def main(argv: list[str] | None = None) -> None:
         state="readonly",
         width=23,
     )
-    vibe_combo.grid(row=9, column=0, sticky="w", pady=(2, 8))
+    vibe_combo.grid(row=11, column=0, sticky="w", pady=(2, 8))
     ttk.Spinbox(
         setup,
         from_=2,
         to=6,
         textvariable=steer_count_var,
         width=8,
-    ).grid(row=9, column=1, sticky="w", padx=(8, 0), pady=(2, 8))
+    ).grid(row=11, column=1, sticky="w", padx=(8, 0), pady=(2, 8))
     setup.columnconfigure(0, weight=1)
     setup.columnconfigure(1, weight=1)
 
@@ -548,7 +582,14 @@ def main(argv: list[str] | None = None) -> None:
     def start_set() -> None:
         nonlocal live_overlay_active
         try:
-            opening = engine.resolve_track(track_var.get())
+            playlist = playlist_by_label.get(playlist_var.get())
+            opening = (
+                engine.resolve_track(track_var.get())
+                if track_var.get().strip()
+                else None
+            )
+            if playlist is None and opening is None:
+                raise ValueError("Choose an opening track or a Rekordbox playlist.")
             destination = (
                 engine.resolve_track(target_var.get())
                 if target_var.get().strip()
@@ -562,14 +603,28 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError:
             messagebox.showerror("Invalid BPM", "Target BPM must be a number.")
             return
-        brief = DJBrief(
-            start_track_id=opening.track_id,
-            target_track_count=int(count_var.get()),
-            target_bpm=target,
-            target_track_id=(destination.track_id if destination is not None else None),
-            vibe=VIBE_LABELS[vibe_var.get()],
-            name=f"RekordBot set — {opening.title}",
-        )
+        if playlist is None:
+            brief = DJBrief(
+                start_track_id=opening.track_id,
+                target_track_count=int(count_var.get()),
+                target_bpm=target,
+                target_track_id=(
+                    destination.track_id if destination is not None else None
+                ),
+                vibe=VIBE_LABELS[vibe_var.get()],
+                name=f"RekordBot set — {opening.title}",
+            )
+            start_action = lambda: engine.start_set(
+                brief,
+                endless=endless_var.get(),
+            )
+        else:
+            start_action = lambda: engine.start_playlist_set(
+                playlist.playlist_id,
+                opening_track_id=(opening.track_id if opening is not None else None),
+                vibe=VIBE_LABELS[vibe_var.get()],
+                endless=endless_var.get(),
+            )
         # Swap the interactive setup window for a non-activating pass-through
         # live overlay. Rekordbox keeps focus for physical search/load/capture
         # operations while RekordBot remains continuously visible.
@@ -583,7 +638,7 @@ def main(argv: list[str] | None = None) -> None:
         root.withdraw()
         live_overlay.deiconify()
         live_overlay.lift()
-        worker.submit(_safe_start(engine, brief, report_error))
+        worker.submit(_safe_result(start_action, lambda _result: None, report_error))
 
     def steer_set() -> None:
         root._rekordbot_expanded_live = False
@@ -602,8 +657,28 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
 
+    def continue_set() -> None:
+        nonlocal live_overlay_active
+        live_overlay_active = True
+        root._rekordbot_expanded_live = False
+        root.withdraw()
+        live_overlay.deiconify()
+        live_overlay.lift()
+        worker.submit(
+            _safe_result(
+                lambda: engine.continue_set(
+                    target_query=target_var.get(),
+                    vibe=VIBE_LABELS[vibe_var.get()],
+                    transition_count=int(steer_count_var.get()),
+                    endless=endless_var.get(),
+                ),
+                lambda _result: None,
+                report_error,
+            )
+        )
+
     action_row = ttk.Frame(setup, style="Card.TFrame")
-    action_row.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(3, 0))
+    action_row.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(3, 0))
     start_button = ttk.Button(
         action_row,
         text="Plan, preflight, and start set",
@@ -617,15 +692,22 @@ def main(argv: list[str] | None = None) -> None:
         command=steer_set,
     )
     steer_button.pack(side="left", padx=(6, 0))
+    continue_button = ttk.Button(
+        action_row,
+        text="Continue set",
+        command=continue_set,
+    )
+    continue_button.pack(side="left", padx=(6, 0))
     ttk.Label(
         setup,
         text=(
-            "Start Set uses the full set length. Queue steering preserves the "
-            "already-armed next track, then uses the transition count above."
+            "Playlist mode maps every song once. Queue steering redirects an active "
+            "set; Continue Set extends the final playing song. Endless Set keeps "
+            "planning safe transitions until Stop After Current is pressed."
         ),
         style="CardMuted.TLabel",
         wraplength=550,
-    ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    ).grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     severity_colors = {
         "info": "#e8ebf2",
@@ -678,8 +760,10 @@ def main(argv: list[str] | None = None) -> None:
         emergency_button.configure(state="normal" if active else "disabled")
         start_button.configure(state="disabled" if active else "normal")
         steer_button.configure(state="normal" if active else "disabled")
+        continue_button.configure(state="disabled" if active else "normal")
         use_deck_button.configure(state="disabled" if active else "normal")
         opening_combo.configure(state="disabled" if active else "normal")
+        playlist_combo.configure(state="disabled" if active else "readonly")
         root.after(300, refresh)
 
     tray = _start_tray(

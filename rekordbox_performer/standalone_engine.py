@@ -9,6 +9,7 @@ import unicodedata
 from typing import Any, Protocol
 
 from .intelligence import ProfileStore, TrackProfile
+from .playlist_catalog import PlaylistSummary, RekordboxPlaylistCatalog
 from .rekordbox_ui import RekordboxUIAdapter
 from .set_runner import AutonomousSetPlan
 from .standalone_planner import DJBrief, LocalDJPlanner
@@ -25,6 +26,7 @@ class PerformerAdapter(Protocol):
     def arm(self, seconds: int) -> dict[str, Any]: ...
     async def preflight(self, plan: AutonomousSetPlan) -> dict[str, Any]: ...
     async def start(self, plan: AutonomousSetPlan) -> dict[str, Any]: ...
+    async def continue_set(self, plan: AutonomousSetPlan) -> dict[str, Any]: ...
     def runner_status(self) -> dict[str, Any]: ...
     def control_status(self) -> dict[str, Any]: ...
     def rekordbox_status(self) -> dict[str, Any]: ...
@@ -59,6 +61,9 @@ class InProcessPerformerAdapter:
 
     async def start(self, plan: AutonomousSetPlan) -> dict[str, Any]:
         return await self._server().start_autonomous_set(plan)
+
+    async def continue_set(self, plan: AutonomousSetPlan) -> dict[str, Any]:
+        return await self._server().continue_autonomous_set(plan)
 
     def runner_status(self) -> dict[str, Any]:
         return self._server().autonomous_set_status()
@@ -97,6 +102,7 @@ class StandaloneDJEngine:
         profile_store: ProfileStore | None = None,
         status_store: StandaloneStatusStore | None = None,
         adapter: PerformerAdapter | None = None,
+        playlist_catalog: RekordboxPlaylistCatalog | None = None,
         monitor_seconds: float = 0.5,
     ) -> None:
         self.profile_store = profile_store or ProfileStore()
@@ -104,6 +110,7 @@ class StandaloneDJEngine:
             self.profile_store.data_dir
         )
         self.adapter = adapter or InProcessPerformerAdapter()
+        self.playlist_catalog = playlist_catalog or RekordboxPlaylistCatalog()
         self.monitor_seconds = monitor_seconds
         self.plan: AutonomousSetPlan | None = None
         self.monitor_task: asyncio.Task[None] | None = None
@@ -113,6 +120,17 @@ class StandaloneDJEngine:
         self._manual_playing_until: dict[int, float] = {}
         self._manual_current_deck: int | None = None
         self._last_manual_signature: tuple[Any, ...] | None = None
+        self._endless = False
+        self._endless_vibe = "maintain"
+        self._candidate_track_ids: set[str] | None = None
+        self._endless_extension_pending = False
+
+    def playlists(self) -> list[PlaylistSummary]:
+        ready = {
+            profile.track_id
+            for profile in self.profile_store.list_profiles(ready_only=True)
+        }
+        return self.playlist_catalog.list_playlists(ready)
 
     def find_tracks(self, query: str, limit: int = 20) -> list[TrackProfile]:
         normalized = self._search_key(query)
@@ -206,8 +224,18 @@ class StandaloneDJEngine:
             )
         return profile
 
-    async def start_set(self, brief: DJBrief) -> dict[str, Any]:
+    async def start_set(
+        self,
+        brief: DJBrief,
+        *,
+        endless: bool = False,
+    ) -> dict[str, Any]:
         self._automation_active = True
+        self._endless = endless
+        self._endless_vibe = brief.vibe
+        self._candidate_track_ids = (
+            set(brief.allowed_track_ids) if brief.allowed_track_ids else None
+        )
         self.status_store.publish(
             phase=RuntimePhase.SELECTING,
             headline="Choosing and validating the set",
@@ -235,6 +263,62 @@ class StandaloneDJEngine:
             self._automation_active = False
             self._fail("Set planning failed", str(exc))
             raise
+        return await self._launch_plan(plan)
+
+    async def start_playlist_set(
+        self,
+        playlist_id: str,
+        *,
+        opening_track_id: str | None = None,
+        vibe: str = "maintain",
+        endless: bool = False,
+    ) -> dict[str, Any]:
+        summary = next(
+            (
+                item
+                for item in self.playlists()
+                if item.playlist_id == str(playlist_id)
+            ),
+            None,
+        )
+        if summary is None:
+            raise ValueError("Rekordbox playlist is no longer available")
+        if summary.ready_count != summary.track_count:
+            raise ValueError(
+                f"{summary.name} has {summary.track_count} tracks but only "
+                f"{summary.ready_count} are automation-ready; analyze the missing "
+                "tracks before requesting an all-song set."
+            )
+        self._automation_active = True
+        self._endless = endless
+        self._endless_vibe = vibe
+        self._candidate_track_ids = set(summary.track_ids)
+        self.status_store.publish(
+            phase=RuntimePhase.SELECTING,
+            headline=f"Mapping playlist: {summary.name}",
+            detail=(
+                f"Optimizing one safe route through all {summary.track_count} tracks "
+                "and compiling every handoff locally."
+            ),
+        )
+        planner = LocalDJPlanner(
+            self.profile_store.list_profiles(ready_only=True),
+            proficient_techniques=self.profile_store.proficient_techniques(),
+        )
+        try:
+            plan = planner.build_playlist_plan(
+                summary.track_ids,
+                opening_track_id=opening_track_id,
+                vibe=vibe,
+                name=f"RekordBot playlist — {summary.name}",
+            )
+        except Exception as exc:
+            self._automation_active = False
+            self._fail("Playlist mapping failed", str(exc))
+            raise
+        return await self._launch_plan(plan)
+
+    async def _launch_plan(self, plan: AutonomousSetPlan) -> dict[str, Any]:
         self.plan = plan
         queue = self._queue_roles(plan)
         self.status_store.publish(
@@ -311,8 +395,10 @@ class StandaloneDJEngine:
             raise ValueError("steering transition count must be between 2 and 6")
         runner = self.adapter.runner_status()
         if runner.get("active") is not True or not runner.get("active_option_id"):
-            raise RuntimeError(
-                "Wait until the app shows an armed next track before steering."
+            return await self.continue_set(
+                target_query=target_query,
+                vibe=vibe,
+                transition_count=transition_count,
             )
         active = self._option(str(runner["active_option_id"]))
         if active is None:
@@ -321,25 +407,13 @@ class StandaloneDJEngine:
         anchor_deck = active.card.incoming_deck
         target = self.resolve_track(target_query) if target_query.strip() else None
         excluded = list(runner.get("played_track_ids") or [])
-        planner = LocalDJPlanner(
-            self.profile_store.list_profiles(ready_only=True),
-            proficient_techniques=self.profile_store.proficient_techniques(),
-        )
-        future = planner.build_plan(
-            DJBrief(
-                start_track_id=anchor_id,
-                target_track_count=transition_count + 1,
-                target_track_id=target.track_id if target is not None else None,
-                target_bpm=target.bpm if target is not None else None,
-                vibe=vibe,
-                excluded_track_ids=excluded,
-                name=(
-                    f"Steer to {target.title}"
-                    if target is not None
-                    else f"Steer {vibe}"
-                ),
-            ),
-            opening_deck=anchor_deck,
+        future, actual_transitions = self._build_future_route(
+            anchor_id=anchor_id,
+            anchor_deck=anchor_deck,
+            target=target,
+            vibe=vibe,
+            transition_count=transition_count,
+            excluded=excluded,
         )
         result = self.adapter.queue_steering(future)
         if result.get("queued") is not True:
@@ -357,7 +431,7 @@ class StandaloneDJEngine:
             detail=(
                 "The transition already armed will remain unchanged. The new "
                 f"{vibe} route begins after that track and arrives in "
-                f"{transition_count} transitions."
+                f"{actual_transitions} transitions."
             ),
             severity="success",
             current=self._role(
@@ -376,11 +450,145 @@ class StandaloneDJEngine:
             "projected_plan": self.plan.model_dump(),
         }
 
+    async def continue_set(
+        self,
+        *,
+        target_query: str = "",
+        vibe: str = "maintain",
+        transition_count: int = 4,
+        endless: bool | None = None,
+    ) -> dict[str, Any]:
+        """Attach a new plan to a final track that is still playing."""
+        if not 2 <= transition_count <= 8:
+            raise ValueError("continuation transition count must be between 2 and 8")
+        runner = self.adapter.runner_status()
+        anchor_id = runner.get("current_track_id")
+        anchor_deck = runner.get("current_deck")
+        if not anchor_id or anchor_deck not in {1, 2}:
+            snapshot = self.status_store.read()
+            anchor_id = snapshot.current.track_id
+            anchor_deck = snapshot.current.deck
+        if not anchor_id or anchor_deck not in {1, 2}:
+            raise RuntimeError("no playing prepared track is available to continue")
+        target = self.resolve_track(target_query) if target_query.strip() else None
+        excluded = list(runner.get("played_track_ids") or [])
+        future, actual_transitions = self._build_future_route(
+            anchor_id=str(anchor_id),
+            anchor_deck=int(anchor_deck),
+            target=target,
+            vibe=vibe,
+            transition_count=transition_count,
+            excluded=excluded,
+        )
+        self._automation_active = True
+        if endless is not None:
+            self._endless = endless
+        self._endless_vibe = vibe
+        self.status_store.publish(
+            phase=RuntimePhase.PREFLIGHT,
+            headline="Extending the live set",
+            detail=(
+                f"Attaching {actual_transitions} transitions to the playing final "
+                "track without restarting it."
+            ),
+        )
+        try:
+            connection = self.adapter.connect()
+            if connection.get("connected") is not True:
+                raise RuntimeError("MIDI output did not connect")
+            self.adapter.arm(30 * 60)
+            started = await self.adapter.continue_set(future)
+            if started.get("ready") is not True:
+                raise RuntimeError(
+                    "; ".join(started.get("errors", []))
+                    or "continuation launch failed"
+                )
+        except Exception as exc:
+            self._automation_active = False
+            self._fail("Set continuation failed", str(exc))
+            raise
+        self.plan = future
+        if self.monitor_task and not self.monitor_task.done():
+            self.monitor_task.cancel()
+        self.monitor_task = asyncio.create_task(self._monitor())
+        return {
+            "ready": True,
+            "continued": True,
+            "actual_transitions": actual_transitions,
+            "plan": future.model_dump(),
+            "launch": started,
+        }
+
+    def _build_future_route(
+        self,
+        *,
+        anchor_id: str,
+        anchor_deck: int,
+        target: TrackProfile | None,
+        vibe: str,
+        transition_count: int,
+        excluded: list[str],
+    ) -> tuple[AutonomousSetPlan, int]:
+        planner = LocalDJPlanner(
+            self.profile_store.list_profiles(ready_only=True),
+            proficient_techniques=self.profile_store.proficient_techniques(),
+        )
+        allowed = set(self._candidate_track_ids or planner.profiles.keys())
+        allowed.add(anchor_id)
+        if target is not None:
+            allowed.add(target.track_id)
+        recent_excluded = list(dict.fromkeys(excluded))
+        available = allowed - set(recent_excluded) - {anchor_id}
+        if len(available) < transition_count:
+            # Endless playback eventually consumes the whole candidate pool.
+            # Retain only as much repeat-cooldown as still leaves enough unique
+            # tracks to compile the requested horizon; never dead-end merely
+            # because every song has appeared earlier in the same set.
+            cooldown = max(0, len(allowed - {anchor_id}) - transition_count)
+            recent_excluded = recent_excluded[-cooldown:] if cooldown else []
+        if target is not None:
+            recent_excluded = [
+                track_id for track_id in recent_excluded if track_id != target.track_id
+            ]
+        last_error: Exception | None = None
+        for transitions in range(transition_count, min(12, transition_count + 4) + 1):
+            try:
+                return (
+                    planner.build_plan(
+                        DJBrief(
+                            start_track_id=anchor_id,
+                            target_track_count=transitions + 1,
+                            target_track_id=(
+                                target.track_id if target is not None else None
+                            ),
+                            target_bpm=target.bpm if target is not None else None,
+                            vibe=vibe,
+                            excluded_track_ids=recent_excluded,
+                            allowed_track_ids=sorted(allowed),
+                            name=(
+                                f"Steer to {target.title}"
+                                if target is not None
+                                else f"Continue {vibe}"
+                            ),
+                        ),
+                        opening_deck=anchor_deck,
+                    ),
+                    transitions,
+                )
+            except ValueError as exc:
+                last_error = exc
+        raise ValueError(
+            f"no safe route could reach the requested direction: {last_error}"
+        )
+
     async def _monitor(self) -> None:
         while True:
             try:
                 runner = self.adapter.runner_status()
                 control = self.adapter.control_status()
+                if self._endless and runner.get("active") is True:
+                    await self._extend_endless_horizon(runner)
+                    runner = self.adapter.runner_status()
                 self._publish_runner_state(runner, control)
                 if runner.get("status") in {"completed", "failed", "stopped"}:
                     self._automation_active = False
@@ -395,6 +603,48 @@ class StandaloneDJEngine:
                     severity="warning",
                 )
             await asyncio.sleep(self.monitor_seconds)
+
+    async def _extend_endless_horizon(self, runner: dict[str, Any]) -> None:
+        """Keep at least three future decisions compiled in endless mode."""
+        if self._endless_extension_pending or runner.get("steering_queued"):
+            return
+        active_id = runner.get("active_option_id")
+        if not active_id:
+            return
+        remaining = int(runner.get("target_track_count") or 0) - len(
+            runner.get("played_track_ids") or []
+        )
+        if remaining > 3:
+            return
+        active = self._option(str(active_id))
+        if active is None:
+            return
+        self._endless_extension_pending = True
+        try:
+            future, _ = self._build_future_route(
+                anchor_id=active.incoming.track_id,
+                anchor_deck=active.card.incoming_deck,
+                target=None,
+                vibe=self._endless_vibe,
+                transition_count=5,
+                excluded=list(runner.get("played_track_ids") or []),
+            )
+            result = self.adapter.queue_steering(future)
+            if result.get("queued") is not True:
+                raise RuntimeError(
+                    "; ".join(result.get("errors", []))
+                    or "endless extension was rejected"
+                )
+            self.plan = AutonomousSetPlan.model_validate(result["projected_plan"])
+            self.status_store.publish(
+                phase=RuntimePhase.SELECTING,
+                headline="Endless set extended",
+                detail="Five more transitions are compiled and locally owned.",
+                severity="success",
+                queue=self._queue_roles(self.plan),
+            )
+        finally:
+            self._endless_extension_pending = False
 
     async def monitor_manual_playback(self) -> None:
         """Reflect manual Rekordbox transport while automation is inactive."""
@@ -768,6 +1018,7 @@ class StandaloneDJEngine:
         return result
 
     def stop_after_current(self) -> dict[str, Any]:
+        self._endless = False
         result = self.adapter.stop_automation()
         self.status_store.publish(
             phase=RuntimePhase.STOPPING,

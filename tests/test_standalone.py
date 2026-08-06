@@ -393,6 +393,22 @@ def test_user_verified_four_bar_drop_gets_blend_not_hard_cut() -> None:
     ] == [0.18, 0.35, 0.72, 0.86, 1]
 
 
+def test_incompatible_keys_fall_through_to_nonoverlap_phrase_cut() -> None:
+    outgoing = profile("a", "A", 128, "9A")
+    incoming = profile("b", "B", 128, "6A")
+
+    handoff = TransitionKingCompiler().compile(
+        outgoing,
+        incoming,
+        outgoing_deck=1,
+    )
+
+    assert handoff.technique == "phrase_cut"
+    assert handoff.card.harmonic_risk_accepted is True
+    assert handoff.card.transition_family == "phrase_cut"
+    assert validate_transition_card(handoff.card, outgoing, incoming) == []
+
+
 def test_local_planner_builds_repeatable_harmonic_tempo_route() -> None:
     profiles = [
         profile("a", "A", 128, "9A"),
@@ -557,6 +573,10 @@ class FakeAdapter:
     async def start(self, plan):
         return {"ready": True}
 
+    async def continue_set(self, plan):
+        self.continued_plan = plan
+        return {"ready": True}
+
     def runner_status(self):
         return self.statuses.pop(0)
 
@@ -624,6 +644,101 @@ def test_standalone_engine_runs_without_codex_round_trips(tmp_path) -> None:
         )
 
     asyncio.run(scenario())
+
+
+def test_playlist_planner_uses_every_track_once() -> None:
+    profiles = [
+        profile("a", "A", 124, "9A"),
+        profile("b", "B", 125, "10A"),
+        profile("c", "C", 126, "11A"),
+        profile("d", "D", 127, "12A"),
+    ]
+
+    plan = LocalDJPlanner(profiles).build_playlist_plan(
+        ["c", "a", "d", "b"],
+        opening_track_id="a",
+    )
+    route = [plan.opening.track_id] + [
+        option.incoming.track_id for option in plan.transitions
+    ]
+
+    assert route[0] == "a"
+    assert len(route) == 4
+    assert set(route) == {"a", "b", "c", "d"}
+
+
+def test_completed_set_can_attach_to_the_still_playing_final_track(tmp_path) -> None:
+    class ContinuationAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = []
+            self.continued_plan = None
+
+        def runner_status(self):
+            return {
+                "active": False,
+                "status": "completed",
+                "current_track_id": "a",
+                "current_deck": 1,
+                "played_track_ids": ["a"],
+                "active_option_id": None,
+            }
+
+    async def scenario() -> None:
+        profiles = ProfileStore(tmp_path / "profiles")
+        for item in (
+            profile("a", "A", 124, "9A"),
+            profile("b", "B", 125, "10A"),
+            profile("c", "C", 126, "11A"),
+        ):
+            profiles.upsert(item)
+        adapter = ContinuationAdapter()
+        engine = StandaloneDJEngine(
+            profile_store=profiles,
+            status_store=StandaloneStatusStore(tmp_path / "status"),
+            adapter=adapter,
+            monitor_seconds=60,
+        )
+
+        result = await engine.continue_set(
+            target_query="C",
+            transition_count=2,
+        )
+
+        assert result["continued"] is True
+        assert adapter.continued_plan.opening.track_id == "a"
+        assert adapter.continued_plan.transitions[-1].incoming.track_id == "c"
+        engine.monitor_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_endless_route_reuses_an_exhausted_small_pool_safely(tmp_path) -> None:
+    profiles = ProfileStore(tmp_path / "profiles")
+    track_ids = [str(index) for index in range(6)]
+    for index, track_id in enumerate(track_ids):
+        profiles.upsert(profile(track_id, f"Track {index}", 124 + index, "9A"))
+    engine = StandaloneDJEngine(
+        profile_store=profiles,
+        status_store=StandaloneStatusStore(tmp_path / "status"),
+        adapter=FakeAdapter(),
+    )
+    engine._candidate_track_ids = set(track_ids)
+
+    future, transitions = engine._build_future_route(
+        anchor_id="5",
+        anchor_deck=2,
+        target=None,
+        vibe="maintain",
+        transition_count=5,
+        excluded=track_ids,
+    )
+
+    assert transitions == 5
+    assert future.target_track_count == 6
+    assert len({future.opening.track_id, *[
+        option.incoming.track_id for option in future.transitions
+    ]}) == 6
 
 
 def test_engine_resolves_accent_insensitive_search_and_loaded_deck(tmp_path) -> None:

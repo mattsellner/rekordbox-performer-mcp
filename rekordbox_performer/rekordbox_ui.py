@@ -398,6 +398,31 @@ class RekordboxUIAdapter:
         self._transport_control_cache = None
         self._transport_cache_signature = None
 
+    def fx_effect(self, deck: int) -> str:
+        """Observe the selected first-slot Beat FX for one deck."""
+        if deck not in {1, 2}:
+            raise ValueError("deck must be 1 or 2")
+        root = self._root()
+        samples, width = self._sample_controls(root)
+        left, right = (
+            (width * 0.15, width * 0.31)
+            if deck == 1
+            else (width * 0.58, width * 0.74)
+        )
+        candidates = [
+            sample
+            for sample in samples
+            if sample.control_type == "Button"
+            and sample.text.strip()
+            and 45 <= sample.top <= 80
+            and 70 <= sample.right - sample.left <= 150
+            and left <= sample.left <= right
+        ]
+        if not candidates:
+            raise RuntimeError(f"Deck {deck} first-slot FX selector is not visible")
+        selected = min(candidates, key=lambda sample: sample.left)
+        return normalize_title(selected.text).replace(" ", "_")
+
     def _transport_controls(self, root) -> list[Any]:
         """Cache only text controls needed for passive deck observation."""
         window = root.rectangle()

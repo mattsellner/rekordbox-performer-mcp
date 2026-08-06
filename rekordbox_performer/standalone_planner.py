@@ -30,7 +30,7 @@ from .set_runner import AutonomousSetPlan, TrackLoadSpec, TransitionOption
 
 class DJBrief(BaseModel):
     start_track_id: str
-    target_track_count: int = Field(default=6, ge=2, le=20)
+    target_track_count: int = Field(default=6, ge=2, le=100)
     name: str = "RekordBot set"
     target_bpm: float | None = Field(default=None, gt=0)
     target_track_id: str | None = None
@@ -43,6 +43,7 @@ class DJBrief(BaseModel):
         "instrumental",
     ] = "maintain"
     excluded_track_ids: list[str] = Field(default_factory=list)
+    allowed_track_ids: list[str] = Field(default_factory=list)
     max_native_bpm_delta: float = Field(default=4.0, gt=0, le=12)
     allow_safe_cuts: bool = True
 
@@ -248,6 +249,23 @@ def _vocal_overlap_bars(
         if outgoing_vocal and incoming_vocal:
             count += 1
     return count
+
+
+def _verified_instrumental_loop(
+    profile: TrackProfile,
+    phrase: PhraseBoundary,
+) -> bool:
+    """Return whether four bars at a verified phrase start contain no vocal."""
+    if profile.vocal_confidence not in {"high", "verified"}:
+        return False
+    loop_start = phrase.start_bar
+    loop_end = loop_start + 3
+    return not any(
+        segment.kind == "vocal"
+        and segment.start_bar <= loop_end
+        and segment.end_bar >= loop_start
+        for segment in profile.segments
+    )
 
 
 def _energy_handoffs(
@@ -959,6 +977,19 @@ class TransitionKingCompiler:
         allow_safe_cuts: bool = True,
     ) -> list[CompiledHandoff]:
         proposals: list[CompiledHandoff] = []
+
+        def consider(builder) -> None:
+            # A technique can be structurally inapplicable (including a
+            # harmonic-overlap rejection) without invalidating other safe
+            # techniques for the same pair. Each candidate fails closed on
+            # its own; the pair fails only when no candidate validates.
+            try:
+                proposal = builder()
+            except ValueError:
+                return
+            if proposal is not None:
+                proposals.append(proposal)
+
         energy_pairs = _energy_handoffs(outgoing, incoming)
         if energy_pairs:
             pair = energy_pairs[0]
@@ -968,9 +999,9 @@ class TransitionKingCompiler:
                 if pair.outgoing_critical.label.casefold() == "down"
                 and pair.incoming_critical.label.casefold() == "chorus"
                 else 18.0
-            )
-            proposals.append(
-                self._compile_energy_card(
+            ) - overlap * 12.0
+            consider(
+                lambda: self._compile_energy_card(
                     outgoing,
                     incoming,
                     outgoing_deck=outgoing_deck,
@@ -985,8 +1016,8 @@ class TransitionKingCompiler:
                     ),
                 )
             )
-            proposals.append(
-                self._compile_energy_card(
+            consider(
+                lambda: self._compile_energy_card(
                     outgoing,
                     incoming,
                     outgoing_deck=outgoing_deck,
@@ -1000,7 +1031,8 @@ class TransitionKingCompiler:
                         - pair.incoming_audible.start_bar
                         == 8
                         else 8.0
-                    ),
+                    )
+                    - overlap * 8.0,
                     reason=(
                         f"Compact bass swap: {pair.reason}. The incoming track "
                         "is established first and the outgoing tail clears in "
@@ -1009,8 +1041,8 @@ class TransitionKingCompiler:
                 )
             )
             if pair.outgoing_critical.label.casefold() == "outro":
-                proposals.append(
-                    self._compile_energy_card(
+                consider(
+                    lambda: self._compile_energy_card(
                         outgoing,
                         incoming,
                         outgoing_deck=outgoing_deck,
@@ -1029,8 +1061,8 @@ class TransitionKingCompiler:
                 and pair.audible_entry_offset > 0
                 and "stem_vocal_blend" in proficient_techniques
             ):
-                proposals.append(
-                    self._compile_energy_card(
+                consider(
+                    lambda: self._compile_energy_card(
                         outgoing,
                         incoming,
                         outgoing_deck=outgoing_deck,
@@ -1047,30 +1079,41 @@ class TransitionKingCompiler:
                     )
                 )
 
-        loop = self._compile_loop_bridge(
-            outgoing,
-            incoming,
-            outgoing_deck=outgoing_deck,
-        )
-        if loop is not None:
-            proposals.append(loop)
+            consider(
+                lambda: self._compile_vocal_loop_blend(
+                    outgoing,
+                    incoming,
+                    outgoing_deck=outgoing_deck,
+                    pair=pair,
+                    vocal_overlap_bars=overlap,
+                )
+            )
 
-        breakdown = self._compile_breakdown(
-            outgoing,
-            incoming,
-            outgoing_deck=outgoing_deck,
-            vibe=vibe,
+        consider(
+            lambda: self._compile_loop_bridge(
+                outgoing,
+                incoming,
+                outgoing_deck=outgoing_deck,
+            )
         )
-        if breakdown is not None:
-            proposals.append(breakdown)
 
-        cut = self._compile_phrase_cut(
-            outgoing,
-            incoming,
-            outgoing_deck=outgoing_deck,
+        consider(
+            lambda: self._compile_breakdown(
+                outgoing,
+                incoming,
+                outgoing_deck=outgoing_deck,
+                vibe=vibe,
+            )
         )
-        if cut is not None and allow_safe_cuts:
-            proposals.append(cut)
+
+        if allow_safe_cuts:
+            consider(
+                lambda: self._compile_phrase_cut(
+                    outgoing,
+                    incoming,
+                    outgoing_deck=outgoing_deck,
+                )
+            )
 
         if not proposals:
             raise ValueError(
@@ -1130,6 +1173,103 @@ class TransitionKingCompiler:
             vibe=vibe,
             allow_safe_cuts=allow_safe_cuts,
         )[0]
+
+    def _compile_vocal_loop_blend(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        pair: EnergyHandoff,
+        vocal_overlap_bars: int,
+    ) -> CompiledHandoff | None:
+        """Hold a clean outgoing pocket when its advancing tail would clash."""
+        if vocal_overlap_bars < 2 or not _verified_instrumental_loop(
+            outgoing,
+            pair.outgoing_start,
+        ):
+            return None
+        incoming_deck = 2 if outgoing_deck == 1 else 1
+        if pair.incoming_entry is not None:
+            launch = MusicalEvent(
+                bar_offset=0,
+                action="hot_cue",
+                parameters={"deck": incoming_deck, "cue": pair.incoming_entry.cue},
+            )
+            load = _load_spec(incoming, pair.incoming_entry)
+        else:
+            launch = MusicalEvent(
+                bar_offset=0,
+                action="play_pause",
+                parameters={"deck": incoming_deck},
+            )
+            load = _load_spec(incoming)
+        events = _progressive_house_events(
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            launch=launch,
+            audible_entry_offset=pair.audible_entry_offset,
+            critical_offset=pair.critical_offset,
+        )
+        events.extend(
+            [
+                MusicalEvent(
+                    bar_offset=0,
+                    action="loop_16",
+                    parameters={"deck": outgoing_deck},
+                ),
+                MusicalEvent(
+                    bar_offset=pair.critical_offset + 8,
+                    action="loop_toggle",
+                    parameters={"deck": outgoing_deck},
+                ),
+            ]
+        )
+        events.sort(key=lambda event: (event.bar_offset, event.beat_offset))
+        card = TransitionCard(
+            name=f"{outgoing.track_id}-{incoming.track_id}-vocal-safe-loop",
+            outgoing_track_id=outgoing.track_id,
+            incoming_track_id=incoming.track_id,
+            anchor_deck=outgoing_deck,
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            transition_family="loop_bridge",
+            start_quantum_bars=16 if pair.critical_offset >= 16 else 8,
+            minimum_lead_bars=16,
+            start_phrase_index=pair.outgoing_start.index,
+            beat_sync_required=True,
+            quantize_required=True,
+            phrase_alignment_verified=True,
+            vocal_plan_verified=True,
+            bass_plan_verified=True,
+            loop_plan_verified=True,
+            incoming_loaded_verified=True,
+            intended_vocal_owner="incoming",
+            critical_bar_offset=pair.critical_offset,
+            events=events,
+            abort_plan=(
+                "Keep the verified outgoing loop and bass active; stop the muted "
+                "incoming deck before its fader rises."
+            ),
+            notes=(
+                f"Four-bar instrumental loop at outgoing bar "
+                f"{pair.outgoing_start.start_bar} prevents {vocal_overlap_bars} "
+                "bars of analyzed vocal collision while preserving runway."
+            ),
+        )
+        self._validate(card, outgoing, incoming)
+        return CompiledHandoff(
+            card=card,
+            load=load,
+            technique="vocal_safe_loop_blend",
+            cue_landmark=pair.incoming_entry,
+            bass_landmark=pair.bass_landmark,
+            reason=(
+                "A verified instrumental outgoing loop preserves energy and "
+                f"removes {vocal_overlap_bars} bars of vocal collision."
+            ),
+            suitability_score=pair.score + 42.0 + vocal_overlap_bars * 7.0,
+        )
 
     def _compile_energy_card(
         self,
@@ -1447,6 +1587,7 @@ class TransitionKingCompiler:
         if entry is None and file_start is None:
             return None
         incoming_deck = 2 if outgoing_deck == 1 else 1
+        harmonic = camelot_compatibility(outgoing.key, incoming.key)
         start = _outgoing_start_phrase(outgoing, required_bars=1)
         launch = MusicalEvent(
             bar_offset=0,
@@ -1474,6 +1615,7 @@ class TransitionKingCompiler:
             vocal_plan_verified=True,
             bass_plan_verified=True,
             incoming_loaded_verified=True,
+            harmonic_risk_accepted=not harmonic.get("compatible", False),
             intended_vocal_owner="incoming",
             critical_bar_offset=0,
             events=_phrase_cut_events(
@@ -1485,7 +1627,14 @@ class TransitionKingCompiler:
                 "Do not cut; keep the outgoing channel full and stop the "
                 "incoming deck."
             ),
-            notes="Verified phrase-boundary cut retained as a low-complexity fallback.",
+            notes=(
+                "Verified phrase-boundary cut retained as a low-complexity "
+                "fallback. The non-overlap cut explicitly isolates incompatible "
+                "keys."
+                if not harmonic.get("compatible", False)
+                else "Verified phrase-boundary cut retained as a low-complexity "
+                "fallback."
+            ),
         )
         self._validate(card, outgoing, incoming)
         return CompiledHandoff(
@@ -1527,6 +1676,9 @@ class LocalDJPlanner:
         }
         self.proficient_techniques = frozenset(proficient_techniques)
         self.compiler = TransitionKingCompiler()
+        self._handoff_cache: dict[
+            tuple[str, str, int, str, bool], CompiledHandoff | None
+        ] = {}
 
     def build_plan(
         self,
@@ -1547,79 +1699,197 @@ class LocalDJPlanner:
             if brief.target_track_id in brief.excluded_track_ids:
                 raise ValueError("destination track has already played in this set")
             target = self.profiles[brief.target_track_id]
-        excluded = set(brief.excluded_track_ids) - {brief.start_track_id}
-        route = [self.profiles[brief.start_track_id]]
-        route_handoffs: list[CompiledHandoff] = []
-        while len(route) < brief.target_track_count:
-            current = route[-1]
-            used = {track.track_id for track in route}
-            final_slot = len(route) == brief.target_track_count - 1
-            if final_slot and target is not None:
-                candidates = [target]
-            else:
-                candidates = [
-                    profile
-                    for profile in self.profiles.values()
-                    if profile.track_id not in used
-                    and profile.track_id not in excluded
-                    and (target is None or profile.track_id != target.track_id)
-                ]
-            candidates = [
-                profile
-                for profile in candidates
-                if abs(profile.bpm - current.bpm) <= brief.max_native_bpm_delta
-            ]
-            evaluated: list[
-                tuple[float, str, str, str, TrackProfile, CompiledHandoff]
-            ] = []
-            outgoing_deck = (
-                opening_deck if len(route) % 2 else (2 if opening_deck == 1 else 1)
+        allowed = (
+            set(brief.allowed_track_ids)
+            if brief.allowed_track_ids
+            else set(self.profiles)
+        )
+        missing_allowed = allowed - self.profiles.keys()
+        if missing_allowed:
+            raise ValueError(
+                "candidate pool contains tracks that are not Tier-A automation ready: "
+                + ", ".join(sorted(missing_allowed))
             )
-            recent = tuple(item.technique for item in route_handoffs[-3:])
-            for candidate in candidates:
-                selection_score = self._score_candidate(
-                    current,
-                    candidate,
-                    depth=len(route),
-                    total=brief.target_track_count,
-                    target_bpm=brief.target_bpm,
-                    target_track=target,
-                    vibe=brief.vibe,
+        if brief.start_track_id not in allowed:
+            raise ValueError("opening track is outside the selected candidate pool")
+        if target is not None and target.track_id not in allowed:
+            raise ValueError("destination track is outside the selected candidate pool")
+        route, route_handoffs = self._search_route(
+            brief,
+            opening_deck=opening_deck,
+            start_track_ids=(brief.start_track_id,),
+            allowed_track_ids=allowed,
+            target=target,
+        )
+
+        return self._plan_from_route(brief, route, route_handoffs, target=target)
+
+    def build_playlist_plan(
+        self,
+        track_ids: Iterable[str],
+        *,
+        opening_track_id: str | None = None,
+        opening_deck: int = 1,
+        vibe: str = "maintain",
+        name: str = "RekordBot playlist set",
+    ) -> AutonomousSetPlan:
+        """Find the strongest safe ordering that uses every playlist track once."""
+        ordered_ids = tuple(dict.fromkeys(str(track_id) for track_id in track_ids))
+        if len(ordered_ids) < 2:
+            raise ValueError("playlist needs at least two automation-ready tracks")
+        missing = [track_id for track_id in ordered_ids if track_id not in self.profiles]
+        if missing:
+            raise ValueError(
+                "playlist contains tracks that are not Tier-A automation ready: "
+                + ", ".join(missing)
+            )
+        if opening_track_id is not None and opening_track_id not in ordered_ids:
+            raise ValueError("selected opening track is not in the playlist")
+        brief = DJBrief(
+            start_track_id=opening_track_id or ordered_ids[0],
+            target_track_count=len(ordered_ids),
+            name=name,
+            vibe=vibe,
+            allowed_track_ids=list(ordered_ids),
+            max_native_bpm_delta=8.0,
+        )
+        starts = (opening_track_id,) if opening_track_id else ordered_ids
+        route, handoffs = self._search_route(
+            brief,
+            opening_deck=opening_deck,
+            start_track_ids=tuple(item for item in starts if item is not None),
+            allowed_track_ids=set(ordered_ids),
+            target=None,
+            beam_width=96,
+        )
+        return self._plan_from_route(brief, route, handoffs, target=None)
+
+    def _search_route(
+        self,
+        brief: DJBrief,
+        *,
+        opening_deck: int,
+        start_track_ids: tuple[str, ...],
+        allowed_track_ids: set[str],
+        target: TrackProfile | None,
+        beam_width: int = 64,
+    ) -> tuple[list[TrackProfile], list[CompiledHandoff]]:
+        """Beam-search the transition graph instead of committing greedily."""
+        excluded = set(brief.excluded_track_ids) - set(start_track_ids)
+        states: list[tuple[float, tuple[str, ...], tuple[CompiledHandoff, ...]]] = [
+            (0.0, (track_id,), ()) for track_id in start_track_ids
+        ]
+        for depth in range(1, brief.target_track_count):
+            expanded: list[
+                tuple[float, tuple[str, ...], tuple[CompiledHandoff, ...]]
+            ] = []
+            final_slot = depth == brief.target_track_count - 1
+            for score, route_ids, handoffs in states:
+                current = self.profiles[route_ids[-1]]
+                if final_slot and target is not None:
+                    candidate_ids = (target.track_id,)
+                else:
+                    candidate_ids = tuple(
+                        track_id
+                        for track_id in allowed_track_ids
+                        if track_id not in route_ids
+                        and track_id not in excluded
+                        and (target is None or track_id != target.track_id)
+                    )
+                outgoing_deck = (
+                    opening_deck if depth % 2 else (2 if opening_deck == 1 else 1)
                 )
-                try:
-                    handoff = self.compiler.compile(
+                for candidate_id in candidate_ids:
+                    if candidate_id in route_ids or candidate_id in excluded:
+                        continue
+                    candidate = self.profiles[candidate_id]
+                    if abs(candidate.bpm - current.bpm) > brief.max_native_bpm_delta:
+                        continue
+                    handoff = self._cached_handoff(
                         current,
                         candidate,
                         outgoing_deck=outgoing_deck,
-                        recent_techniques=recent,
-                        proficient_techniques=self.proficient_techniques,
-                        vibe=brief.vibe,
-                        allow_safe_cuts=brief.allow_safe_cuts,
+                        brief=brief,
                     )
-                except ValueError:
-                    continue
-                evaluated.append(
-                    (
-                        selection_score[0] + handoff.suitability_score * 0.35,
-                        selection_score[1],
-                        selection_score[2],
-                        candidate.track_id,
+                    if handoff is None:
+                        continue
+                    selection = self._score_candidate(
+                        current,
                         candidate,
-                        handoff,
+                        depth=depth,
+                        total=brief.target_track_count,
+                        target_bpm=brief.target_bpm,
+                        target_track=target,
+                        vibe=brief.vibe,
+                    )[0]
+                    repeated = sum(
+                        item.technique == handoff.technique for item in handoffs[-3:]
                     )
-                )
-            if not evaluated:
+                    diversity_penalty = repeated * 7.0 + (
+                        8.0
+                        if handoffs and handoffs[-1].technique == handoff.technique
+                        else 0.0
+                    )
+                    expanded.append(
+                        (
+                            score
+                            + selection
+                            + handoff.suitability_score * 0.35
+                            - diversity_penalty,
+                            (*route_ids, candidate_id),
+                            (*handoffs, handoff),
+                        )
+                    )
+            if not expanded:
                 direction = (
-                    f" while steering toward {target.title}"
-                    if target is not None
-                    else ""
+                    f" while steering toward {target.title}" if target is not None else ""
                 )
                 raise ValueError(
-                    f"no safe prepared successor exists for {current.title}{direction}"
+                    "no complete safe route exists through the prepared transition "
+                    f"graph{direction}"
                 )
-            _, _, _, _, selected, selected_handoff = max(evaluated)
-            route.append(selected)
-            route_handoffs.append(selected_handoff)
+            expanded.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            states = expanded[:beam_width]
+        _, route_ids, handoffs = max(states, key=lambda item: (item[0], item[1]))
+        return [self.profiles[track_id] for track_id in route_ids], list(handoffs)
+
+    def _cached_handoff(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        brief: DJBrief,
+    ) -> CompiledHandoff | None:
+        key = (
+            outgoing.track_id,
+            incoming.track_id,
+            outgoing_deck,
+            brief.vibe,
+            brief.allow_safe_cuts,
+        )
+        if key not in self._handoff_cache:
+            try:
+                self._handoff_cache[key] = self.compiler.compile(
+                    outgoing,
+                    incoming,
+                    outgoing_deck=outgoing_deck,
+                    proficient_techniques=self.proficient_techniques,
+                    vibe=brief.vibe,
+                    allow_safe_cuts=brief.allow_safe_cuts,
+                )
+            except ValueError:
+                self._handoff_cache[key] = None
+        return self._handoff_cache[key]
+
+    def _plan_from_route(
+        self,
+        brief: DJBrief,
+        route: list[TrackProfile],
+        route_handoffs: list[CompiledHandoff],
+        *,
+        target: TrackProfile | None,
+    ) -> AutonomousSetPlan:
 
         transitions: list[TransitionOption] = []
         for index, ((outgoing, incoming), handoff) in enumerate(
@@ -1634,6 +1904,13 @@ class LocalDJPlanner:
                     technique=handoff.technique,
                     reason=handoff.reason,
                     alternatives=list(handoff.alternatives),
+                    fx_effect={
+                        "filter_exit": "echo",
+                        "breakdown_handoff": "reverb",
+                        "loop_bridge": "spiral",
+                        "vocal_safe_loop_blend": "spiral",
+                        "phrase_cut": "vinyl_brake",
+                    }.get(handoff.technique),
                 )
             )
 

@@ -21,9 +21,14 @@ Rekordbox runtime. Codex is not consulted between tracks and can be closed
 without interrupting the set. RekordBot:
 
 - selects a complete route from Tier-A analyzed tracks before playback;
+- can map every automation-ready song in a selected Rekordbox playlist through
+  a transition-graph search, preserving each song exactly once;
+- can attach a new route to the final song while it is still playing, or keep a
+  rolling five-transition horizon compiled in Endless Set mode;
 - scores long blends, compact bass swaps, filter exits, breakdown handoffs,
-  loop bridges, phrase cuts, and proficiency-gated stem blends from verified
-  phrase, vocal, waveform-energy, key, and BPM evidence;
+  vocal-safe instrumental loops, loop bridges, phrase cuts, and
+  proficiency-gated stem blends from verified phrase, vocal, waveform-energy,
+  key, and BPM evidence;
 - pairs the incoming chorus/drop with an outgoing energy release instead of
   choosing a bass-swap bar from elapsed overlap length alone;
 - starts the opener at its own native BPM before enabling Beat Sync;
@@ -96,6 +101,27 @@ controls remain available. Click **Queue steering** to redirect the set over
 two to six transitions. The transition already armed is never replaced; the
 new route begins with its incoming track, which preserves phrase timing and
 the rolling two-track safety lead.
+
+If the planned route has finished but its last song is still playing, choose an
+optional destination/vibe and click **Continue set**. RekordBot observes the
+playing deck, attaches the next route, and does not restart the current song.
+Enable **Endless set** before starting or continuing to keep extending the
+transition horizon until **Stop After Current** is pressed.
+
+To use playlist mode, select a playlist whose readiness counter shows every
+song ready, optionally choose an opening track from that playlist, and start the
+set. Set length is ignored in this mode because the graph planner uses every
+playlist song exactly once. RekordBot reads playlist membership from the local
+Rekordbox database without modifying it; an incomplete playlist is rejected
+with its ready/total count instead of silently skipping songs.
+
+The energy-preserving long blend and compact bass swap remain the defaults.
+Other techniques are selected only when their analyzed evidence scores higher:
+for example, a verified four-bar instrumental loop can hold the outgoing groove
+through a vocal collision, while breakdown, filter, echo, reverb, spiral, and
+vinyl-brake exits remain available for structurally suitable handoffs. Beat FX
+selection is visually verified while fully dry; if RekordBot cannot confirm the
+requested effect, it executes the validated dry transition instead.
 
 ## Performance-intelligence workflow
 
