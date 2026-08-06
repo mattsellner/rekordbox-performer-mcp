@@ -1,19 +1,105 @@
 from __future__ import annotations
 
-from PIL import Image, ImageDraw
 import pytest
+from PIL import Image, ImageDraw
 
+from rekordbox_performer import rekordbox_ui
 from rekordbox_performer.rekordbox_ui import (
     ControlSample,
     DeckSnapshot,
     RekordboxUIAdapter,
-    blue_ratio,
     analyze_bar_grid_alignment,
-    vivid_color_ratio,
+    blue_ratio,
     normalize_title,
     parse_clock_seconds,
     unique_row_tops,
+    vivid_color_ratio,
 )
+
+
+def test_select_exact_track_reacquires_search_after_collection_rebuild(
+    monkeypatch,
+) -> None:
+    class WindowRect:
+        left = 0
+        top = 0
+
+        @staticmethod
+        def width():
+            return 1920
+
+    class Control:
+        def __init__(self) -> None:
+            self.clicked = False
+
+        def click_input(self) -> None:
+            self.clicked = True
+
+    class Root:
+        def __init__(self) -> None:
+            self.focused = False
+            self.clicked_at = None
+
+        @staticmethod
+        def descendants():
+            return []
+
+        @staticmethod
+        def rectangle():
+            return WindowRect()
+
+        def set_focus(self) -> None:
+            self.focused = True
+
+        def click_input(self, *, coords) -> None:
+            self.clicked_at = coords
+
+    stale_search = Control()
+    collection = Control()
+    fresh_search = Control()
+    first_root = Root()
+    rebuilt_root = Root()
+    adapter = RekordboxUIAdapter()
+    roots = iter((first_root, rebuilt_root))
+    adapter._root = lambda: next(roots)
+    initial_samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(collection, "Text", "Collection", 0, 700, 100, 720),
+        ControlSample(stale_search, "Edit", "old", 1600, 720, 1900, 750),
+    ]
+    rebuilt_samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(fresh_search, "Edit", "", 1600, 720, 1900, 750),
+    ]
+    sampled = iter(((initial_samples, 1920), (rebuilt_samples, 1920)))
+    adapter._sample_controls = lambda *_args: next(sampled)
+    row_samples = [
+        ControlSample(None, "Custom", "header", 0, 780, 1800, 802),
+        ControlSample(None, "Custom", "System", 0, 807, 1800, 829),
+    ]
+    adapter._sample_browser_rows = lambda *_args: (row_samples, 1920)
+    adapter._set_clipboard_text = lambda _query: None
+    adapter._restore_clipboard_text = lambda _previous: None
+    monkeypatch.setattr(rekordbox_ui.time, "sleep", lambda _seconds: None)
+    sent = []
+    monkeypatch.setattr(rekordbox_ui, "send_keys", sent.append)
+
+    result = adapter.select_exact_track("System", result_index=0)
+
+    assert collection.clicked is True
+    assert stale_search.clicked is False
+    assert fresh_search.clicked is True
+    assert rebuilt_root.focused is True
+    assert sent == ["{END}", "+{HOME}", "{BACKSPACE}", "^v"]
+    assert result["result_count"] == 1
+
+
+def test_single_browser_result_is_not_mistaken_for_header() -> None:
+    samples = [
+        ControlSample(None, "Custom", "", 334, 785, 1895, 807),
+    ]
+
+    assert RekordboxUIAdapter._result_rows_from_samples(samples, 1920) == [785]
 
 
 def test_visual_bar_grid_alignment_detects_two_beat_offset() -> None:
@@ -360,6 +446,43 @@ def test_deck_is_playing_reuses_supplied_initial_snapshot(monkeypatch) -> None:
 
     assert adapter.deck_is_playing(1, initial=initial) is True
     assert calls == [1]
+
+
+def test_transport_status_never_focuses_or_captures_rekordbox() -> None:
+    class WindowRect:
+        @staticmethod
+        def height():
+            return 1000
+
+    class Root:
+        @staticmethod
+        def rectangle():
+            return WindowRect()
+
+    samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(None, "Text", "Manual Track", 20, 275, 500, 295),
+        ControlSample(None, "Text", "Artist", 20, 305, 150, 320),
+        ControlSample(None, "Text", "00:42", 500, 305, 550, 320),
+        ControlSample(None, "Edit", "126.00", 760, 450, 820, 470),
+    ]
+    adapter = RekordboxUIAdapter()
+    adapter._root = lambda: Root()
+    adapter._transport_controls = lambda _root: []
+    adapter._sample_controls = lambda _root, _controls: (samples, 1920)
+    adapter._capture_focused = lambda _root: pytest.fail("captured Rekordbox")
+
+    result = adapter.transport_status()
+
+    assert result["mode"] is None
+    assert result["decks"][0] == {
+        "deck": 1,
+        "title": "Manual Track",
+        "artist": "Artist",
+        "bpm": 126.0,
+        "key": None,
+        "elapsed_seconds": 42,
+    }
 
 
 def test_blue_ratio_distinguishes_active_rekordbox_blue() -> None:

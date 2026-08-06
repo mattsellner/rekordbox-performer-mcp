@@ -1,7 +1,7 @@
 [project]
-name = "rekordbox-performer"
+name = "rekordbot"
 version = "0.1.0"
-description = "Safety-first MCP control surface for Rekordbox via virtual MIDI"
+description = "Autonomous Windows DJ and safety-first Rekordbox control engine"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.4,<4",
@@ -13,11 +13,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+app = [
+    "pystray>=0.19,<0.20",
+]
+package = [
+    "pyinstaller>=6.0,<7",
+    "pystray>=0.19,<0.20",
+]
 rehearsal = [
     "numpy>=2.0,<3",
     "soundcard>=0.4.4,<0.5",
     "soundfile>=0.13,<0.14",
 ]
+
+[project.scripts]
+rekordbot = "rekordbox_performer.app:main"
 
 [build-system]
 requires = ["hatchling"]

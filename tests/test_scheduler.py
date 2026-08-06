@@ -112,6 +112,7 @@ def test_scheduler_executes_locally() -> None:
         assert final["completed_events"] == 2
         assert len(output.messages) == 2
         assert "p99_event_lateness_ms" in final
+        assert final["p99_event_lateness_ms"] < 20
         assert scheduler.metrics()["completed_jobs"] == 1
 
     asyncio.run(scenario())

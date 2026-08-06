@@ -13,7 +13,6 @@ from PIL import Image
 from pywinauto import Application, Desktop, mouse
 from pywinauto.keyboard import send_keys
 
-
 _TIME_PATTERN = re.compile(r"^\s*(-?)(\d{1,3}):(\d{2})\s*$")
 
 
@@ -279,6 +278,8 @@ class RekordboxUIAdapter:
         # their text and pixels are still sampled fresh on every call.
         self._status_control_cache: list[Any] | None = None
         self._status_cache_signature: tuple[int, int] | None = None
+        self._transport_control_cache: list[Any] | None = None
+        self._transport_cache_signature: tuple[int, int] | None = None
 
     def _root(self):
         window = next(
@@ -394,6 +395,32 @@ class RekordboxUIAdapter:
         """
         self._status_control_cache = None
         self._status_cache_signature = None
+        self._transport_control_cache = None
+        self._transport_cache_signature = None
+
+    def _transport_controls(self, root) -> list[Any]:
+        """Cache only text controls needed for passive deck observation."""
+        window = root.rectangle()
+        signature = (int(getattr(root, "handle", id(root))), window.width())
+        if (
+            self._transport_control_cache is not None
+            and self._transport_cache_signature == signature
+        ):
+            return self._transport_control_cache
+        controls = []
+        for control in root.descendants(control_type="Text"):
+            rectangle = control.rectangle()
+            top = rectangle.top - window.top
+            center = ((rectangle.left + rectangle.right) / 2) - window.left
+            if 260 <= top <= 330 or (
+                430 <= top <= 495
+                and window.width() * 0.36 <= center <= window.width() * 0.64
+                and rectangle.width() >= 20
+            ):
+                controls.append(control)
+        self._transport_control_cache = controls
+        self._transport_cache_signature = signature
+        return controls
 
     @staticmethod
     def _mode_from_samples(samples: list[ControlSample]) -> str:
@@ -527,7 +554,12 @@ class RekordboxUIAdapter:
         # Custom control.  It is always the first wide 22 px band and is not a
         # draggable track.  Returning it caused an empty/header drag that left
         # the target deck at "Not Loaded.".
-        return row_tops[1:] if row_tops else []
+        # UIA does not expose the header band consistently. With exactly one
+        # result it may expose only the real track row, so never discard the
+        # sole row-shaped control.
+        if len(row_tops) <= 1:
+            return row_tops
+        return row_tops[1:]
 
     def _result_row_point(self, root, row_top: int) -> tuple[int, int]:
         """Return a safe absolute hit point in the row's non-editable gutter."""
@@ -598,7 +630,13 @@ class RekordboxUIAdapter:
                 f"found {len(collection_controls)}"
             )
         collection_controls[0].click_input()
-        time.sleep(0.15)
+        # Clicking Collection can rebuild the entire browser pane. Any search
+        # wrapper captured before this click may still exist as a Python object
+        # while no longer receiving keyboard input.
+        time.sleep(0.3)
+        root = self._root()
+        descendants = root.descendants()
+        samples, window_width = self._sample_controls(root, descendants)
         search_controls = [
             sample.control
             for sample in samples
@@ -617,15 +655,24 @@ class RekordboxUIAdapter:
         try:
             root.set_focus()
             search.click_input()
+            time.sleep(0.08)
             # Clear and paste as two settled operations. Rekordbox applies its
             # browser filter asynchronously; a combined Ctrl+A/Ctrl+V could
             # leave the previous result rows visible long enough to be
             # mistaken for the new query, and restoring the clipboard
             # immediately could race the paste on busy UI threads.
-            send_keys("^a{BACKSPACE}")
+            # Rekordbox's QML search field intermittently treats Ctrl+A as a
+            # browser-level shortcut and leaves an old query selected only in
+            # part. End then Shift+Home reliably selects the entire one-line
+            # value before deletion.
+            send_keys("{END}")
             time.sleep(0.08)
-            send_keys("^v")
+            send_keys("+{HOME}")
+            time.sleep(0.08)
+            send_keys("{BACKSPACE}")
             time.sleep(0.12)
+            send_keys("^v")
+            time.sleep(0.25)
         finally:
             self._restore_clipboard_text(previous)
 
@@ -1000,6 +1047,40 @@ class RekordboxUIAdapter:
         samples, window_width = self._sample_controls(root, descendants)
         image = self._capture_focused(root)
         return self._deck_snapshot(samples, image, deck, window_width)
+
+    def transport_status(self) -> dict[str, Any]:
+        """Read deck identity, clock, and BPM without focusing or capturing.
+
+        This intentionally omits pixel-derived mixer/mode state. It is safe for
+        the standalone app's idle watcher and cannot minimize another window.
+        """
+        root = self._root()
+        descendants = self._transport_controls(root)
+        samples, window_width = self._sample_controls(root, descendants)
+        window_height = root.rectangle().height()
+        passive_image = Image.new(
+            "RGB",
+            (max(1, window_width), max(1, window_height)),
+        )
+        decks = []
+        for deck in (1, 2):
+            snapshot = self._deck_snapshot(
+                samples,
+                passive_image,
+                deck,
+                window_width,
+            )
+            decks.append(
+                {
+                    "deck": snapshot.deck,
+                    "title": snapshot.title,
+                    "artist": snapshot.artist,
+                    "bpm": snapshot.bpm,
+                    "key": snapshot.key,
+                    "elapsed_seconds": snapshot.elapsed_seconds,
+                }
+            )
+        return {"mode": None, "decks": decks}
 
     def deck_is_playing(
         self,

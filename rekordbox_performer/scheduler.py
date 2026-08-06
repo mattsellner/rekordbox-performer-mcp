@@ -193,8 +193,15 @@ class TransitionScheduler:
                     index += 1
                 target = started + at_ms / 1000
                 delay = target - time.monotonic()
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                # Windows' default asyncio timer can overshoot a musical
+                # boundary by 15-30 ms. Sleep most of the interval, then use a
+                # short cooperative high-resolution tail so MIDI dispatch is
+                # consistently inside the 20 ms QA gate.
+                precision_tail = 0.025
+                if delay > precision_tail:
+                    await asyncio.sleep(delay - precision_tail)
+                while time.monotonic() < target:
+                    await asyncio.sleep(0)
                 if not self.engine.is_armed():
                     raise RuntimeError("Live MIDI control became disarmed")
 

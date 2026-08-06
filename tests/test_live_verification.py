@@ -11,6 +11,7 @@ from rekordbox_performer.intelligence import (
     MusicalEvent,
     TransitionCard,
 )
+from rekordbox_performer.set_runner import TempoPlan
 
 
 def card() -> TransitionCard:
@@ -96,6 +97,8 @@ class OpeningProfileStore:
 class OpeningUI:
     def __init__(self, incoming_bpm: float = 128.0) -> None:
         self.incoming_bpm = incoming_bpm
+        self.sync = {1: True, 2: True}
+        self.quantize = {1: True, 2: True}
 
     def status(self) -> dict:
         return {
@@ -105,16 +108,16 @@ class OpeningUI:
                     "title": "Outgoing",
                     "elapsed_seconds": 0,
                     "bpm": 128.0,
-                    "beat_sync_enabled": True,
-                    "quantize_enabled": True,
+                    "beat_sync_enabled": self.sync[1],
+                    "quantize_enabled": self.quantize[1],
                 },
                 {
                     "deck": 2,
                     "title": "Incoming",
                     "elapsed_seconds": 0,
                     "bpm": self.incoming_bpm,
-                    "beat_sync_enabled": True,
-                    "quantize_enabled": True,
+                    "beat_sync_enabled": self.sync[2],
+                    "quantize_enabled": self.quantize[2],
                 },
             ]
         }
@@ -140,15 +143,24 @@ class OpeningSession:
 
 def _install_opening_fakes(monkeypatch, *, incoming_bpm: float = 128.0):
     engine = OpeningEngine()
+    ui = OpeningUI(incoming_bpm)
     monkeypatch.setattr(server, "profile_store", OpeningProfileStore())
-    monkeypatch.setattr(server, "rekordbox_ui", OpeningUI(incoming_bpm))
+    monkeypatch.setattr(server, "rekordbox_ui", ui)
     monkeypatch.setattr(server, "deck_observer", CompletionObserver())
     monkeypatch.setattr(server, "engine", engine)
     monkeypatch.setattr(server, "live_state", server.LiveState())
     monkeypatch.setattr(server, "set_sessions", OpeningSession())
 
     async def modes(**kwargs):
-        return {"deck": kwargs["deck"], "changed": False, "actions": []}
+        deck = kwargs["deck"]
+        changed = False
+        if kwargs.get("beat_sync") is not None:
+            changed = changed or ui.sync[deck] != kwargs["beat_sync"]
+            ui.sync[deck] = kwargs["beat_sync"]
+        if kwargs.get("quantize") is not None:
+            changed = changed or ui.quantize[deck] != kwargs["quantize"]
+            ui.quantize[deck] = kwargs["quantize"]
+        return {"deck": deck, "changed": changed, "actions": []}
 
     async def master(deck):
         return {
@@ -336,7 +348,6 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
         "eq_mid",
         "eq_low",
         "filter",
-        "tempo",
         "fx_wet_dry",
         "channel_fader",
         "gain",
@@ -344,10 +355,145 @@ def test_atomic_opening_sets_master_after_launch_and_arms_scheduled_job(
         "eq_mid",
         "eq_low",
         "filter",
-        "tempo",
         "fx_wet_dry",
+        "tempo",
+        "tempo",
+        "tempo",
+        "tempo",
+        "tempo",
+        "tempo",
         "master",
     ]
+
+
+def test_atomic_opening_disables_sync_before_launch_then_uses_native_tempo(
+    monkeypatch,
+) -> None:
+    _install_opening_fakes(monkeypatch, incoming_bpm=130.0)
+    ui = server.rekordbox_ui
+    order = []
+
+    original_modes = server.ensure_deck_modes
+
+    async def modes(**kwargs):
+        order.append(f"sync:{kwargs['deck']}:{kwargs.get('beat_sync')}")
+        return await original_modes(**kwargs)
+
+    async def launch(**kwargs):
+        order.append("launch")
+        assert ui.sync == {1: False, 2: False}
+        return {"live_state": {"playing": True}}
+
+    refresh_count = 0
+
+    async def refresh(**kwargs):
+        nonlocal refresh_count
+        refresh_count += 1
+        order.append(f"refresh:{refresh_count}")
+        assert "launch" in order
+        return {
+            "outgoing": {"playing": True, "bpm": 128.0},
+            "incoming": {"playing": False, "bpm": 130.0},
+        }
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "native-opening",
+                "execution_id": "native-opening",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 999.0,
+            },
+        }
+
+    monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            execution_id="native-opening",
+        )
+    )
+
+    assert result["ready"] is True
+    assert result["opening_native_bpm"] == 128.0
+    assert order[:3] == ["sync:1:False", "sync:2:False", "launch"]
+    assert order.index("refresh:1") < order.index("sync:1:True")
+    assert ui.sync == {1: True, 2: True}
+
+
+def test_atomic_opening_aborts_if_rekordbox_changes_opening_tempo(
+    monkeypatch,
+) -> None:
+    _install_opening_fakes(monkeypatch, incoming_bpm=130.0)
+
+    async def launch(**kwargs):
+        return {"live_state": {"playing": True}}
+
+    async def refresh(**kwargs):
+        return {
+            "outgoing": {"playing": True, "bpm": 130.0},
+            "incoming": {"playing": False, "bpm": 130.0},
+        }
+
+    async def schedule(**kwargs):
+        raise AssertionError("a non-native opening must never be scheduled")
+
+    monkeypatch.setattr(server, "launch_staged_track", launch)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.launch_and_schedule_opening_transition(
+            card=opening_card(),
+            outgoing_title="Outgoing",
+            incoming_title="Incoming",
+            execution_id="wrong-opening-tempo",
+        )
+    )
+
+    assert result["ready"] is False
+    assert result["aborted_after_launch"] is True
+    assert "did not start at its native BPM" in result["errors"][0]
+
+
+def test_tempo_ramp_brackets_soft_takeover_pickup(monkeypatch) -> None:
+    class TempoEngine:
+        def __init__(self) -> None:
+            self.values = []
+
+        async def send_action(self, action, parameters):
+            assert action == "tempo"
+            self.values.append(parameters["value"])
+            return [parameters["value"]]
+
+    async def no_sleep(_seconds):
+        return None
+
+    engine = TempoEngine()
+    monkeypatch.setattr(server, "engine", engine)
+    monkeypatch.setattr(server.asyncio, "sleep", no_sleep)
+    plan = TempoPlan(target_bpm=122.5, duration_bars=32)
+
+    result = asyncio.run(
+        server._acquire_tempo_soft_takeover(
+            plan=plan,
+            deck=2,
+            native_bpm=123.0,
+            live_bpm=121.0,
+        )
+    )
+
+    current = plan.control_value(native_bpm=123.0, bpm=121.0)
+    assert engine.values == [current - 0.02, current + 0.02, current]
+    assert result["pickup_values"] == engine.values
 
 
 def test_atomic_opening_prepares_and_verifies_hot_cue_before_playback(
@@ -563,6 +709,70 @@ def test_rolling_scheduler_skips_blind_master_toggle_and_requires_job(
     assert master_calls == [1]
 
 
+def test_rolling_scheduler_observes_clock_after_master_verification(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(server, "profile_store", OpeningProfileStore())
+    order = []
+
+    async def stage(**kwargs):
+        return {"verified": True, "already_loaded": True}
+
+    async def verify(**kwargs):
+        return {"verified": True}
+
+    async def master(deck):
+        order.append("master")
+        return {
+            "deck": deck,
+            "changed": False,
+            "before": {"target": True, "other": False},
+            "after": {"target": True, "other": False},
+            "messages": [],
+        }
+
+    async def refresh(**kwargs):
+        order.append("refresh")
+        assert order[0] == "master"
+        return {"outgoing": {"playing": True}, "incoming": {"playing": False}}
+
+    async def modes(**kwargs):
+        return {"deck": kwargs["deck"], "changed": False, "actions": []}
+
+    async def schedule(**kwargs):
+        return {
+            "ready": True,
+            "job": {
+                "id": "ordered-job",
+                "execution_id": "ordered-rolling",
+                "status": "running",
+                "event_count": 5,
+                "control_reserved_until_monotonic": 789.0,
+            },
+        }
+
+    monkeypatch.setattr(server, "_stage_track", stage)
+    monkeypatch.setattr(server, "verify_hot_cue", verify)
+    monkeypatch.setattr(server, "ensure_master_deck", master)
+    monkeypatch.setattr(server, "refresh_transition_state", refresh)
+    monkeypatch.setattr(server, "ensure_deck_modes", modes)
+    monkeypatch.setattr(server, "perform_transition_card", schedule)
+
+    result = asyncio.run(
+        server.stage_and_schedule_transition_card(
+            card=card(),
+            incoming_title="Incoming",
+            incoming_artist="Artist",
+            incoming_cue=1,
+            incoming_cue_time_ms=10_000,
+            execution_id="ordered-rolling",
+        )
+    )
+
+    assert result["ready"] is True
+    assert order == ["master", "refresh", "refresh"]
+
+
 def test_rolling_scheduler_accepts_verified_file_start_without_hot_cue(
     monkeypatch,
 ) -> None:
@@ -734,6 +944,31 @@ def test_sync_guard_cancels_before_fader_rise_on_live_bpm_mismatch(
     assert engine.actions[-3:] == ["channel_fader", "eq_low", "cue"]
 
 
+def test_sync_guard_status_capture_does_not_block_scheduler_loop(
+    monkeypatch,
+) -> None:
+    class SlowUI:
+        @staticmethod
+        def status():
+            time.sleep(0.08)
+            return {"decks": []}
+
+        @staticmethod
+        def invalidate_status_cache():
+            pass
+
+    monkeypatch.setattr(server, "rekordbox_ui", SlowUI())
+    monkeypatch.setattr(server, "deck_observer", CompletionObserver())
+
+    async def scenario() -> None:
+        capture = asyncio.create_task(server._guard_status(invalidate=True))
+        await asyncio.sleep(0.01)
+        assert capture.done() is False
+        await capture
+
+    asyncio.run(scenario())
+
+
 def test_sync_guard_rejects_transport_prearmed_before_phrase_beat_one() -> None:
     with pytest.raises(RuntimeError, match="exact phrase beat-1 boundary"):
         server._arm_sync_guard(
@@ -825,8 +1060,9 @@ def test_sync_guard_repairs_two_beat_bar_error_before_fader_rise(
     assert "beat_jump_2_forward" in engine.actions
     assert server.sync_guard_status["repair-job"]["status"] == "passed"
     assert (
-        server.sync_guard_status["repair-job"]
-        ["bar_alignment_correction"]["after"]["error_beats"]
+        server.sync_guard_status["repair-job"]["bar_alignment_correction"]["after"][
+            "error_beats"
+        ]
         == 0
     )
 

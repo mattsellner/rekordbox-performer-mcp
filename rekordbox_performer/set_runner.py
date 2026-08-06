@@ -107,9 +107,13 @@ class AutonomousSetPlan(BaseModel):
     opening: TrackLoadSpec
     transitions: list[TransitionOption] = Field(min_length=1)
     target_track_count: int = Field(ge=2, le=100)
-    stage_deadline_bars: int = Field(default=32, ge=16, le=128)
-    reserve_deadline_bars: int = Field(default=16, ge=8, le=64)
-    rescue_loop_trigger_bars: int = Field(default=8, ge=4, le=16)
+    # Runtime work begins while there is still musical room to recover from a
+    # slow Rekordbox UI scan.  The old 32/16/8 defaults left only ~15 seconds
+    # at house tempos for a rescue loop and reproduced exactly the dead-air
+    # failure this runner exists to prevent.
+    stage_deadline_bars: int = Field(default=64, ge=16, le=128)
+    reserve_deadline_bars: int = Field(default=32, ge=8, le=64)
+    rescue_loop_trigger_bars: int = Field(default=16, ge=4, le=32)
     rescue_loop_beats: Literal[4, 8, 16] = 16
     retry_limit: int = Field(default=3, ge=1, le=10)
     tempo_strategy: Literal["auto", "manual", "hold"] = "auto"
@@ -142,9 +146,7 @@ class AutonomousSetPlan(BaseModel):
                 key=lambda option: option.priority,
             )
             if not choices:
-                raise ValueError(
-                    f"no transition option leaves planned track {current}"
-                )
+                raise ValueError(f"no transition option leaves planned track {current}")
             current = choices[0].incoming.track_id
             if current in visited:
                 raise ValueError("primary transition path contains a cycle")
@@ -198,9 +200,8 @@ class AutonomousSetPlan(BaseModel):
         if self.tempo_strategy == "hold" or abs(total_change) < 0.05:
             return self
         if self.tempo_strategy == "manual":
-            if (
-                abs(total_change) >= self.tempo_arc_minimum_change_bpm
-                and not any(option.tempo_after is not None for option in primary)
+            if abs(total_change) >= self.tempo_arc_minimum_change_bpm and not any(
+                option.tempo_after is not None for option in primary
             ):
                 raise ValueError(
                     "manual tempo strategy spans a material BPM change but "
@@ -258,9 +259,14 @@ class AutonomousSetState(BaseModel):
     played_track_ids: list[str]
     active_job_id: str | None = None
     active_option_id: str | None = None
+    staged_option_id: str | None = None
+    transition_start_at: float | None = None
+    transition_critical_at: float | None = None
+    pending_redirect: AutonomousSetPlan | None = None
     attempted_options: dict[str, int] = Field(default_factory=dict)
     transition_jobs: list[str] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     rescue_loop_active: bool = False
     rescue_loop_deck: int | None = None
     last_remaining_bars: float | None = None
@@ -269,6 +275,7 @@ class AutonomousSetState(BaseModel):
 
 
 ScheduleCallback = Callable[[TransitionOption, bool], Awaitable[dict[str, Any]]]
+PrestageCallback = Callable[[TransitionOption], Awaitable[dict[str, Any]]]
 StatusCallback = Callable[[str], dict[str, Any]]
 QaCallback = Callable[[str], dict[str, Any]]
 RemainingCallback = Callable[[str, int], Awaitable[float]]
@@ -286,6 +293,7 @@ class AutonomousSetRunner:
         path: Path,
         *,
         schedule: ScheduleCallback,
+        prestage: PrestageCallback | None = None,
         job_status: StatusCallback,
         job_qa: QaCallback,
         remaining_bars: RemainingCallback,
@@ -297,6 +305,7 @@ class AutonomousSetRunner:
     ) -> None:
         self.path = path
         self.schedule = schedule
+        self.prestage = prestage or self._noop_prestage
         self.job_status = job_status
         self.job_qa = job_qa
         self.remaining_bars = remaining_bars
@@ -307,6 +316,10 @@ class AutonomousSetRunner:
         self.poll_seconds = poll_seconds
         self.task: asyncio.Task[None] | None = None
         self.state: AutonomousSetState | None = self._read()
+
+    @staticmethod
+    async def _noop_prestage(_option: TransitionOption) -> dict[str, Any]:
+        return {"ready": True, "skipped": True}
 
     def _read(self) -> AutonomousSetState | None:
         if not self.path.exists():
@@ -346,7 +359,12 @@ class AutonomousSetRunner:
         self._write()
         return self.public()
 
-    def start_with_job(self, option_id: str, job_id: str) -> dict[str, Any]:
+    def start_with_job(
+        self,
+        option_id: str,
+        job_id: str,
+        schedule: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.state is None:
             raise RuntimeError("no autonomous set is prepared")
         if self.task and not self.task.done():
@@ -359,6 +377,7 @@ class AutonomousSetRunner:
             self.state.attempted_options.get(option.id, 0) + 1
         )
         self.state.transition_jobs.append(job_id)
+        self._set_transition_timing(option, schedule or {})
         self._write()
         self.task = asyncio.create_task(self._run())
         return self.public()
@@ -389,19 +408,133 @@ class AutonomousSetRunner:
             return {"active": False}
         return {
             "active": self.state.status in {"running", "recovering"},
-            **self.state.model_dump(exclude={"plan"}),
+            **self.state.model_dump(exclude={"plan", "pending_redirect"}),
             "plan_name": self.state.plan.name,
             "target_track_count": self.state.plan.target_track_count,
+            "steering_queued": self.state.pending_redirect is not None,
+            "steering_target_track_id": (
+                self._primary_path_ids(self.state.pending_redirect)[-1]
+                if self.state.pending_redirect is not None
+                else None
+            ),
             "task_running": bool(self.task and not self.task.done()),
         }
+
+    @staticmethod
+    def _primary_path_ids(plan: AutonomousSetPlan) -> list[str]:
+        result = [plan.opening.track_id]
+        current = plan.opening.track_id
+        for _ in range(plan.target_track_count - 1):
+            option = min(
+                (
+                    item
+                    for item in plan.transitions
+                    if item.card.outgoing_track_id == current
+                ),
+                key=lambda item: item.priority,
+            )
+            result.append(option.incoming.track_id)
+            current = option.incoming.track_id
+        return result
+
+    def _project_redirect(self, future: AutonomousSetPlan) -> AutonomousSetPlan:
+        assert self.state is not None
+        prefix_ids = list(self.state.played_track_ids)
+        if self.state.active_option_id is not None:
+            active = self._option(self.state.active_option_id)
+            if active.incoming.track_id != future.opening.track_id:
+                raise ValueError(
+                    "steering must begin after the already-armed incoming track"
+                )
+            if prefix_ids[-1] != active.incoming.track_id:
+                prefix_ids.append(active.incoming.track_id)
+        elif prefix_ids[-1] != future.opening.track_id:
+            raise ValueError("steering plan does not begin at the current track")
+
+        prefix: list[TransitionOption] = []
+        for outgoing, incoming in zip(prefix_ids, prefix_ids[1:]):
+            options = [
+                item
+                for item in self.state.plan.transitions
+                if item.card.outgoing_track_id == outgoing
+                and item.incoming.track_id == incoming
+            ]
+            if not options:
+                raise ValueError(
+                    f"existing set plan does not contain {outgoing} -> {incoming}"
+                )
+            prefix.append(min(options, key=lambda item: item.priority))
+
+        payload = self.state.plan.model_dump()
+        payload.update(
+            {
+                "name": f"{self.state.plan.name} -> {future.name}",
+                "transitions": [
+                    item.model_dump() for item in [*prefix, *future.transitions]
+                ],
+                "target_track_count": len(prefix_ids) + future.target_track_count - 1,
+                "tempo_target_bpm": future.tempo_target_bpm,
+            }
+        )
+        return AutonomousSetPlan.model_validate(payload)
+
+    def queue_redirect(self, future: AutonomousSetPlan) -> dict[str, Any]:
+        """Queue a new route after the handoff that is already armed."""
+        if self.state is None or self.state.status not in {"running", "recovering"}:
+            raise RuntimeError("an autonomous set must be running before steering")
+        if self.state.active_option_id is None:
+            raise RuntimeError(
+                "wait until the next transition is armed before steering the set"
+            )
+        projected = self._project_redirect(future)
+        self.state.pending_redirect = future
+        self._write()
+        return {
+            "queued": True,
+            "runner": self.public(),
+            "projected_plan": projected.model_dump(),
+        }
+
+    def _apply_pending_redirect(self) -> None:
+        assert self.state is not None
+        future = self.state.pending_redirect
+        if future is None:
+            return
+        if future.opening.track_id != self.state.current_track_id:
+            return
+        self.state.plan = self._project_redirect(future)
+        self.state.pending_redirect = None
+        self.state.staged_option_id = None
+        valid_ids = {item.id for item in self.state.plan.transitions}
+        self.state.attempted_options = {
+            option_id: attempts
+            for option_id, attempts in self.state.attempted_options.items()
+            if option_id in valid_ids
+        }
+        self._write()
 
     def _option(self, option_id: str) -> TransitionOption:
         assert self.state is not None
         return next(
-            option
-            for option in self.state.plan.transitions
-            if option.id == option_id
+            option for option in self.state.plan.transitions if option.id == option_id
         )
+
+    def _set_transition_timing(
+        self,
+        option: TransitionOption,
+        scheduled: dict[str, Any],
+    ) -> None:
+        assert self.state is not None
+        delay_ms = scheduled.get("start_delay_ms")
+        bpm = scheduled.get("bpm")
+        if delay_ms is None or bpm is None or float(bpm) <= 0:
+            self.state.transition_start_at = None
+            self.state.transition_critical_at = None
+            return
+        transition_start = time.time() + float(delay_ms) / 1000.0
+        critical_seconds = option.card.critical_bar_offset * 4 * 60.0 / float(bpm)
+        self.state.transition_start_at = transition_start
+        self.state.transition_critical_at = transition_start + critical_seconds
 
     def _choices(self) -> list[TransitionOption]:
         assert self.state is not None
@@ -474,7 +607,10 @@ class AutonomousSetRunner:
         assert self.state is not None
         try:
             while True:
-                if len(self.state.played_track_ids) >= self.state.plan.target_track_count:
+                if (
+                    len(self.state.played_track_ids)
+                    >= self.state.plan.target_track_count
+                ):
                     self.state.status = "completed"
                     self._write()
                     self.finish("completed")
@@ -494,16 +630,69 @@ class AutonomousSetRunner:
                         self.state.played_track_ids.append(option.incoming.track_id)
                         self.state.active_job_id = None
                         self.state.active_option_id = None
+                        self.state.transition_start_at = None
+                        self.state.transition_critical_at = None
                         self.state.rescue_loop_active = False
                         self.state.rescue_loop_deck = None
                         self.state.status = "running"
                         self._write()
+                        # A steering request never alters the handoff that was
+                        # already armed.  Apply it only now, after that job has
+                        # passed QA and its incoming track is authoritative.
+                        self._apply_pending_redirect()
+                        # The next deck must be loaded immediately after it is
+                        # retired.  A tempo ramp may take 32 bars; awaiting it
+                        # before staging violated the rolling two-track lead
+                        # and could consume the entire following transition
+                        # window.  Stage and ramp concurrently, then compile
+                        # against the final tempo clock.
+                        tempo_task = None
                         if option.tempo_after is not None:
-                            await self.run_tempo(
-                                option.tempo_after,
-                                self.state.current_deck,
-                                option.incoming.track_id,
+                            tempo_task = asyncio.create_task(
+                                self.run_tempo(
+                                    option.tempo_after,
+                                    self.state.current_deck,
+                                    option.incoming.track_id,
+                                )
                             )
+                        if (
+                            len(self.state.played_track_ids)
+                            < self.state.plan.target_track_count
+                        ):
+                            next_choices = self._choices()
+                            if next_choices:
+                                next_option = next_choices[0]
+                                try:
+                                    staged = await self.prestage(next_option)
+                                    if staged.get("ready") is not True:
+                                        raise RuntimeError(
+                                            "; ".join(staged.get("errors", []))
+                                            or "next track was not staged"
+                                        )
+                                    self.state.staged_option_id = next_option.id
+                                    self._write()
+                                except Exception as exc:
+                                    # Staging is retried by the normal atomic
+                                    # schedule path.  Keep the audible track
+                                    # and route alive; never burn the option's
+                                    # retry budget for an early preload.
+                                    self.state.failures.append(
+                                        f"{next_option.id}: early staging: {exc}"
+                                    )
+                                    self._write()
+                        if tempo_task is not None:
+                            try:
+                                await tempo_task
+                            except Exception as exc:  # tempo is noncritical
+                                # A rejected tempo CC must not strand a safe,
+                                # audible deck or prevent the already-staged
+                                # next transition. Preserve the musical route
+                                # at its current BPM and surface the degraded
+                                # energy arc separately from hard failures.
+                                self.state.warnings.append(
+                                    f"{option.id}: tempo ramp skipped: {exc}"
+                                )
+                                self._write()
                         continue
                     error = "; ".join(qa.get("faults", [])) or job.get("error")
                     self.advance(self.state.active_job_id, False, error)
@@ -544,8 +733,20 @@ class AutonomousSetRunner:
                     job_id = job.get("id")
                     if not job_id:
                         raise RuntimeError("scheduled transition has no job ID")
+                    if (
+                        self.state.pending_redirect is not None
+                        and option.incoming.track_id
+                        != self.state.pending_redirect.opening.track_id
+                    ):
+                        self.state.failures.append(
+                            "queued steering was cancelled because recovery "
+                            "selected a different incoming track"
+                        )
+                        self.state.pending_redirect = None
                     self.state.active_option_id = option.id
                     self.state.active_job_id = job_id
+                    self.state.staged_option_id = option.id
+                    self._set_transition_timing(option, scheduled)
                     self.state.transition_jobs.append(job_id)
                     self.state.status = "running"
                     if self.state.rescue_loop_active:

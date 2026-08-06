@@ -1,6 +1,7 @@
-# Rekordbox Performer
+# RekordBot
 
-Safety-first live Rekordbox control over a dedicated virtual MIDI port.
+An autonomous Windows DJ and safety-first Rekordbox control engine operating
+over a dedicated virtual MIDI port.
 
 > [!WARNING]
 > This is an experimental prototype for supervised performance. Keep a
@@ -12,6 +13,77 @@ Safety-first live Rekordbox control over a dedicated virtual MIDI port.
 
 The DDJ-FLX4 remains connected as the Hardware Unlock device and manual control
 surface. This server does not modify the Rekordbox database or process audio.
+
+## RekordBot for Windows
+
+RekordBot moves the DJ and TransitionKing decisions into the local
+Rekordbox runtime. Codex is not consulted between tracks and can be closed
+without interrupting the set. RekordBot:
+
+- selects a complete route from Tier-A analyzed tracks before playback;
+- compiles each transition from verified phrase, cue, bass-energy, key, and
+  BPM evidence;
+- starts the opener at its own native BPM before enabling Beat Sync;
+- keeps the outgoing channel full while the incoming channel establishes,
+  swaps bass only on a verified incoming bass phrase, and retires the outgoing
+  deck afterward;
+- preloads the following track while a gradual tempo ramp is running;
+- protects 64/32/16-bar staging, reserve, and rescue deadlines locally; and
+- exposes a compact always-on-top window plus system-tray controls for status,
+  Hold Current, Stop After Current, and Emergency Stop.
+
+Only one process may own the virtual MIDI port. Disconnect the Codex Performer
+before starting a live standalone set. Rekordbox must remain open in Performance
+mode with the current MIDI mapping active and the FLX4 selected as its audio
+device.
+
+Run from source:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[app]"
+.\.venv\Scripts\rekordbot.exe
+```
+
+Build the Windows executable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-app.ps1
+```
+
+The executable is created at `dist\RekordBot\RekordBot.exe`. Closing the
+window sends it to the system tray, so the local engine continues running. The
+app refuses to exit from the tray while a set is active; use a normal or
+emergency stop first.
+
+The existing `Codex Rekordbox Performer` virtual MIDI port, MIDI mapping file,
+and `%LOCALAPPDATA%\rekordbox-performer` profile store intentionally retain
+their compatibility names. Upgrading to RekordBot therefore preserves the
+current Rekordbox mapping and analyzed-track library.
+
+### RekordBot workflow
+
+The Rekordbox browser highlight is not a stable track identity. To choose an
+opener, use either of these explicit paths:
+
+1. Load the intended opener onto stopped Deck 1 in Rekordbox, then click
+   **Use loaded Deck 1**. The app observes the deck title and resolves it to one
+   Tier-A prepared profile.
+2. Choose an exact title/artist from the **Opening track** prepared-library
+   dropdown. Typing part of a title or artist is accepted only when it resolves
+   to one unambiguous ready profile.
+
+Then set **Set length** and optionally **Finish near BPM**, choose a
+**Destination track**, or select a direction such as **More downtempo**,
+**More energetic**, **Deeper / darker**, **More vocal**, or
+**More instrumental**. Click **Plan, preflight, and start set**. The app connects
+MIDI at that point, verifies all tracks and transitions, and only then starts
+the opener.
+
+During playback, the destination, vibe, and **Arrive over next transitions**
+controls remain available. Click **Queue steering** to redirect the set over
+two to six transitions. The transition already armed is never replaced; the
+new route begins with its incoming track, which preserves phrase timing and
+the rolling two-track safety lead.
 
 ## Performance-intelligence workflow
 
@@ -216,7 +288,7 @@ method. Restaging that track later in the same set tries the proven query first,
 skips a known-failing MIDI load when appropriate, and reuses coordinates from
 the current browser snapshot. Preflight each planned track once before playback
 so retired-deck reloads take this optimized path. The cache is intentionally
-discarded when Codex/Rekordbox Performer restarts.
+discarded when Codex/RekordBot Performer restarts.
 
 ## Telemetry boundary
 
@@ -276,7 +348,7 @@ The reliability upgrade moves lifecycle ownership into Performer:
 4. After each verified handoff, the runner immediately selects, stages, and
    schedules the next option locally. It advances only after transport,
    fader/EQ, effects/stems cleanup, and pre-audible bar-alignment QA pass.
-5. Before every staging retry, the runner measures remaining bars. At eight
+5. Before every staging retry, the runner measures remaining bars. At sixteen
    bars or less it creates a 4-, 8-, or 16-beat loop on the next phrase
    downbeat and verifies actual transport repetition. The accepted transition
    card releases that loop on bar 0 beat 1. This prevents an exhausted outgoing
@@ -341,7 +413,7 @@ py -3.12 -m venv .venv
 5. Import `mapping/Codex-Rekordbox-Performer.midi.csv`. The fallback
    `mapping/rekordbox-midi-learn.csv` can be used for manual MIDI Learn.
 6. Keep channel faders down and decks stopped during mapping.
-7. Register `rekordbox-performer` as a stdio MCP server in your MCP client.
+7. Register `rekordbot` as a stdio MCP server in your MCP client.
 8. Call `list_midi_outputs`, `connect_midi`, and `control_status`.
 9. Enable MIX POINT LINK in Preferences when available.
 10. Build an `AutonomousSetPlan` and call `preflight_autonomous_set` while both

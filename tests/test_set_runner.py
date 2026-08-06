@@ -10,7 +10,9 @@ from rekordbox_performer.set_runner import (
 )
 
 
-def option(option_id: str, outgoing: str, incoming: str, out_deck: int) -> TransitionOption:
+def option(
+    option_id: str, outgoing: str, incoming: str, out_deck: int
+) -> TransitionOption:
     in_deck = 2 if out_deck == 1 else 1
     return TransitionOption(
         id=option_id,
@@ -81,9 +83,7 @@ def test_autonomous_runner_advances_without_client_round_trips(tmp_path) -> None
             job_status=lambda job_id: jobs[job_id],
             job_qa=lambda job_id: {"passed": True, "faults": []},
             remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
-            engage_loop=lambda deck, beats: asyncio.sleep(
-                0, result={"verified": True}
-            ),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
             run_tempo=lambda plan, deck, track_id: asyncio.sleep(
                 0, result={"status": "completed"}
             ),
@@ -119,9 +119,7 @@ def test_autonomous_runner_completes_eight_tracks_after_transient_load_failure(
                 incoming,
                 1 if index % 2 == 0 else 2,
             )
-            for index, (outgoing, incoming) in enumerate(
-                zip(track_ids, track_ids[1:])
-            )
+            for index, (outgoing, incoming) in enumerate(zip(track_ids, track_ids[1:]))
         ]
         plan = AutonomousSetPlan(
             name="eight-track endurance",
@@ -147,9 +145,7 @@ def test_autonomous_runner_completes_eight_tracks_after_transient_load_failure(
             job_status=lambda job_id: jobs[job_id],
             job_qa=lambda job_id: {"passed": True, "faults": []},
             remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
-            engage_loop=lambda deck, beats: asyncio.sleep(
-                0, result={"verified": True}
-            ),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
             run_tempo=lambda plan, deck, track_id: asyncio.sleep(
                 0, result={"status": "completed"}
             ),
@@ -198,9 +194,7 @@ def test_stale_observations_do_not_exhaust_transition_retry_budget(tmp_path) -> 
                 else {"passed": True, "faults": []}
             ),
             remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
-            engage_loop=lambda deck, beats: asyncio.sleep(
-                0, result={"verified": True}
-            ),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
             run_tempo=lambda plan, deck, track_id: asyncio.sleep(
                 0, result={"status": "completed"}
             ),
@@ -316,13 +310,10 @@ def test_auto_tempo_arc_rises_gradually_across_the_primary_path() -> None:
         tempo_ramp_bars=24,
     )
 
-    resolved = plan.materialize_tempo_arc(
-        {"a": 120, "b": 121, "c": 125, "d": 129}
-    )
+    resolved = plan.materialize_tempo_arc({"a": 120, "b": 121, "c": 125, "d": 129})
 
     assert [
-        transition.tempo_after.target_bpm
-        for transition in resolved.transitions
+        transition.tempo_after.target_bpm for transition in resolved.transitions
     ] == [123, 126, 129]
     assert all(
         transition.tempo_after.duration_bars == 24
@@ -408,9 +399,7 @@ def test_runner_executes_post_handoff_tempo_plan(tmp_path) -> None:
             job_status=lambda job_id: jobs[job_id],
             job_qa=lambda job_id: {"passed": True, "faults": []},
             remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
-            engage_loop=lambda deck, beats: asyncio.sleep(
-                0, result={"verified": True}
-            ),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
             run_tempo=run_tempo,
             advance=lambda job_id, succeeded, error: {},
             poll_seconds=0.001,
@@ -421,5 +410,220 @@ def test_runner_executes_post_handoff_tempo_plan(tmp_path) -> None:
 
         assert ramps == [(123, 2, "b")]
         assert runner.public()["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_runner_prestages_next_track_while_tempo_ramp_is_running(tmp_path) -> None:
+    async def scenario() -> None:
+        first = option("a-b", "a", "b", 1)
+        first.tempo_after = TempoPlan(target_bpm=123, duration_bars=32)
+        second = option("b-c", "b", "c", 2)
+        plan = AutonomousSetPlan(
+            name="rolling lead",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[first, second],
+            target_track_count=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "completed"}}
+        prestaged = asyncio.Event()
+        timeline = []
+
+        async def prestage(next_option):
+            timeline.append(f"prestage:{next_option.id}")
+            prestaged.set()
+            return {"ready": True}
+
+        async def run_tempo(tempo, deck, track_id):
+            timeline.append("tempo:start")
+            await asyncio.wait_for(prestaged.wait(), timeout=0.1)
+            timeline.append("tempo:finish")
+            return {"status": "completed"}
+
+        async def schedule(next_option, release_loop):
+            timeline.append(f"schedule:{next_option.id}")
+            jobs["second"] = {"id": "second", "status": "completed"}
+            return {
+                "ready": True,
+                "job": jobs["second"],
+                "start_delay_ms": 1_000,
+                "bpm": 123,
+            }
+
+        runner = AutonomousSetRunner(
+            tmp_path / "rolling-lead.json",
+            schedule=schedule,
+            prestage=prestage,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: {"passed": True, "faults": []},
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
+            run_tempo=run_tempo,
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        assert timeline.index("prestage:b-c") < timeline.index("tempo:finish")
+        assert timeline.index("tempo:finish") < timeline.index("schedule:b-c")
+        assert runner.public()["staged_option_id"] == "b-c"
+        assert runner.public()["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_runner_continues_when_noncritical_tempo_ramp_is_rejected(tmp_path) -> None:
+    async def scenario() -> None:
+        first = option("a-b", "a", "b", 1)
+        first.tempo_after = TempoPlan(target_bpm=123, duration_bars=32)
+        second = option("b-c", "b", "c", 2)
+        plan = AutonomousSetPlan(
+            name="tempo fallback",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[first, second],
+            target_track_count=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "completed"}}
+        scheduled = []
+
+        async def schedule(next_option, release_loop):
+            scheduled.append(next_option.id)
+            jobs["second"] = {"id": "second", "status": "completed"}
+            return {"ready": True, "job": jobs["second"]}
+
+        async def reject_tempo(_tempo, _deck, _track_id):
+            raise RuntimeError("tempo pickup was not acquired")
+
+        runner = AutonomousSetRunner(
+            tmp_path / "tempo-fallback.json",
+            schedule=schedule,
+            prestage=lambda _option: asyncio.sleep(0, result={"ready": True}),
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: {"passed": True, "faults": []},
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
+            run_tempo=reject_tempo,
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        state = runner.public()
+        assert state["status"] == "completed"
+        assert state["played_track_ids"] == ["a", "b", "c"]
+        assert scheduled == ["b-c"]
+        assert "tempo ramp skipped" in state["warnings"][0]
+        assert state["failures"] == []
+
+    asyncio.run(scenario())
+
+
+def test_runner_engages_rescue_loop_at_sixteen_bar_boundary(tmp_path) -> None:
+    async def scenario() -> None:
+        plan = AutonomousSetPlan(
+            name="sixteen bar rescue",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[option("a-b", "a", "b", 1)],
+            target_track_count=2,
+        )
+        jobs = {"opening": {"id": "opening", "status": "failed"}}
+        loops = []
+
+        async def schedule(next_option, release_loop):
+            assert release_loop is True
+            jobs["recovered"] = {"id": "recovered", "status": "completed"}
+            return {"ready": True, "job": jobs["recovered"]}
+
+        async def engage(deck, beats):
+            loops.append((deck, beats))
+            return {"verified": True}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "sixteen-bar-rescue.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: (
+                {"passed": False, "faults": ["opening failed"]}
+                if job_id == "opening"
+                else {"passed": True, "faults": []}
+            ),
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=16),
+            engage_loop=engage,
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        assert loops == [(1, 16)]
+        assert runner.public()["deadline_phase"] == "rescue"
+        assert runner.public()["status"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_runner_applies_steering_only_after_already_armed_handoff(tmp_path) -> None:
+    async def scenario() -> None:
+        original = AutonomousSetPlan(
+            name="original",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[
+                option("a-b", "a", "b", 1),
+                option("b-c", "b", "c", 2),
+            ],
+            target_track_count=3,
+        )
+        redirected = AutonomousSetPlan(
+            name="redirected",
+            opening=TrackLoadSpec(track_id="b", title="B"),
+            transitions=[
+                option("b-x", "b", "x", 2),
+                option("x-y", "x", "y", 1),
+            ],
+            target_track_count=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "completed"}}
+        scheduled = []
+
+        async def schedule(next_option, release_loop):
+            scheduled.append(next_option.id)
+            job_id = f"job-{len(scheduled)}"
+            jobs[job_id] = {"id": job_id, "status": "completed"}
+            return {"ready": True, "job": jobs[job_id]}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "steering.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: {"passed": True, "faults": []},
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(original, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        queued = runner.queue_redirect(redirected)
+
+        assert queued["queued"] is True
+        assert queued["projected_plan"]["target_track_count"] == 4
+        assert runner.public()["steering_queued"] is True
+
+        await runner.task
+
+        assert runner.public()["played_track_ids"] == ["a", "b", "x", "y"]
+        assert scheduled == ["b-x", "x-y"]
+        assert runner.public()["steering_queued"] is False
 
     asyncio.run(scenario())

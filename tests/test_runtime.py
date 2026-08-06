@@ -21,3 +21,17 @@ def test_control_lease_allows_only_one_owner(tmp_path: Path) -> None:
     second.acquire()
     assert second.status()["held_by_this_process"] is True
     second.release()
+
+
+def test_control_lease_rewrites_owner_instead_of_appending(tmp_path: Path) -> None:
+    path = tmp_path / "control.lock"
+    lease = ControlLease(path)
+
+    lease.acquire()
+    first_size = path.stat().st_size
+    lease.release()
+    lease.acquire()
+
+    assert path.stat().st_size <= first_size + 4
+    lease.release()
+    assert path.read_bytes()[1:].count(b'"pid"') == 1

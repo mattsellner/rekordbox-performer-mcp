@@ -244,8 +244,7 @@ class TrackProfile(BaseModel):
         }
         ready = all(checks.values())
         analysis_ready = all(
-            checks[name]
-            for name in ("beatgrid", "phrases", "mix_in", "mix_out")
+            checks[name] for name in ("beatgrid", "phrases", "mix_in", "mix_out")
         )
         tier = "A" if ready else "B" if analysis_ready else "C"
         return {"ready": ready, "tier": tier, "checks": checks}
@@ -255,8 +254,7 @@ class TrackProfile(BaseModel):
         kinds = {landmark.kind for landmark in self.landmarks}
         checks = {
             "beatgrid": (
-                self.beatgrid_confidence in live_confidence
-                and bool(self.beat_grid)
+                self.beatgrid_confidence in live_confidence and bool(self.beat_grid)
             ),
             "phrases": (
                 self.phrase_confidence in live_confidence
@@ -347,12 +345,7 @@ class LiveState:
         }
 
     def snapshot(self) -> dict[str, Any]:
-        return {
-            "decks": [
-                self.get(deck)
-                for deck in sorted(self.decks)
-            ]
-        }
+        return {"decks": [self.get(deck) for deck in sorted(self.decks)]}
 
 
 class MusicalEvent(BaseModel):
@@ -501,9 +494,7 @@ def bass_phrase_evidence(
             "window_bars": window_bars,
         }
     track_values = [
-        float(item.median)
-        for item in profile.bass_energy_by_bar
-        if item.median > 0
+        float(item.median) for item in profile.bass_energy_by_bar if item.median > 0
     ]
     reference = _percentile(track_values, 0.60)
     bars = [curve.get(bar) for bar in range(start_bar, start_bar + window_bars)]
@@ -527,11 +518,7 @@ def bass_phrase_evidence(
         if bar in curve
     ]
     previous_median = _percentile(previous, 0.50)
-    lift_ratio = (
-        phrase_median / previous_median
-        if previous_median > 0
-        else None
-    )
+    lift_ratio = phrase_median / previous_median if previous_median > 0 else None
     attack_ratio = attack_energy / reference if reference > 0 else 0.0
     downbeat_ratio = downbeat_energy / reference if reference > 0 else 0.0
     phrase_ratio = phrase_median / reference if reference > 0 else 0.0
@@ -613,7 +600,7 @@ def incoming_bass_handoff_evidence(
             for event in card.events
             if event.bar_offset == 0
             and event.beat_offset == 0
-            and event.action == "hot_cue"
+            and event.action in {"hot_cue", "play_pause"}
             and event.parameters.get("deck") == card.incoming_deck
         ),
         None,
@@ -622,29 +609,64 @@ def incoming_bass_handoff_evidence(
         return {
             "verified": False,
             "available": bool(incoming.bass_energy_by_bar),
-            "reason": "incoming Hot Cue phrase anchor is unavailable",
+            "reason": "incoming phrase anchor is unavailable",
         }
-    entry = next(
-        (
-            landmark
-            for landmark in incoming.landmarks
-            if landmark.cue == launch.parameters.get("cue")
-            and landmark.kind in {"mix_in", "phrase_start"}
-            and landmark.confidence in {"verified", "high"}
-        ),
-        None,
-    )
+    if launch.action == "hot_cue":
+        entry = next(
+            (
+                landmark
+                for landmark in incoming.landmarks
+                if landmark.cue == launch.parameters.get("cue")
+                and landmark.kind in {"mix_in", "phrase_start"}
+                and landmark.confidence in {"verified", "high"}
+            ),
+            None,
+        )
+    else:
+        entry = next(
+            (
+                landmark
+                for landmark in incoming.landmarks
+                if landmark.kind in {"mix_in", "phrase_start"}
+                and landmark.bar == 1
+                and (landmark.beat or 1) == 1
+                and landmark.confidence in {"verified", "high"}
+            ),
+            None,
+        )
     if entry is None:
         return {
             "verified": False,
             "available": bool(incoming.bass_energy_by_bar),
-            "reason": "incoming cue has no verified phrase landmark",
+            "reason": "incoming launch has no verified phrase landmark",
         }
-    return bass_phrase_evidence(
+    target_bar = entry.bar + card.critical_bar_offset
+    evidence = bass_phrase_evidence(
         incoming,
-        entry.bar + card.critical_bar_offset,
+        target_bar,
         window_bars=8,
     )
+    user_verified_drop = next(
+        (
+            landmark
+            for landmark in incoming.landmarks
+            if landmark.kind == "drop"
+            and landmark.bar == target_bar
+            and (landmark.beat or 1) == 1
+            and landmark.confidence == "verified"
+            and landmark.name.casefold().startswith("user verified")
+        ),
+        None,
+    )
+    if user_verified_drop is not None:
+        return {
+            **evidence,
+            "verified": True,
+            "reason": None,
+            "source": "user_verified_drop",
+            "landmark": user_verified_drop.model_dump(),
+        }
+    return evidence
 
 
 def _grid_aligned_phrases(
@@ -713,9 +735,7 @@ class ProfileStore:
                 "SELECT COUNT(*) FROM profiles"
             ).fetchone()[0]
             if profile_count == 0 and self.profile_path.exists():
-                profiles = json.loads(
-                    self.profile_path.read_text(encoding="utf-8")
-                )
+                profiles = json.loads(self.profile_path.read_text(encoding="utf-8"))
                 now = time.time()
                 connection.executemany(
                     """
@@ -770,10 +790,7 @@ class ProfileStore:
             rows = connection.execute(
                 "SELECT track_id, payload FROM profiles"
             ).fetchall()
-        return {
-            row["track_id"]: json.loads(row["payload"])
-            for row in rows
-        }
+        return {row["track_id"]: json.loads(row["payload"]) for row in rows}
 
     def _write_profiles(
         self,
@@ -847,13 +864,10 @@ class ProfileStore:
                     "beatgrid_confidence": (
                         "high" if analysis.beat_grid else "unknown"
                     ),
-                    "phrase_confidence": (
-                        "high" if phrases else "unknown"
-                    ),
+                    "phrase_confidence": ("high" if phrases else "unknown"),
                     "phrase_boundaries": phrases,
                     "bass_energy_by_bar": (
-                        analysis.bass_energy_by_bar
-                        or existing.bass_energy_by_bar
+                        analysis.bass_energy_by_bar or existing.bass_energy_by_bar
                     ),
                     "landmarks": first_phrase_landmarks,
                     "vocal_confidence": (
@@ -891,12 +905,8 @@ class ProfileStore:
                 service_uri=analysis.service_uri,
                 beat_count=analysis.beat_count or len(analysis.beat_grid),
                 beat_grid=analysis.beat_grid,
-                beatgrid_confidence=(
-                    "high" if analysis.beat_grid else "unknown"
-                ),
-                phrase_confidence=(
-                    "high" if phrases else "unknown"
-                ),
+                beatgrid_confidence=("high" if analysis.beat_grid else "unknown"),
+                phrase_confidence=("high" if phrases else "unknown"),
                 phrase_boundaries=phrases,
                 bass_energy_by_bar=analysis.bass_energy_by_bar,
                 vocal_confidence=(
@@ -936,8 +946,7 @@ class ProfileStore:
                 None,
             )
             if outro and not any(
-                landmark.kind == "mix_out"
-                for landmark in profile.landmarks
+                landmark.kind == "mix_out" for landmark in profile.landmarks
             ):
                 outro_time_ms = next(
                     (
@@ -965,10 +974,10 @@ class ProfileStore:
             ]
             strong_phrases = []
             for phrase in phrases:
-                if (
-                    phrase.beat_in_bar != 1
-                    or phrase.confidence not in {"verified", "high"}
-                ):
+                if phrase.beat_in_bar != 1 or phrase.confidence not in {
+                    "verified",
+                    "high",
+                }:
                     continue
                 evidence = bass_phrase_evidence(profile, phrase.start_bar)
                 if not evidence["verified"]:
@@ -1069,11 +1078,7 @@ class ProfileStore:
             )
             profiles[track.track_id] = profile.model_dump()
             created += 1
-        eligible_ids = [
-            track.track_id
-            for track in tracks
-            if track.bpm > 0
-        ]
+        eligible_ids = [track.track_id for track in tracks if track.bpm > 0]
         self._write_profiles(
             {
                 track_id: profiles[track_id]
@@ -1099,6 +1104,18 @@ class ProfileStore:
         if row is None:
             raise KeyError(f"No performance profile for track {track_id}")
         return TrackProfile.model_validate(json.loads(row["payload"]))
+
+    def list_profiles(self, *, ready_only: bool = False) -> list[TrackProfile]:
+        """Return prepared profiles for the standalone local DJ planner."""
+        profiles = [
+            TrackProfile.model_validate(payload)
+            for payload in self._load_profiles().values()
+        ]
+        if ready_only:
+            profiles = [profile for profile in profiles if profile.readiness()["ready"]]
+        return sorted(
+            profiles, key=lambda item: (item.artist.casefold(), item.title.casefold())
+        )
 
     def audit(self, track_ids: list[str] | None = None) -> dict[str, Any]:
         profiles = self._load_profiles()
@@ -1196,8 +1213,7 @@ def _profile_live_ready(
 
 def _card_accepts_vocal_risk(card: TransitionCard) -> bool:
     return card.vocal_risk_accepted or (
-        card.vocal_plan_verified
-        and card.intended_vocal_owner == "intentional_overlap"
+        card.vocal_plan_verified and card.intended_vocal_owner == "intentional_overlap"
     )
 
 
@@ -1216,9 +1232,7 @@ def validate_transition_card(
     bpm_delta = abs(outgoing.bpm - incoming.bpm)
     stretch_percent = bpm_delta / outgoing.bpm * 100.0
     if bpm_delta > 0.05 and not card.beat_sync_required:
-        errors.append(
-            "tempo-mismatched tracks require verified Beat Sync"
-        )
+        errors.append("tempo-mismatched tracks require verified Beat Sync")
     if (
         stretch_percent > card.max_tempo_stretch_percent
         and not card.tempo_risk_accepted
@@ -1265,9 +1279,7 @@ def validate_transition_card(
         errors.append(f"incoming profile missing {missing}")
 
     unsafe_mode_toggles = [
-        event.action
-        for event in card.events
-        if event.action in {"sync", "quantize"}
+        event.action for event in card.events if event.action in {"sync", "quantize"}
     ]
     if unsafe_mode_toggles:
         errors.append(
@@ -1275,7 +1287,9 @@ def validate_transition_card(
             "use ensure_deck_modes and re-observe first"
         )
 
-    ordered = sorted(card.events, key=lambda event: (event.bar_offset, event.beat_offset))
+    ordered = sorted(
+        card.events, key=lambda event: (event.bar_offset, event.beat_offset)
+    )
     if ordered != card.events:
         errors.append("musical events must be ordered by bar_offset and beat_offset")
 
@@ -1287,8 +1301,7 @@ def validate_transition_card(
     critical = [
         event
         for event in card.events
-        if event.bar_offset == card.critical_bar_offset
-        and event.beat_offset == 0
+        if event.bar_offset == card.critical_bar_offset and event.beat_offset == 0
     ]
     outgoing_low_cut = any(
         event.action == "eq_low"
@@ -1318,17 +1331,92 @@ def validate_transition_card(
     critical_bass_handoff = outgoing_low_cut and incoming_low_open
     verified_bass_anchor_required = drop_anchored or planned_bass_handoff
     if drop_anchored and not (outgoing_low_cut and incoming_low_open):
-        errors.append(
-            "critical downbeat lacks a simultaneous two-deck bass swap"
-        )
+        errors.append("critical downbeat lacks a simultaneous two-deck bass swap")
     if planned_bass_handoff and not critical_bass_handoff:
         errors.append(
-            "bass handoff must swap both low EQs together on the critical "
-            "downbeat"
+            "bass handoff must swap both low EQs together on the critical downbeat"
         )
-    if planned_bass_handoff and card.critical_bar_offset not in {8, 16}:
+    incoming_audible_events = [
+        event
+        for event in card.events
+        if event.action == "channel_fader"
+        and event.parameters.get("deck") == card.incoming_deck
+        and float(event.parameters.get("value", 0)) > 0
+    ]
+    audible_entry_position = (
+        min(
+            (
+                (event.bar_offset, event.beat_offset)
+                for event in incoming_audible_events
+            ),
+            default=None,
+        )
+    )
+    audible_lead_bars = (
+        None
+        if audible_entry_position is None
+        else card.critical_bar_offset - audible_entry_position[0]
+    )
+    energy_preserving_house = card.transition_family in {
+        "long_blend",
+        "bass_swap",
+    }
+    if energy_preserving_house:
+        incoming_low_closed = any(
+            event.action == "eq_low"
+            and event.parameters.get("deck") == card.incoming_deck
+            and float(event.parameters.get("value", 0)) <= -0.9
+            and event.bar_offset == 0
+            and event.beat_offset == 0
+            for event in card.events
+        )
+        if not incoming_low_closed:
+            errors.append("house handoff must launch with the incoming low EQ closed")
+        outgoing_reductions_before_swap = [
+            event
+            for event in card.events
+            if event.action == "channel_fader"
+            and event.parameters.get("deck") == card.outgoing_deck
+            and float(event.parameters.get("value", 1)) < 0.9
+            and (event.bar_offset, event.beat_offset) <= (card.critical_bar_offset, 0)
+        ]
+        if outgoing_reductions_before_swap:
+            errors.append(
+                "outgoing channel fader must stay at or above 0.9 until "
+                "after the bass handoff"
+            )
+        establish_lead = min(4, max(2, int((audible_lead_bars or 4) / 2)))
+        establish_deadline = max(0, card.critical_bar_offset - establish_lead)
+        incoming_established = any(
+            event.action == "channel_fader"
+            and event.parameters.get("deck") == card.incoming_deck
+            and float(event.parameters.get("value", 0)) >= 0.7
+            and (event.bar_offset, event.beat_offset) <= (establish_deadline, 0)
+            for event in card.events
+        )
+        if not incoming_established:
+            errors.append(
+                "incoming channel must reach at least 0.7 before the final "
+                f"{establish_lead}-bar approach to the bass handoff"
+            )
+        incoming_reductions_after_established = []
+        established = False
+        for event in card.events:
+            if (
+                event.action == "channel_fader"
+                and event.parameters.get("deck") == card.incoming_deck
+            ):
+                value = float(event.parameters.get("value", 0))
+                if value >= 0.7:
+                    established = True
+                elif established:
+                    incoming_reductions_after_established.append(event)
+        if incoming_reductions_after_established:
+            errors.append("incoming channel may not be lowered after it is established")
+    if card.transition_family == "phrase_cut" and card.critical_bar_offset > 4:
         errors.append(
-            "bass handoff must land 8 or 16 bars after the incoming cue"
+            "phrase_cut must complete within four bars; use a verified blend, "
+            "bass swap, breakdown, or loop card for a longer handoff"
         )
     bass_evidence = incoming_bass_handoff_evidence(card, incoming)
     if (
@@ -1361,17 +1449,12 @@ def validate_transition_card(
     }
     if len(launch_events) != 1:
         errors.append(
-            "incoming deck must launch exactly once "
-            "on transition bar 0 beat 1"
+            "incoming deck must launch exactly once on transition bar 0 beat 1"
         )
     else:
         launch = launch_events[0]
-        if verified_bass_anchor_required and launch.action != "hot_cue":
-            errors.append(
-                "a transition with a bass handoff requires a verified Hot Cue "
-                "on a phrase start"
-            )
-        elif (
+        file_start_entries: list[TrackLandmark] = []
+        if (
             launch.action == "hot_cue"
             and launch.parameters.get("cue") not in verified_entry_cues
         ):
@@ -1393,7 +1476,16 @@ def validate_transition_card(
                     "play_pause launch requires a high-confidence file-start "
                     "mix-in or phrase-start landmark"
                 )
+        verified_phrase_starts = {
+            (phrase.start_bar, phrase.beat_in_bar)
+            for phrase in incoming.phrase_boundaries
+            if phrase.confidence in {"verified", "high"}
+        }
         if verified_bass_anchor_required and launch.action == "hot_cue":
+            if card.critical_bar_offset not in {8, 16}:
+                errors.append(
+                    "bass handoff must land 8 or 16 bars after the incoming cue"
+                )
             entry = next(
                 (
                     landmark
@@ -1406,41 +1498,64 @@ def validate_transition_card(
             )
             if entry is not None:
                 if (entry.beat or 1) != 1:
-                    errors.append(
-                        "incoming launch cue must mark beat 1 of its phrase"
-                    )
-                verified_phrase_starts = {
-                    (phrase.start_bar, phrase.beat_in_bar)
-                    for phrase in incoming.phrase_boundaries
-                    if phrase.confidence in {"verified", "high"}
-                }
+                    errors.append("incoming launch cue must mark beat 1 of its phrase")
                 if (entry.bar, entry.beat or 1) not in verified_phrase_starts:
                     errors.append(
                         "incoming launch cue does not land on a verified "
                         "phrase boundary"
                     )
-                entry_beat = (
-                    (entry.bar - 1) * incoming.time_signature
-                    + (entry.beat or 1)
+                entry_beat = (entry.bar - 1) * incoming.time_signature + (
+                    entry.beat or 1
                 )
                 critical_beat = (
-                    entry_beat
-                    + card.critical_bar_offset * incoming.time_signature
+                    entry_beat + card.critical_bar_offset * incoming.time_signature
                 )
                 verified_bass_phrase_starts = {
-                    (landmark.bar - 1) * incoming.time_signature
-                    + (landmark.beat or 1)
+                    (landmark.bar - 1) * incoming.time_signature + (landmark.beat or 1)
                     for landmark in incoming.landmarks
                     if landmark.kind in {"drop", "bass_in"}
                     and landmark.confidence in {"verified", "high"}
-                    and (landmark.bar, landmark.beat or 1)
-                    in verified_phrase_starts
+                    and (landmark.bar, landmark.beat or 1) in verified_phrase_starts
                 }
                 if critical_beat not in verified_bass_phrase_starts:
                     errors.append(
                         "critical bass swap does not land on the downbeat of "
                         "a verified incoming drop or bass phrase"
                     )
+        elif (
+            verified_bass_anchor_required
+            and launch.action == "play_pause"
+            and file_start_entries
+        ):
+            entry = file_start_entries[0]
+            if audible_entry_position is None:
+                errors.append("file-start bass handoff never opens the incoming channel")
+            else:
+                reveal_bar_offset, reveal_beat_offset = audible_entry_position
+                audible_bar = entry.bar + reveal_bar_offset
+                if reveal_beat_offset != 0 or (audible_bar, 1) not in verified_phrase_starts:
+                    errors.append(
+                        "file-start pre-roll must become audible on beat 1 of a "
+                        "verified incoming phrase"
+                    )
+                if audible_lead_bars not in {4, 8, 16}:
+                    errors.append(
+                        "file-start pre-roll must become audible 4, 8, or 16 "
+                        "bars before the bass handoff"
+                    )
+                if reveal_bar_offset == 0 and card.critical_bar_offset == 4:
+                    short_drop = any(
+                        landmark.kind == "drop"
+                        and landmark.bar == entry.bar + card.critical_bar_offset
+                        and (landmark.beat or 1) == 1
+                        and landmark.confidence == "verified"
+                        for landmark in incoming.landmarks
+                    )
+                    if not short_drop:
+                        errors.append(
+                            "four-bar file-start blend requires an explicitly "
+                            "verified incoming drop"
+                        )
 
     outgoing_fader_zero: tuple[int, int] | None = None
     outgoing_stop: tuple[int, int] | None = None
@@ -1452,10 +1567,7 @@ def validate_transition_card(
             and float(event.parameters.get("value", 1)) == 0.0
         ):
             outgoing_fader_zero = position
-        if (
-            event.action == "cue"
-            and event.parameters.get("deck") == card.outgoing_deck
-        ):
+        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck:
             outgoing_stop = position
     if outgoing_fader_zero is None:
         errors.append("outgoing deck never reaches channel fader zero")
@@ -1467,8 +1579,54 @@ def validate_transition_card(
         and outgoing_stop < outgoing_fader_zero
     ):
         errors.append("outgoing deck is stopped before it is silent")
+    if card.transition_family == "long_blend":
+        progressive_retirement = [
+            event
+            for event in card.events
+            if event.action == "channel_fader"
+            and event.parameters.get("deck") == card.outgoing_deck
+            and 0 < float(event.parameters.get("value", 1)) < 0.9
+            and (event.bar_offset, event.beat_offset)
+            > (card.critical_bar_offset, 0)
+        ]
+        if len(progressive_retirement) < 3:
+            errors.append(
+                "long blend must retire the outgoing channel through at least "
+                "three progressive post-swap fader steps"
+            )
+        if (
+            outgoing_fader_zero is None
+            or outgoing_fader_zero[0] < card.critical_bar_offset + 4
+        ):
+            errors.append(
+                "long blend must keep the outgoing tail alive for at least "
+                "four bars after the bass swap"
+            )
+        outgoing_filter_moves = [
+            event
+            for event in card.events
+            if event.action == "filter"
+            and event.parameters.get("deck") == card.outgoing_deck
+            and float(event.parameters.get("value", 0)) != 0
+            and (event.bar_offset, event.beat_offset)
+            > (card.critical_bar_offset, 0)
+        ]
+        filter_reset = any(
+            event.action == "filter"
+            and event.parameters.get("deck") == card.outgoing_deck
+            and float(event.parameters.get("value", 1)) == 0
+            and outgoing_fader_zero is not None
+            and (event.bar_offset, event.beat_offset) >= outgoing_fader_zero
+            for event in card.events
+        )
+        if not outgoing_filter_moves or not filter_reset:
+            errors.append(
+                "long blend requires a post-swap outgoing CFX move and a "
+                "neutral filter reset at retirement"
+            )
     outgoing_fx_on = [
-        index for index, event in enumerate(card.events)
+        index
+        for index, event in enumerate(card.events)
         if event.action == "fx_toggle"
         and event.parameters.get("deck") == card.outgoing_deck
     ]
@@ -1478,12 +1636,10 @@ def validate_transition_card(
             event.action == "fx_wet_dry"
             and event.parameters.get("deck") == card.outgoing_deck
             and float(event.parameters.get("value", 1)) == 0.0
-            for event in card.events[final_toggle - 1:]
+            for event in card.events[final_toggle - 1 :]
         )
         if len(outgoing_fx_on) % 2 or not wet_reset:
-            errors.append(
-                "outgoing FX plan must toggle off and reset wet/dry to zero"
-            )
+            errors.append("outgoing FX plan must toggle off and reset wet/dry to zero")
     stem_events: dict[tuple[int, str], int] = {}
     for event in card.events:
         if event.action not in {
@@ -1496,26 +1652,19 @@ def validate_transition_card(
         stem_events[key] = stem_events.get(key, 0) + 1
     for (deck, action), count in stem_events.items():
         if count % 2:
-            errors.append(
-                f"deck {deck} {action} must be restored with a paired toggle"
-            )
+            errors.append(f"deck {deck} {action} must be restored with a paired toggle")
 
     for index, event in enumerate(card.events):
         if event.action not in {"loop_4", "loop_8", "loop_16"}:
             continue
         if not card.loop_plan_verified:
-            errors.append(
-                "transition loop requires verified observable loop state"
-            )
+            errors.append("transition loop requires verified observable loop state")
         deck = event.parameters.get("deck")
         if not any(
-            later.action == "loop_toggle"
-            and later.parameters.get("deck") == deck
-            for later in card.events[index + 1:]
+            later.action == "loop_toggle" and later.parameters.get("deck") == deck
+            for later in card.events[index + 1 :]
         ):
-            errors.append(
-                f"deck {deck} transition loop is not explicitly released"
-            )
+            errors.append(f"deck {deck} transition loop is not explicitly released")
     return errors
 
 
@@ -1555,9 +1704,7 @@ def compile_transition_card(
     if not state["playing"] and not stopped_dual_launch:
         errors.append("anchor deck is not playing")
     if state["observation_age_ms"] > max_observation_age_ms:
-        errors.append(
-            f"anchor observation is stale ({state['observation_age_ms']} ms)"
-        )
+        errors.append(f"anchor observation is stale ({state['observation_age_ms']} ms)")
     if state["confidence"] not in {"verified", "high"}:
         errors.append("anchor observation confidence is below high")
     if state["source"] == "manual":
@@ -1568,9 +1715,7 @@ def compile_transition_card(
             "use verified native transport feedback"
         )
     if state["source"] == "vision" and state["confidence"] != "verified":
-        errors.append(
-            "vision observations require verified adapter confidence"
-        )
+        errors.append("vision observations require verified adapter confidence")
     if incoming_state is not None:
         if incoming_state["track_id"] != incoming.track_id:
             errors.append("incoming deck track does not match transition card")
@@ -1616,9 +1761,7 @@ def compile_transition_card(
                 errors.append("incoming Quantize state is unobserved")
             elif not incoming_state["quantize_enabled"]:
                 errors.append("incoming Quantize is off")
-    anchor_profile = (
-        outgoing if card.anchor_deck == card.outgoing_deck else incoming
-    )
+    anchor_profile = outgoing if card.anchor_deck == card.outgoing_deck else incoming
     phrases = anchor_profile.phrase_boundaries
     if not phrases:
         errors.append("anchor profile has no Rekordbox phrase boundaries")
@@ -1654,17 +1797,14 @@ def compile_transition_card(
         if (landmark.beat or 1) != 1:
             return {
                 "ready": False,
-                "errors": [
-                    "stopped anchor launch cue must mark phrase beat 1"
-                ],
+                "errors": ["stopped anchor launch cue must mark phrase beat 1"],
                 "events": [],
             }
         start_delay_ms = 250
         events = []
         for event in card.events:
             offset_beats = (
-                event.bar_offset * anchor_profile.time_signature
-                + event.beat_offset
+                event.bar_offset * anchor_profile.time_signature + event.beat_offset
             )
             events.append(
                 {
@@ -1692,9 +1832,7 @@ def compile_transition_card(
             "start_bar": landmark.bar,
             "start_beat_in_bar": landmark.beat or 1,
             "start_phrase": None,
-            "incoming_bass_handoff": incoming_bass_handoff_evidence(
-                card, incoming
-            ),
+            "incoming_bass_handoff": incoming_bass_handoff_evidence(card, incoming),
             "events": events,
         }
     minimum_lead_beats = card.minimum_lead_bars * beats_per_bar
@@ -1702,20 +1840,14 @@ def compile_transition_card(
     candidates = list(phrases)
     if card.start_phrase_index is not None:
         candidates = [
-            phrase
-            for phrase in candidates
-            if phrase.index == card.start_phrase_index
+            phrase for phrase in candidates if phrase.index == card.start_phrase_index
         ]
     if card.start_phrase_label:
         label = card.start_phrase_label.casefold()
         candidates = [
-            phrase
-            for phrase in candidates
-            if phrase.label.casefold() == label
+            phrase for phrase in candidates if phrase.label.casefold() == label
         ]
-    candidates = [
-        phrase for phrase in candidates if phrase.start_beat >= earliest
-    ]
+    candidates = [phrase for phrase in candidates if phrase.start_beat >= earliest]
     if not candidates:
         return {
             "ready": False,
@@ -1741,8 +1873,7 @@ def compile_transition_card(
     outgoing_stops = [
         event
         for event in card.events
-        if event.action == "cue"
-        and event.parameters.get("deck") == card.outgoing_deck
+        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck
     ]
     if anchor_profile.beat_count and outgoing_stops:
         final_stop = max(
@@ -1750,9 +1881,7 @@ def compile_transition_card(
             key=lambda event: (event.bar_offset, event.beat_offset),
         )
         retirement_beat = (
-            start_beat
-            + final_stop.bar_offset * beats_per_bar
-            + final_stop.beat_offset
+            start_beat + final_stop.bar_offset * beats_per_bar + final_stop.beat_offset
         )
         if retirement_beat > anchor_profile.beat_count:
             return {
@@ -1777,9 +1906,7 @@ def compile_transition_card(
     quantized_transport_lead_ms = 0
     events = []
     for event in card.events:
-        offset_beats = (
-            event.bar_offset * beats_per_bar + event.beat_offset
-        )
+        offset_beats = event.bar_offset * beats_per_bar + event.beat_offset
         at_ms = start_delay_ms + round(offset_beats * beat_ms)
         if (
             quantized_transport_lead_ms
@@ -1813,9 +1940,7 @@ def compile_transition_card(
         "start_bar": chosen_phrase.start_bar,
         "start_beat_in_bar": chosen_phrase.beat_in_bar,
         "start_phrase": chosen_phrase.model_dump(),
-        "incoming_bass_handoff": incoming_bass_handoff_evidence(
-            card, incoming
-        ),
+        "incoming_bass_handoff": incoming_bass_handoff_evidence(card, incoming),
         "quantized_transport_lead_ms": quantized_transport_lead_ms,
         "events": events,
     }
@@ -1857,11 +1982,7 @@ def audit_set_plan(plan: SetPlan, store: ProfileStore) -> dict[str, Any]:
         track["ready"]
         or (
             track["track_id"] in waived_vocal_track_ids
-            and set(
-                name
-                for name, passed in track["checks"].items()
-                if not passed
-            )
+            and set(name for name, passed in track["checks"].items() if not passed)
             <= {"vocals"}
         )
         for track in track_audit["tracks"]

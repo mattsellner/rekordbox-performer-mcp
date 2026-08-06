@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -203,6 +204,39 @@ def test_stage_track_skips_search_when_exact_track_is_already_loaded(
         ("channel_fader", {"deck": 2, "value": 0}),
         ("cue", {"deck": 2}),
     ]
+
+
+def test_stage_track_reloads_resident_track_parked_away_from_file_start(
+    monkeypatch,
+) -> None:
+    ui = AlreadyLoadedUI()
+    ui.search_attempted = False
+    original_snapshot = ui.deck_snapshot
+
+    def parked_snapshot(deck: int) -> DeckSnapshot:
+        value = original_snapshot(deck)
+        return replace(value, elapsed_seconds=250)
+
+    ui.deck_snapshot = parked_snapshot
+    ui.select_exact_track = FakeUI.select_exact_track.__get__(ui, AlreadyLoadedUI)
+    observer = FakeObserver()
+    monkeypatch.setattr(server, "rekordbox_ui", ui)
+    monkeypatch.setattr(server, "engine", FakeEngine())
+    monkeypatch.setattr(server, "deck_observer", observer)
+
+    result = asyncio.run(
+        server._stage_track(
+            deck=2,
+            track_id="rekordbox:resident",
+            title="Track",
+            artist="Artist",
+            source="local",
+        )
+    )
+
+    assert result["verified"] is True
+    assert result["already_loaded"] is False
+    assert result["browser_search_skipped"] is False
 
 
 def test_stage_track_broadens_parenthetical_search(monkeypatch) -> None:

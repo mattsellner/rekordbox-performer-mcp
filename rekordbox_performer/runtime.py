@@ -26,7 +26,10 @@ class ControlLease:
         if self.held:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
+        try:
+            handle = self.path.open("r+b")
+        except FileNotFoundError:
+            handle = self.path.open("w+b")
         try:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
@@ -97,7 +100,7 @@ class ControlLease:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as exc:
                 raise RuntimeError(
-                    "Another Rekordbox Performer process owns live MIDI control"
+                    "Another RekordBot or Performer process owns live MIDI control"
                 ) from exc
             return
 
@@ -107,7 +110,7 @@ class ControlLease:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise RuntimeError(
-                "Another Rekordbox Performer process owns live MIDI control"
+                "Another RekordBot or Performer process owns live MIDI control"
             ) from exc
 
     @staticmethod

@@ -63,8 +63,7 @@ def prepared_profile(track_id: str, title: str) -> TrackProfile:
             ),
         ],
         bass_energy_by_bar=[
-            BassEnergyBar(bar=bar, median=10, mean=12, peak=20)
-            for bar in range(1, 81)
+            BassEnergyBar(bar=bar, median=10, mean=12, peak=20) for bar in range(1, 81)
         ],
         landmarks=[
             TrackLandmark(
@@ -127,6 +126,26 @@ def valid_card() -> TransitionCard:
                 parameters={"deck": 2, "cue": 1},
             ),
             MusicalEvent(
+                bar_offset=0,
+                action="eq_low",
+                parameters={"deck": 2, "value": -1},
+            ),
+            MusicalEvent(
+                bar_offset=0,
+                action="channel_fader",
+                parameters={"deck": 2, "value": 0.25},
+            ),
+            MusicalEvent(
+                bar_offset=12,
+                action="channel_fader",
+                parameters={"deck": 2, "value": 0.72},
+            ),
+            MusicalEvent(
+                bar_offset=14,
+                action="channel_fader",
+                parameters={"deck": 2, "value": 0.86},
+            ),
+            MusicalEvent(
                 bar_offset=16,
                 action="eq_low",
                 parameters={"deck": 1, "value": -1},
@@ -135,6 +154,11 @@ def valid_card() -> TransitionCard:
                 bar_offset=16,
                 action="eq_low",
                 parameters={"deck": 2, "value": 0},
+            ),
+            MusicalEvent(
+                bar_offset=16,
+                action="channel_fader",
+                parameters={"deck": 2, "value": 1},
             ),
             MusicalEvent(
                 bar_offset=20,
@@ -324,7 +348,9 @@ def test_large_bpm_move_requires_bridge_or_explicit_tempo_risk() -> None:
     assert any("verified tempo ramp or compatible bridge" in error for error in errors)
     card.tempo_risk_accepted = True
     errors = validate_transition_card(card, outgoing, incoming)
-    assert not any("verified tempo ramp or compatible bridge" in error for error in errors)
+    assert not any(
+        "verified tempo ramp or compatible bridge" in error for error in errors
+    )
 
 
 def test_card_rejects_retirement_after_outgoing_grid_end() -> None:
@@ -446,7 +472,7 @@ def test_phrase_cut_can_launch_verified_file_start_without_hot_cue() -> None:
     assert not any("launch" in error.lower() for error in errors)
 
 
-def test_bass_swap_still_requires_verified_hot_cue() -> None:
+def test_bass_swap_accepts_verified_file_start_phrase() -> None:
     outgoing = prepared_profile("a", "A")
     incoming = prepared_profile("b", "B")
     card = valid_card()
@@ -456,7 +482,7 @@ def test_bass_swap_still_requires_verified_hot_cue() -> None:
         parameters={"deck": 2},
     )
     errors = validate_transition_card(card, outgoing, incoming)
-    assert any("requires a verified Hot Cue" in error for error in errors)
+    assert not any("launch" in error.casefold() for error in errors)
 
 
 def test_card_compiles_to_next_phrase_boundary() -> None:
@@ -504,7 +530,10 @@ def test_card_compiles_to_next_phrase_boundary() -> None:
     assert compiled["quantized_transport_lead_ms"] == 0
     assert compiled["events"][0]["action"] == "hot_cue"
     assert compiled["events"][0]["at_ms"] == compiled["start_delay_ms"]
-    assert compiled["events"][1]["at_ms"] > compiled["events"][0]["at_ms"]
+    assert any(
+        event["at_ms"] > compiled["events"][0]["at_ms"]
+        for event in compiled["events"][1:]
+    )
 
 
 def test_card_rejects_unverified_vocal_plan() -> None:
@@ -899,11 +928,7 @@ def test_native_analysis_adds_analyzed_outro_mix_out(tmp_path: Path) -> None:
         )
     )
     profile = TrackProfile.model_validate(result["profile"])
-    mix_out = next(
-        item
-        for item in profile.landmarks
-        if item.kind == "mix_out"
-    )
+    mix_out = next(item for item in profile.landmarks if item.kind == "mix_out")
     assert mix_out.bar == 17
     assert mix_out.time_ms == 30050
     assert profile.analysis_readiness()["ready"] is True
@@ -924,15 +949,9 @@ def test_ingest_maps_phrase_indices_to_pickup_beat_grid_labels(
             beat_count=3,
             phrase_count=2,
             beat_grid=[
-                AnalysisBeatGridPoint(
-                    index=1, bar=1, beat=3, bpm=128, time_ms=0
-                ),
-                AnalysisBeatGridPoint(
-                    index=2, bar=1, beat=4, bpm=128, time_ms=469
-                ),
-                AnalysisBeatGridPoint(
-                    index=3, bar=2, beat=1, bpm=128, time_ms=938
-                ),
+                AnalysisBeatGridPoint(index=1, bar=1, beat=3, bpm=128, time_ms=0),
+                AnalysisBeatGridPoint(index=2, bar=1, beat=4, bpm=128, time_ms=469),
+                AnalysisBeatGridPoint(index=3, bar=2, beat=1, bpm=128, time_ms=938),
             ],
             phrases=[
                 PhraseBoundary(
@@ -961,8 +980,7 @@ def test_ingest_maps_phrase_indices_to_pickup_beat_grid_labels(
 
     profile = TrackProfile.model_validate(result["profile"])
     assert [
-        (phrase.start_bar, phrase.beat_in_bar)
-        for phrase in profile.phrase_boundaries
+        (phrase.start_bar, phrase.beat_in_bar) for phrase in profile.phrase_boundaries
     ] == [(1, 3), (2, 1)]
 
 
@@ -1200,7 +1218,13 @@ def test_card_allows_stopped_native_bpm_until_post_launch_sync_guard() -> None:
 
 def test_card_rejects_bass_swap_split_across_critical_bar() -> None:
     card = valid_card()
-    card.events[2].beat_offset = 2
+    next(
+        event
+        for event in card.events
+        if event.action == "eq_low"
+        and event.parameters.get("deck") == card.incoming_deck
+        and event.parameters.get("value") == 0
+    ).beat_offset = 2
     state = LiveState()
     for deck, track_id, playing in ((1, "a", True), (2, "b", False)):
         state.update(
@@ -1260,8 +1284,7 @@ def test_card_rejects_unverified_incoming_launch_cue() -> None:
     assert compiled["ready"] is False
     assert (
         "incoming launch cue is not a high-confidence mix-in or "
-        "phrase-start landmark"
-        in compiled["errors"]
+        "phrase-start landmark" in compiled["errors"]
     )
 
 
@@ -1292,12 +1315,11 @@ def test_bass_swap_rejects_critical_bar_without_verified_bass_phrase() -> None:
     )
     assert (
         "critical bass swap does not land on the downbeat of a verified "
-        "incoming drop or bass phrase"
-        in errors
+        "incoming drop or bass phrase" in errors
     )
 
 
-def test_breakdown_handoff_with_bass_swap_rejects_file_start_launch() -> None:
+def test_breakdown_handoff_with_bass_swap_accepts_verified_file_start() -> None:
     card = valid_card()
     card.transition_family = "breakdown_handoff"
     card.events[0] = MusicalEvent(
@@ -1312,11 +1334,7 @@ def test_breakdown_handoff_with_bass_swap_rejects_file_start_launch() -> None:
         prepared_profile("b", "B"),
     )
 
-    assert (
-        "a transition with a bass handoff requires a verified Hot Cue "
-        "on a phrase start"
-        in errors
-    )
+    assert not any("launch" in error.casefold() for error in errors)
 
 
 def test_bass_handoff_rejects_arbitrary_ten_bar_swap() -> None:
@@ -1339,7 +1357,13 @@ def test_bass_handoff_rejects_arbitrary_ten_bar_swap() -> None:
 def test_breakdown_handoff_rejects_split_low_eq_transfer() -> None:
     card = valid_card()
     card.transition_family = "breakdown_handoff"
-    card.events[2].beat_offset = 1
+    next(
+        event
+        for event in card.events
+        if event.action == "eq_low"
+        and event.parameters.get("deck") == card.incoming_deck
+        and event.parameters.get("value") == 0
+    ).beat_offset = 1
 
     errors = validate_transition_card(
         card,
@@ -1406,7 +1430,10 @@ def test_card_rejects_manual_clock_and_playing_incoming_deck() -> None:
     )
     assert compiled["ready"] is False
     assert "manual observations are not authoritative live clocks" in compiled["errors"]
-    assert "incoming deck must be stopped before its scheduled launch" in compiled["errors"]
+    assert (
+        "incoming deck must be stopped before its scheduled launch"
+        in compiled["errors"]
+    )
 
 
 def test_phrase_compiler_rejects_non_bar_one_boundary() -> None:
@@ -1485,8 +1512,7 @@ def test_drop_anchored_hot_cue_must_mark_phrase_beat_one() -> None:
     entry = next(
         landmark
         for landmark in incoming.landmarks
-        if landmark.kind in {"mix_in", "phrase_start"}
-        and landmark.cue is not None
+        if landmark.kind in {"mix_in", "phrase_start"} and landmark.cue is not None
     )
     entry.beat = 3
     state = LiveState()
@@ -1578,6 +1604,21 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
             parameters={"deck": 2, "cue": 1},
         ),
         MusicalEvent(
+            bar_offset=0,
+            action="eq_low",
+            parameters={"deck": 2, "value": -1},
+        ),
+        MusicalEvent(
+            bar_offset=0,
+            action="channel_fader",
+            parameters={"deck": 2, "value": 0.25},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="channel_fader",
+            parameters={"deck": 2, "value": 0.72},
+        ),
+        MusicalEvent(
             bar_offset=8,
             action="eq_low",
             parameters={"deck": 1, "value": -1},
@@ -1586,6 +1627,11 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
             bar_offset=8,
             action="eq_low",
             parameters={"deck": 2, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            action="channel_fader",
+            parameters={"deck": 2, "value": 1},
         ),
         MusicalEvent(
             bar_offset=12,
@@ -1624,4 +1670,11 @@ def test_stopped_anchor_compiles_verified_dual_hot_cue_launch() -> None:
     assert compiled["start_bar"] == 65
     assert compiled["events"][0]["at_ms"] == 250
     assert compiled["events"][1]["at_ms"] == 250
-    assert compiled["events"][2]["at_ms"] == 15250
+    assert (
+        next(
+            event["at_ms"]
+            for event in compiled["events"]
+            if event["action"] == "eq_low" and event["parameters"].get("deck") == 1
+        )
+        == 15250
+    )
