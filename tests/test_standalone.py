@@ -129,7 +129,7 @@ def test_transition_compiler_preserves_energy_until_verified_bass_swap() -> None
         outgoing_deck=1,
     )
 
-    assert handoff.technique == "verified_bass_swap"
+    assert handoff.technique == "long_blend"
     assert handoff.load.cue == 7
     assert handoff.card.critical_bar_offset == 16
     assert validate_transition_card(handoff.card, outgoing, incoming) == []
@@ -177,7 +177,7 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
         outgoing_deck=1,
     )
 
-    assert handoff.technique == "file_start_bass_swap"
+    assert handoff.technique == "long_blend"
     assert handoff.card.transition_family == "long_blend"
     assert handoff.card.critical_bar_offset == 16
     assert validate_transition_card(handoff.card, outgoing, incoming) == []
@@ -203,8 +203,7 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
     outgoing_fades = [
         event.parameters["value"]
         for event in handoff.card.events
-        if event.action == "channel_fader"
-        and event.parameters.get("deck") == 1
+        if event.action == "channel_fader" and event.parameters.get("deck") == 1
     ]
     assert outgoing_fades == [0.86, 0.62, 0.32, 0]
     outgoing_filter = [
@@ -213,6 +212,132 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
         if event.action == "filter" and event.parameters.get("deck") == 1
     ]
     assert outgoing_filter == [0.12, 0.22, 0.38, 0.58, 0]
+
+
+def test_energy_router_aligns_outgoing_down_with_incoming_chorus() -> None:
+    outgoing = profile("ocean", "Lost In The Ocean", 125, "3A")
+    outgoing.phrase_boundaries = [
+        PhraseBoundary(
+            index=index,
+            start_beat=(bar - 1) * 4 + 1,
+            end_beat=(bar - 1) * 4 + 32,
+            start_bar=bar,
+            beat_in_bar=1,
+            length_beats=32,
+            length_bars=8,
+            kind_code=3 if label == "down" else 5,
+            label=label,
+            confidence="verified",
+        )
+        for index, (bar, label) in enumerate(
+            [(1, "intro"), (89, "up"), (113, "chorus"), (121, "down")],
+            start=1,
+        )
+    ]
+    outgoing.landmarks = [
+        TrackLandmark(
+            name="file start",
+            kind="phrase_start",
+            bar=1,
+            time_ms=0,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="bass",
+            kind="bass_in",
+            bar=113,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=145,
+            confidence="verified",
+        ),
+    ]
+    outgoing.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=8 if 113 <= bar < 121 else 2,
+            mean=14 if 113 <= bar < 121 else 7,
+            peak=80,
+        )
+        for bar in range(1, 153)
+    ]
+
+    incoming = profile("faces", "Blow Ya Faces Off", 125, "4A")
+    incoming.phrase_boundaries = [
+        PhraseBoundary(
+            index=index,
+            start_beat=(bar - 1) * 4 + 1,
+            end_beat=(bar - 1) * 4 + length * 4,
+            start_bar=bar,
+            beat_in_bar=1,
+            length_beats=length * 4,
+            length_bars=length,
+            kind_code=5 if label == "chorus" else 2,
+            label=label,
+            confidence="verified",
+        )
+        for index, (bar, label, length) in enumerate(
+            [
+                (1, "intro", 16),
+                (17, "up", 4),
+                (21, "up", 4),
+                (25, "up", 8),
+                (33, "chorus", 16),
+            ],
+            start=1,
+        )
+    ]
+    incoming.landmarks = [
+        TrackLandmark(
+            name="file start",
+            kind="phrase_start",
+            bar=1,
+            time_ms=0,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="strong early bass",
+            kind="bass_in",
+            bar=21,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=65,
+            confidence="verified",
+        ),
+    ]
+    incoming.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=20 if 21 <= bar < 33 else 7,
+            mean=21 if 33 <= bar < 41 else 18,
+            peak=105 if 33 <= bar < 41 else 75,
+        )
+        for bar in range(1, 81)
+    ]
+
+    handoff = TransitionKingCompiler().compile(
+        outgoing,
+        incoming,
+        outgoing_deck=1,
+    )
+
+    assert handoff.technique == "long_blend"
+    assert handoff.card.start_phrase_index == 2
+    assert handoff.card.critical_bar_offset == 32
+    assert "down bar 121" in handoff.reason
+    assert "chorus bar 33" in handoff.reason
+    assert any(
+        event.action == "channel_fader"
+        and event.parameters == {"deck": 2, "value": 0.18}
+        and event.bar_offset == 24
+        for event in handoff.card.events
+    )
 
 
 def test_user_verified_four_bar_drop_gets_blend_not_hard_cut() -> None:
@@ -264,8 +389,7 @@ def test_user_verified_four_bar_drop_gets_blend_not_hard_cut() -> None:
     assert [
         event.parameters["value"]
         for event in handoff.card.events
-        if event.action == "channel_fader"
-        and event.parameters.get("deck") == 2
+        if event.action == "channel_fader" and event.parameters.get("deck") == 2
     ] == [0.18, 0.35, 0.72, 0.86, 1]
 
 

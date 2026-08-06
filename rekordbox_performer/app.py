@@ -38,6 +38,8 @@ class SnapshotView:
     clock: str
     health: str
     severity: str
+    technique: str
+    critical: str
 
 
 def format_snapshot(snapshot: RuntimeSnapshot) -> SnapshotView:
@@ -70,6 +72,17 @@ def format_snapshot(snapshot: RuntimeSnapshot) -> SnapshotView:
             f"Rekordbox {snapshot.health.rekordbox.upper()}  ·  "
             f"Rescue {snapshot.health.rescue.upper()}"
         )
+    technique_name = (snapshot.transition_technique or "").replace("_", " ").title()
+    technique = (
+        f"Technique  {technique_name}"
+        if technique_name
+        else "Technique  Waiting for transition plan"
+    )
+    critical = (
+        f"Critical handoff in {snapshot.critical_in_bars:.1f} bars"
+        if snapshot.critical_in_bars is not None
+        else "Critical handoff not yet scheduled"
+    )
     return SnapshotView(
         headline=snapshot.headline,
         detail=snapshot.detail,
@@ -78,6 +91,8 @@ def format_snapshot(snapshot: RuntimeSnapshot) -> SnapshotView:
         clock="  ·  ".join(clock_parts) or "Waiting for live clock",
         health=health,
         severity=snapshot.severity,
+        technique=technique,
+        critical=critical,
     )
 
 
@@ -178,45 +193,104 @@ def main(argv: list[str] | None = None) -> None:
     worker = AsyncWorker()
     root = tk.Tk()
     root.title("RekordBot")
-    root.configure(bg="#111318")
+    root.configure(bg="#090d18")
     root.attributes("-topmost", not args.not_topmost)
-    width, height = 560, 585
+    root._rekordbot_expanded_live = False
+    width, height = 620, 730
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     root.geometry(
         f"{width}x{height}+{screen_width - width - 18}+{screen_height - height - 68}"
     )
-    root.minsize(520, 540)
+    root.minsize(580, 680)
 
     def report_error(title: str, message: str) -> None:
         root.after(0, lambda: messagebox.showerror(title, message))
 
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure("Dark.TFrame", background="#111318")
-    style.configure("Dark.TLabel", background="#111318", foreground="#e8ebf2")
-    style.configure("Muted.TLabel", background="#111318", foreground="#9ca5b5")
-    style.configure("Accent.TButton", background="#5b7cfa", foreground="white")
+    style.configure("Dark.TFrame", background="#090d18")
+    style.configure("Card.TFrame", background="#121a2b")
+    style.configure("Dark.TLabel", background="#090d18", foreground="#f5f7ff")
+    style.configure("Card.TLabel", background="#121a2b", foreground="#f5f7ff")
+    style.configure("Muted.TLabel", background="#090d18", foreground="#8f9bb3")
+    style.configure("CardMuted.TLabel", background="#121a2b", foreground="#8f9bb3")
+    style.configure(
+        "Accent.TButton",
+        background="#6c7cff",
+        foreground="white",
+        borderwidth=0,
+        padding=(14, 8),
+    )
+    style.map("Accent.TButton", background=[("active", "#8491ff")])
+    style.configure("TButton", padding=(10, 7))
+    style.configure("TEntry", fieldbackground="#182238", foreground="#f5f7ff")
+    style.configure("TCombobox", fieldbackground="#182238", foreground="#f5f7ff")
+    style.configure("TSpinbox", fieldbackground="#182238", foreground="#f5f7ff")
 
-    frame = ttk.Frame(root, padding=14, style="Dark.TFrame")
+    frame = ttk.Frame(root, padding=18, style="Dark.TFrame")
     frame.pack(fill="both", expand=True)
+    ttk.Label(
+        frame,
+        text="REKORDBOT  /  AUTONOMOUS PERFORMANCE",
+        style="Muted.TLabel",
+        font=("Segoe UI Semibold", 9),
+    ).pack(anchor="w")
+    status_card = ttk.Frame(frame, padding=16, style="Card.TFrame")
+    status_card.pack(fill="x", pady=(10, 0))
     headline = ttk.Label(
-        frame, text="Ready", style="Dark.TLabel", font=("Segoe UI Semibold", 15)
+        status_card,
+        text="Ready",
+        style="Card.TLabel",
+        font=("Segoe UI Semibold", 18),
     )
     headline.pack(anchor="w")
     now_playing = ttk.Label(
-        frame, text="No track playing", style="Dark.TLabel", font=("Segoe UI", 11)
+        status_card,
+        text="No track playing",
+        style="Card.TLabel",
+        font=("Segoe UI Semibold", 11),
     )
     now_playing.pack(anchor="w", pady=(7, 0))
-    clock = ttk.Label(frame, text="Waiting for live clock", style="Muted.TLabel")
+    clock = ttk.Label(
+        status_card,
+        text="Waiting for live clock",
+        style="CardMuted.TLabel",
+    )
     clock.pack(anchor="w", pady=(2, 0))
-    next_track = ttk.Label(frame, text="Next: not selected", style="Dark.TLabel")
+    next_track = ttk.Label(
+        status_card,
+        text="Next: not selected",
+        style="Card.TLabel",
+    )
     next_track.pack(anchor="w", pady=(8, 0))
+    technique = ttk.Label(
+        status_card,
+        text="Technique  Waiting for transition plan",
+        style="CardMuted.TLabel",
+        font=("Segoe UI Semibold", 9),
+    )
+    technique.pack(anchor="w", pady=(8, 0))
+    critical = ttk.Label(
+        status_card,
+        text="Critical handoff not yet scheduled",
+        style="CardMuted.TLabel",
+    )
+    critical.pack(anchor="w", pady=(2, 0))
     detail = ttk.Label(
-        frame, text="", style="Muted.TLabel", wraplength=395, justify="left"
+        status_card,
+        text="",
+        style="CardMuted.TLabel",
+        wraplength=550,
+        justify="left",
     )
     detail.pack(anchor="w", pady=(5, 0))
-    health = ttk.Label(frame, text="", style="Muted.TLabel", font=("Segoe UI", 8))
+    health = ttk.Label(
+        status_card,
+        text="",
+        style="CardMuted.TLabel",
+        font=("Segoe UI", 8),
+    )
     health.pack(anchor="w", pady=(8, 0))
 
     controls = ttk.Frame(frame, style="Dark.TFrame")
@@ -245,9 +319,116 @@ def main(argv: list[str] | None = None) -> None:
     )
     emergency_button.pack(side="right")
 
-    ttk.Separator(frame).pack(fill="x", pady=(12, 7))
-    setup = ttk.Frame(frame, style="Dark.TFrame")
-    setup.pack(fill="x")
+    # During live automation the setup window becomes a compact, click-through
+    # overlay. It remains visible above Rekordbox without intercepting browser,
+    # deck, or waveform input and without forcing the user to minimize it.
+    live_overlay = tk.Toplevel(root)
+    live_overlay.withdraw()
+    live_overlay.overrideredirect(True)
+    live_overlay.configure(bg="#0b1020")
+    live_overlay.attributes("-topmost", not args.not_topmost)
+    live_overlay.attributes("-alpha", 0.95)
+    overlay_width, overlay_height = 420, 218
+    live_overlay.geometry(
+        f"{overlay_width}x{overlay_height}+"
+        f"{screen_width - overlay_width - 18}+"
+        f"{screen_height - overlay_height - 68}"
+    )
+    overlay_shell = tk.Frame(
+        live_overlay,
+        bg="#121a2b",
+        highlightbackground="#33415f",
+        highlightthickness=1,
+        padx=16,
+        pady=14,
+    )
+    overlay_shell.pack(fill="both", expand=True)
+    tk.Label(
+        overlay_shell,
+        text="REKORDBOT  LIVE",
+        bg="#121a2b",
+        fg="#7f8cff",
+        font=("Segoe UI Semibold", 9),
+    ).pack(anchor="w")
+    overlay_headline = tk.Label(
+        overlay_shell,
+        text="Ready",
+        bg="#121a2b",
+        fg="#f5f7ff",
+        font=("Segoe UI Semibold", 16),
+        anchor="w",
+    )
+    overlay_headline.pack(fill="x", pady=(5, 0))
+    overlay_now = tk.Label(
+        overlay_shell,
+        text="No track playing",
+        bg="#121a2b",
+        fg="#dce3f7",
+        font=("Segoe UI Semibold", 10),
+        anchor="w",
+    )
+    overlay_now.pack(fill="x", pady=(5, 0))
+    overlay_next = tk.Label(
+        overlay_shell,
+        text="Next: not selected",
+        bg="#121a2b",
+        fg="#9da9c2",
+        font=("Segoe UI", 9),
+        anchor="w",
+    )
+    overlay_next.pack(fill="x", pady=(2, 0))
+    overlay_technique = tk.Label(
+        overlay_shell,
+        text="Technique  Waiting for transition plan",
+        bg="#121a2b",
+        fg="#7de2b8",
+        font=("Segoe UI Semibold", 9),
+        anchor="w",
+    )
+    overlay_technique.pack(fill="x", pady=(8, 0))
+    overlay_clock = tk.Label(
+        overlay_shell,
+        text="Waiting for live clock",
+        bg="#121a2b",
+        fg="#9da9c2",
+        font=("Segoe UI", 9),
+        anchor="w",
+    )
+    overlay_clock.pack(fill="x", pady=(2, 0))
+    overlay_health = tk.Label(
+        overlay_shell,
+        text="",
+        bg="#121a2b",
+        fg="#74819b",
+        font=("Segoe UI", 8),
+        anchor="w",
+    )
+    overlay_health.pack(fill="x", pady=(8, 0))
+
+    def make_overlay_click_through() -> None:
+        if args.not_topmost:
+            return
+        try:
+            import ctypes
+
+            widget_handle = live_overlay.winfo_id()
+            hwnd = ctypes.windll.user32.GetParent(widget_handle) or widget_handle
+            get_style = ctypes.windll.user32.GetWindowLongW
+            set_style = ctypes.windll.user32.SetWindowLongW
+            style_value = get_style(hwnd, -20)
+            set_style(hwnd, -20, style_value | 0x20 | 0x80 | 0x08000000)
+        except (AttributeError, OSError):
+            # The overlay remains useful on non-Windows test hosts; only the
+            # pass-through window style is platform-specific.
+            return
+
+    live_overlay.update_idletasks()
+    make_overlay_click_through()
+    live_overlay_active = False
+
+    ttk.Separator(frame).pack(fill="x", pady=(16, 10))
+    setup = ttk.Frame(frame, padding=14, style="Card.TFrame")
+    setup.pack(fill="both", expand=True)
     prepared = engine.profile_store.list_profiles(ready_only=True)
     prepared_labels = [engine.track_label(item) for item in prepared]
     track_var = tk.StringVar(value=args.track or "")
@@ -265,7 +446,7 @@ def main(argv: list[str] | None = None) -> None:
     ttk.Label(
         setup,
         text="OPENING TRACK",
-        style="Muted.TLabel",
+        style="CardMuted.TLabel",
         font=("Segoe UI Semibold", 8),
     ).grid(row=0, column=0, columnspan=3, sticky="w")
     opening_combo = ttk.Combobox(
@@ -280,17 +461,17 @@ def main(argv: list[str] | None = None) -> None:
     ttk.Label(
         setup,
         textvariable=opening_feedback,
-        style="Muted.TLabel",
-        wraplength=520,
+        style="CardMuted.TLabel",
+        wraplength=560,
     ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 9))
 
-    ttk.Label(setup, text="Set length", style="Muted.TLabel").grid(
+    ttk.Label(setup, text="Set length", style="CardMuted.TLabel").grid(
         row=3, column=0, sticky="w"
     )
     ttk.Label(
         setup,
         text="Finish near BPM (optional)",
-        style="Muted.TLabel",
+        style="CardMuted.TLabel",
     ).grid(row=3, column=1, sticky="w", padx=(8, 0))
     ttk.Spinbox(setup, from_=2, to=20, textvariable=count_var, width=8).grid(
         row=4, column=0, sticky="w", pady=(2, 9)
@@ -302,10 +483,10 @@ def main(argv: list[str] | None = None) -> None:
     ttk.Label(
         setup,
         text="DIRECTION / DESTINATION (OPTIONAL)",
-        style="Muted.TLabel",
+        style="CardMuted.TLabel",
         font=("Segoe UI Semibold", 8),
     ).grid(row=5, column=0, columnspan=3, sticky="w")
-    ttk.Label(setup, text="Destination track", style="Muted.TLabel").grid(
+    ttk.Label(setup, text="Destination track", style="CardMuted.TLabel").grid(
         row=6, column=0, columnspan=3, sticky="w", pady=(3, 0)
     )
     target_combo = ttk.Combobox(
@@ -315,13 +496,13 @@ def main(argv: list[str] | None = None) -> None:
         width=48,
     )
     target_combo.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(2, 6))
-    ttk.Label(setup, text="Vibe", style="Muted.TLabel").grid(
+    ttk.Label(setup, text="Vibe", style="CardMuted.TLabel").grid(
         row=8, column=0, sticky="w"
     )
     ttk.Label(
         setup,
         text="Arrive over next transitions",
-        style="Muted.TLabel",
+        style="CardMuted.TLabel",
     ).grid(row=8, column=1, columnspan=2, sticky="w", padx=(8, 0))
     vibe_combo = ttk.Combobox(
         setup,
@@ -365,6 +546,7 @@ def main(argv: list[str] | None = None) -> None:
     use_deck_button.configure(command=use_loaded_deck)
 
     def start_set() -> None:
+        nonlocal live_overlay_active
         try:
             opening = engine.resolve_track(track_var.get())
             destination = (
@@ -388,22 +570,26 @@ def main(argv: list[str] | None = None) -> None:
             vibe=VIBE_LABELS[vibe_var.get()],
             name=f"RekordBot set — {opening.title}",
         )
-        # Rekordbox selection still uses physical browser/deck hit points. A
-        # topmost corner window can cover them even after Rekordbox receives
-        # focus, sending search and drag input into this app instead. Relinquish
-        # the overlay before preflight; refresh restores it at a terminal state.
-        # Publish the active phase on the UI thread first so the 300 ms refresh
-        # cannot race the worker and restore topmost while preflight is starting.
+        # Swap the interactive setup window for a non-activating pass-through
+        # live overlay. Rekordbox keeps focus for physical search/load/capture
+        # operations while RekordBot remains continuously visible.
         engine.status_store.publish(
             phase=RuntimePhase.SELECTING,
             headline="Starting set preflight",
-            detail="Relinquishing the overlay before Rekordbox staging begins.",
+            detail="Compact live view active while Rekordbox staging begins.",
         )
-        root.attributes("-topmost", False)
-        root.lower()
+        live_overlay_active = True
+        root._rekordbot_expanded_live = False
+        root.withdraw()
+        live_overlay.deiconify()
+        live_overlay.lift()
         worker.submit(_safe_start(engine, brief, report_error))
 
     def steer_set() -> None:
+        root._rekordbot_expanded_live = False
+        root.withdraw()
+        live_overlay.deiconify()
+        live_overlay.lift()
         worker.submit(
             _safe_result(
                 lambda: engine.steer_set(
@@ -416,7 +602,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
 
-    action_row = ttk.Frame(setup, style="Dark.TFrame")
+    action_row = ttk.Frame(setup, style="Card.TFrame")
     action_row.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(3, 0))
     start_button = ttk.Button(
         action_row,
@@ -437,8 +623,8 @@ def main(argv: list[str] | None = None) -> None:
             "Start Set uses the full set length. Queue steering preserves the "
             "already-armed next track, then uses the transition count above."
         ),
-        style="Muted.TLabel",
-        wraplength=510,
+        style="CardMuted.TLabel",
+        wraplength=550,
     ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     severity_colors = {
@@ -447,10 +633,8 @@ def main(argv: list[str] | None = None) -> None:
         "warning": "#ffd166",
         "error": "#ff6b6b",
     }
-    overlay_topmost: bool | None = None
 
     def refresh() -> None:
-        nonlocal overlay_topmost
         snapshot = engine.status_store.read()
         if (
             snapshot.phase == RuntimePhase.IDLE
@@ -468,13 +652,27 @@ def main(argv: list[str] | None = None) -> None:
         now_playing.configure(text=view.now_playing)
         next_track.configure(text=view.next_track)
         clock.configure(text=view.clock)
+        technique.configure(text=view.technique)
+        critical.configure(text=view.critical)
         detail.configure(text=view.detail)
         health.configure(text=view.health)
+        overlay_headline.configure(
+            text=view.headline, fg=severity_colors[view.severity]
+        )
+        overlay_now.configure(text=view.now_playing)
+        overlay_next.configure(text=view.next_track)
+        overlay_technique.configure(text=view.technique)
+        overlay_clock.configure(text=(f"{view.clock}  ·  {view.critical}"))
+        overlay_health.configure(text=view.health)
         active = snapshot.phase not in TERMINAL_PHASES
-        desired_topmost = bool(not args.not_topmost and not active)
-        if desired_topmost != overlay_topmost:
-            root.attributes("-topmost", desired_topmost)
-            overlay_topmost = desired_topmost
+        if (
+            live_overlay_active
+            and snapshot.phase not in TERMINAL_PHASES
+            and not root._rekordbot_expanded_live
+            and live_overlay.state() == "withdrawn"
+        ):
+            live_overlay.deiconify()
+            live_overlay.lift()
         hold_button.configure(state="normal" if active else "disabled")
         stop_button.configure(state="normal" if active else "disabled")
         emergency_button.configure(state="normal" if active else "disabled")
@@ -484,9 +682,21 @@ def main(argv: list[str] | None = None) -> None:
         opening_combo.configure(state="disabled" if active else "normal")
         root.after(300, refresh)
 
-    tray = _start_tray(root, engine, worker, messagebox, report_error)
+    tray = _start_tray(
+        root,
+        live_overlay,
+        engine,
+        worker,
+        messagebox,
+        report_error,
+    )
 
     def close_to_taskbar() -> None:
+        snapshot = engine.status_store.read()
+        if snapshot.phase not in TERMINAL_PHASES:
+            root._rekordbot_expanded_live = False
+            live_overlay.deiconify()
+            live_overlay.lift()
         if tray is not None:
             root.withdraw()
         else:
@@ -547,6 +757,7 @@ def _confirm_emergency(action: Callable[[], None], messagebox) -> None:
 
 def _start_tray(
     root,
+    live_overlay,
     engine: StandaloneDJEngine,
     worker: AsyncWorker,
     messagebox,
@@ -559,13 +770,28 @@ def _start_tray(
     except ImportError:
         return None
 
-    image = Image.new("RGB", (64, 64), "#111318")
+    image = Image.new("RGB", (64, 64), "#090d18")
     draw = ImageDraw.Draw(image)
     draw.ellipse((8, 8, 56, 56), outline="#5b7cfa", width=6)
     draw.ellipse((27, 27, 37, 37), fill="#75e6a4")
 
     def on_open(_icon=None, _item=None) -> None:
-        root.after(0, lambda: (root.deiconify(), root.lift()))
+        def show() -> None:
+            snapshot = engine.status_store.read()
+            if snapshot.phase in TERMINAL_PHASES:
+                live_overlay.withdraw()
+                root._rekordbot_expanded_live = False
+                root.attributes("-topmost", True)
+                root.deiconify()
+                root.lift()
+            else:
+                live_overlay.withdraw()
+                root._rekordbot_expanded_live = True
+                root.attributes("-topmost", False)
+                root.deiconify()
+                root.lift()
+
+        root.after(0, show)
 
     def on_hold(_icon=None, _item=None) -> None:
         worker.submit(_safe_async(engine.hold_current, report_error))
@@ -579,7 +805,8 @@ def _start_tray(
             if snapshot.phase not in TERMINAL_PHASES:
                 messagebox.showwarning(
                     "Set still active",
-                    "Use Stop After Current or Emergency Stop before exiting the DJ engine.",
+                    "Use Stop After Current or Emergency Stop before exiting "
+                    "the DJ engine.",
                 )
                 return
             icon.stop()

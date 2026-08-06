@@ -69,6 +69,11 @@ class RuntimeSnapshot(BaseModel):
     action_in_bars: float | None = None
     action_in_seconds: float | None = None
     transition_name: str | None = None
+    transition_family: str | None = None
+    transition_technique: str | None = None
+    transition_reason: str | None = None
+    transition_alternatives: list[str] = Field(default_factory=list)
+    critical_in_bars: float | None = None
     queue: list[TrackRole] = Field(default_factory=list)
     health: RuntimeHealth = Field(default_factory=RuntimeHealth)
     failures: list[str] = Field(default_factory=list)

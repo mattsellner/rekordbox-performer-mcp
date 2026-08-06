@@ -22,6 +22,7 @@ from .intelligence import (
     TransitionCard,
     bass_phrase_evidence,
     camelot_compatibility,
+    energy_phrase_evidence,
     validate_transition_card,
 )
 from .set_runner import AutonomousSetPlan, TrackLoadSpec, TransitionOption
@@ -53,6 +54,25 @@ class CompiledHandoff:
     technique: str
     cue_landmark: TrackLandmark | None
     bass_landmark: TrackLandmark | None
+    reason: str = ""
+    alternatives: tuple[str, ...] = ()
+    suitability_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class EnergyHandoff:
+    """One phrase-exact outgoing/incoming energy ownership pairing."""
+
+    outgoing_start: PhraseBoundary
+    outgoing_critical: PhraseBoundary
+    incoming_entry: TrackLandmark | None
+    incoming_audible: PhraseBoundary
+    incoming_critical: PhraseBoundary
+    bass_landmark: TrackLandmark | None
+    critical_offset: int
+    audible_entry_offset: int
+    score: float
+    reason: str
 
 
 def _confidence_ready(value: str) -> bool:
@@ -154,6 +174,244 @@ def _outgoing_start_phrase(
             f"{required_bars} bars of runway"
         )
     return max(choices, key=lambda phrase: phrase.start_bar)
+
+
+def _phrase_average(
+    profile: TrackProfile,
+    phrase: PhraseBoundary,
+    attribute: str = "median",
+    bars: int = 8,
+) -> float:
+    curve = {item.bar: item for item in profile.bass_energy_by_bar}
+    values = [
+        float(getattr(curve[bar], attribute))
+        for bar in range(phrase.start_bar, phrase.start_bar + bars)
+        if bar in curve
+    ]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _outgoing_release_score(
+    profile: TrackProfile,
+    phrase: PhraseBoundary,
+) -> float:
+    previous = [
+        item
+        for item in profile.phrase_boundaries
+        if item.start_bar < phrase.start_bar
+        and item.beat_in_bar == 1
+        and _confidence_ready(item.confidence)
+    ]
+    previous_energy = (
+        _phrase_average(profile, previous[-1])
+        if previous
+        else _phrase_average(profile, phrase)
+    )
+    current_energy = _phrase_average(profile, phrase)
+    energy_release = max(-10.0, min(35.0, (previous_energy - current_energy) * 5.0))
+    label_score = {
+        "down": 58.0,
+        "outro": 45.0,
+        "chorus": 15.0,
+        "up": 5.0,
+        "intro": -25.0,
+    }.get(phrase.label.casefold(), 0.0)
+    return label_score + energy_release
+
+
+def _vocal_overlap_bars(
+    outgoing: TrackProfile,
+    incoming: TrackProfile,
+    handoff: EnergyHandoff,
+) -> int:
+    count = 0
+    for offset in range(
+        handoff.audible_entry_offset,
+        handoff.critical_offset + 1,
+    ):
+        outgoing_bar = handoff.outgoing_start.start_bar + offset
+        incoming_bar = (
+            1 + offset
+            if handoff.incoming_entry is None
+            else handoff.incoming_entry.bar + offset
+        )
+        outgoing_vocal = any(
+            segment.kind == "vocal"
+            and segment.start_bar <= outgoing_bar <= segment.end_bar
+            for segment in outgoing.segments
+        )
+        incoming_vocal = any(
+            segment.kind == "vocal"
+            and segment.start_bar <= incoming_bar <= segment.end_bar
+            for segment in incoming.segments
+        )
+        if outgoing_vocal and incoming_vocal:
+            count += 1
+    return count
+
+
+def _energy_handoffs(
+    outgoing: TrackProfile,
+    incoming: TrackProfile,
+) -> list[EnergyHandoff]:
+    """Pair an outgoing energy release with an incoming chorus/drop downbeat."""
+    phrases = [
+        phrase
+        for phrase in incoming.phrase_boundaries
+        if phrase.beat_in_bar == 1 and _confidence_ready(phrase.confidence)
+    ]
+    file_start = next(
+        (
+            landmark
+            for landmark in incoming.landmarks
+            if landmark.kind in {"mix_in", "phrase_start"}
+            and landmark.bar == 1
+            and (landmark.beat or 1) == 1
+            and _confidence_ready(landmark.confidence)
+        ),
+        None,
+    )
+    automation_entries = _automation_entries(incoming)
+    mix_out = _mix_out_bar(outgoing)
+    results: list[EnergyHandoff] = []
+    for critical in phrases:
+        evidence = energy_phrase_evidence(incoming, critical.start_bar)
+        if not evidence.get("verified"):
+            continue
+        bass_landmark = next(
+            (
+                landmark
+                for landmark in incoming.landmarks
+                if landmark.kind in {"drop", "bass_in"}
+                and landmark.bar == critical.start_bar
+                and (landmark.beat or 1) == 1
+                and _confidence_ready(landmark.confidence)
+            ),
+            None,
+        )
+        entry_options: list[TrackLandmark | None] = [
+            entry
+            for entry in automation_entries
+            if critical.start_bar - entry.bar in {8, 16}
+        ]
+        if file_start is not None:
+            entry_options.append(None)
+        for entry in entry_options:
+            entry_bar = entry.bar if entry is not None else 1
+            critical_offset = critical.start_bar - entry_bar
+            if critical_offset < 4 or critical_offset > 64:
+                continue
+            audible_candidates = [
+                phrase
+                for phrase in phrases
+                if phrase.start_bar >= entry_bar
+                and critical.start_bar - phrase.start_bar in {8, 16, 4}
+            ]
+            if not audible_candidates:
+                continue
+            # Eight bars is the default when it preserves a useful build. It
+            # avoids exposing a long vocal/melodic overlap merely because a
+            # file-start pre-roll began much earlier while muted.
+            audible = max(
+                audible_candidates,
+                key=lambda phrase: (
+                    3
+                    if critical.start_bar - phrase.start_bar == 8
+                    else 2
+                    if critical.start_bar - phrase.start_bar == 16
+                    else 1,
+                    phrase.start_bar,
+                ),
+            )
+            audible_entry_offset = audible.start_bar - entry_bar
+            outgoing_pairs: list[tuple[PhraseBoundary, PhraseBoundary]] = []
+            for outgoing_critical in outgoing.phrase_boundaries:
+                if (
+                    outgoing_critical.beat_in_bar != 1
+                    or not _confidence_ready(outgoing_critical.confidence)
+                    or outgoing_critical.start_bar + 8 > mix_out
+                ):
+                    continue
+                outgoing_start = _phrase_at(
+                    outgoing,
+                    outgoing_critical.start_bar - critical_offset,
+                )
+                if outgoing_start is not None:
+                    outgoing_pairs.append((outgoing_start, outgoing_critical))
+            # A verified four-bar build can land on the second half of an
+            # eight-bar musical sentence. Preserve that deliberate subphrase
+            # case while longer handoffs still require full phrase-to-phrase
+            # alignment.
+            if critical_offset == 4 and not outgoing_pairs:
+                for outgoing_start in outgoing.phrase_boundaries:
+                    if (
+                        outgoing_start.beat_in_bar == 1
+                        and _confidence_ready(outgoing_start.confidence)
+                        and outgoing_start.start_bar + 12 <= mix_out
+                    ):
+                        outgoing_pairs.append(
+                            (
+                                outgoing_start,
+                                outgoing_start.model_copy(
+                                    update={
+                                        "start_bar": outgoing_start.start_bar + 4,
+                                        "start_beat": outgoing_start.start_beat + 16,
+                                    }
+                                ),
+                            )
+                        )
+            for outgoing_start, outgoing_critical in outgoing_pairs:
+                label = critical.label.casefold()
+                incoming_label_score = {
+                    "drop": 62.0,
+                    "chorus": 58.0,
+                    "up": 18.0,
+                    "down": -8.0,
+                    "intro": -20.0,
+                    "outro": -30.0,
+                }.get(label, 0.0)
+                user_verified = bool(
+                    bass_landmark
+                    and bass_landmark.confidence == "verified"
+                    and bass_landmark.name.casefold().startswith("user verified")
+                )
+                score = (
+                    float(evidence.get("score", 0))
+                    + incoming_label_score
+                    + _outgoing_release_score(outgoing, outgoing_critical)
+                    + (80.0 if user_verified else 0.0)
+                    + (10.0 if entry is not None else 0.0)
+                    + min(12.0, outgoing_start.start_bar / 16.0)
+                )
+                results.append(
+                    EnergyHandoff(
+                        outgoing_start=outgoing_start,
+                        outgoing_critical=outgoing_critical,
+                        incoming_entry=entry,
+                        incoming_audible=audible,
+                        incoming_critical=critical,
+                        bass_landmark=bass_landmark,
+                        critical_offset=critical_offset,
+                        audible_entry_offset=audible_entry_offset,
+                        score=score,
+                        reason=(
+                            f"align {outgoing.title} {outgoing_critical.label} "
+                            f"bar {outgoing_critical.start_bar} with "
+                            f"{incoming.title} {critical.label} bar "
+                            f"{critical.start_bar}; energy source "
+                            f"{evidence.get('energy_source') or 'waveform'}"
+                        ),
+                    )
+                )
+    return sorted(
+        results,
+        key=lambda item: (
+            item.score,
+            item.outgoing_critical.start_bar,
+            item.incoming_critical.start_bar,
+        ),
+        reverse=True,
+    )
 
 
 def _load_spec(
@@ -304,7 +562,181 @@ def _progressive_house_events(
     return sorted(events, key=lambda event: (event.bar_offset, event.beat_offset))
 
 
-class TransitionKingCompiler:
+def _compact_handoff_events(
+    *,
+    outgoing_deck: int,
+    incoming_deck: int,
+    launch: MusicalEvent,
+    audible_entry_offset: int,
+    critical_offset: int,
+    filter_exit: bool = False,
+) -> list[MusicalEvent]:
+    events = _progressive_house_events(
+        outgoing_deck=outgoing_deck,
+        incoming_deck=incoming_deck,
+        launch=launch,
+        audible_entry_offset=audible_entry_offset,
+        critical_offset=critical_offset,
+    )
+    # Replace the eight-bar long-blend retirement with a decisive four-bar
+    # post-swap tail.  The incoming build and exact low-EQ transfer are shared.
+    events = [
+        event
+        for event in events
+        if not (
+            event.parameters.get("deck") == outgoing_deck
+            and event.bar_offset > critical_offset
+        )
+    ]
+    filter_values = (0.28, 0.48, 0.68) if filter_exit else (0.12, 0.28, 0.48)
+    events.extend(
+        [
+            MusicalEvent(
+                bar_offset=critical_offset + 1,
+                action="filter",
+                parameters={"deck": outgoing_deck, "value": filter_values[0]},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 1,
+                action="channel_fader",
+                parameters={"deck": outgoing_deck, "value": 0.76},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 2,
+                action="filter",
+                parameters={"deck": outgoing_deck, "value": filter_values[1]},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 2,
+                action="channel_fader",
+                parameters={"deck": outgoing_deck, "value": 0.42},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 3,
+                action="filter",
+                parameters={"deck": outgoing_deck, "value": filter_values[2]},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 4,
+                action="channel_fader",
+                parameters={"deck": outgoing_deck, "value": 0},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 4,
+                action="filter",
+                parameters={"deck": outgoing_deck, "value": 0},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 4,
+                action="eq_low",
+                parameters={"deck": outgoing_deck, "value": 0},
+            ),
+            MusicalEvent(
+                bar_offset=critical_offset + 4,
+                beat_offset=1,
+                action="cue",
+                parameters={"deck": outgoing_deck},
+            ),
+        ]
+    )
+    return sorted(events, key=lambda event: (event.bar_offset, event.beat_offset))
+
+
+def _breakdown_events(
+    *,
+    outgoing_deck: int,
+    incoming_deck: int,
+    launch: MusicalEvent,
+) -> list[MusicalEvent]:
+    return [
+        MusicalEvent(
+            bar_offset=0,
+            action="channel_fader",
+            parameters={"deck": incoming_deck, "value": 0.2},
+        ),
+        launch,
+        MusicalEvent(
+            bar_offset=2,
+            action="channel_fader",
+            parameters={"deck": incoming_deck, "value": 0.48},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="filter",
+            parameters={"deck": outgoing_deck, "value": 0.22},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="channel_fader",
+            parameters={"deck": outgoing_deck, "value": 0.78},
+        ),
+        MusicalEvent(
+            bar_offset=4,
+            action="channel_fader",
+            parameters={"deck": incoming_deck, "value": 0.78},
+        ),
+        MusicalEvent(
+            bar_offset=6,
+            action="filter",
+            parameters={"deck": outgoing_deck, "value": 0.52},
+        ),
+        MusicalEvent(
+            bar_offset=6,
+            action="channel_fader",
+            parameters={"deck": outgoing_deck, "value": 0.38},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            action="channel_fader",
+            parameters={"deck": incoming_deck, "value": 1},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            action="channel_fader",
+            parameters={"deck": outgoing_deck, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            action="filter",
+            parameters={"deck": outgoing_deck, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=8,
+            beat_offset=1,
+            action="cue",
+            parameters={"deck": outgoing_deck},
+        ),
+    ]
+
+
+def _phrase_cut_events(
+    *,
+    outgoing_deck: int,
+    incoming_deck: int,
+    launch: MusicalEvent,
+) -> list[MusicalEvent]:
+    return [
+        launch,
+        MusicalEvent(
+            bar_offset=0,
+            action="channel_fader",
+            parameters={"deck": incoming_deck, "value": 1},
+        ),
+        MusicalEvent(
+            bar_offset=0,
+            action="channel_fader",
+            parameters={"deck": outgoing_deck, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=0,
+            beat_offset=1,
+            action="cue",
+            parameters={"deck": outgoing_deck},
+        ),
+    ]
+
+
+class _LegacyTransitionKingCompiler:
     """Compile one evidence-backed handoff with a deterministic energy policy."""
 
     def compile(
@@ -512,15 +944,588 @@ class TransitionKingCompiler:
             raise ValueError("; ".join(errors))
 
 
+class TransitionKingCompiler:
+    """Score multiple evidence-backed techniques and compile the best one."""
+
+    def assess(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        recent_techniques: tuple[str, ...] = (),
+        proficient_techniques: frozenset[str] = frozenset(),
+        vibe: str = "maintain",
+        allow_safe_cuts: bool = True,
+    ) -> list[CompiledHandoff]:
+        proposals: list[CompiledHandoff] = []
+        energy_pairs = _energy_handoffs(outgoing, incoming)
+        if energy_pairs:
+            pair = energy_pairs[0]
+            overlap = _vocal_overlap_bars(outgoing, incoming, pair)
+            long_score = pair.score + (
+                32.0
+                if pair.outgoing_critical.label.casefold() == "down"
+                and pair.incoming_critical.label.casefold() == "chorus"
+                else 18.0
+            )
+            proposals.append(
+                self._compile_energy_card(
+                    outgoing,
+                    incoming,
+                    outgoing_deck=outgoing_deck,
+                    pair=pair,
+                    family="long_blend",
+                    technique="long_blend",
+                    score=long_score,
+                    reason=(
+                        f"Long energy-preserving blend: {pair.reason}. "
+                        "The outgoing channel stays full through the swap and "
+                        "retires over eight bars."
+                    ),
+                )
+            )
+            proposals.append(
+                self._compile_energy_card(
+                    outgoing,
+                    incoming,
+                    outgoing_deck=outgoing_deck,
+                    pair=pair,
+                    family="bass_swap",
+                    technique="compact_bass_swap",
+                    score=pair.score
+                    + (
+                        20.0
+                        if pair.incoming_critical.start_bar
+                        - pair.incoming_audible.start_bar
+                        == 8
+                        else 8.0
+                    ),
+                    reason=(
+                        f"Compact bass swap: {pair.reason}. The incoming track "
+                        "is established first and the outgoing tail clears in "
+                        "four bars."
+                    ),
+                )
+            )
+            if pair.outgoing_critical.label.casefold() == "outro":
+                proposals.append(
+                    self._compile_energy_card(
+                        outgoing,
+                        incoming,
+                        outgoing_deck=outgoing_deck,
+                        pair=pair,
+                        family="echo_exit",
+                        technique="filter_exit",
+                        score=pair.score + 25.0,
+                        reason=(
+                            f"High-pass exit: {pair.reason}. A compact filter "
+                            "tail clears the short outgoing phrase after the swap."
+                        ),
+                    )
+                )
+            if (
+                overlap >= 4
+                and pair.audible_entry_offset > 0
+                and "stem_vocal_blend" in proficient_techniques
+            ):
+                proposals.append(
+                    self._compile_energy_card(
+                        outgoing,
+                        incoming,
+                        outgoing_deck=outgoing_deck,
+                        pair=pair,
+                        family="long_blend",
+                        technique="stem_vocal_blend",
+                        score=pair.score + 15.0 + min(8.0, overlap / 2.0),
+                        reason=(
+                            f"Stem-assisted blend: {pair.reason}. Incoming vocals "
+                            f"are suppressed for {overlap} overlap bars and restored "
+                            "after the outgoing deck is silent."
+                        ),
+                        use_incoming_vocal_stem=True,
+                    )
+                )
+
+        loop = self._compile_loop_bridge(
+            outgoing,
+            incoming,
+            outgoing_deck=outgoing_deck,
+        )
+        if loop is not None:
+            proposals.append(loop)
+
+        breakdown = self._compile_breakdown(
+            outgoing,
+            incoming,
+            outgoing_deck=outgoing_deck,
+            vibe=vibe,
+        )
+        if breakdown is not None:
+            proposals.append(breakdown)
+
+        cut = self._compile_phrase_cut(
+            outgoing,
+            incoming,
+            outgoing_deck=outgoing_deck,
+        )
+        if cut is not None and allow_safe_cuts:
+            proposals.append(cut)
+
+        if not proposals:
+            raise ValueError(
+                f"{outgoing.title} -> {incoming.title} has no verified transition route"
+            )
+
+        adjusted = []
+        for proposal in proposals:
+            repeated = recent_techniques.count(proposal.technique)
+            immediate_repeat = bool(
+                recent_techniques and recent_techniques[-1] == proposal.technique
+            )
+            penalty = repeated * 7.0 + (8.0 if immediate_repeat else 0.0)
+            adjusted.append(
+                CompiledHandoff(
+                    **{
+                        **proposal.__dict__,
+                        "suitability_score": proposal.suitability_score - penalty,
+                    }
+                )
+            )
+        ranked = sorted(
+            adjusted,
+            key=lambda item: (item.suitability_score, item.technique),
+            reverse=True,
+        )
+        names = tuple(item.technique for item in ranked)
+        return [
+            CompiledHandoff(
+                **{
+                    **item.__dict__,
+                    "alternatives": tuple(
+                        name for name in names if name != item.technique
+                    ),
+                }
+            )
+            for item in ranked
+        ]
+
+    def compile(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        recent_techniques: tuple[str, ...] = (),
+        proficient_techniques: frozenset[str] = frozenset(),
+        vibe: str = "maintain",
+        allow_safe_cuts: bool = True,
+    ) -> CompiledHandoff:
+        return self.assess(
+            outgoing,
+            incoming,
+            outgoing_deck=outgoing_deck,
+            recent_techniques=recent_techniques,
+            proficient_techniques=proficient_techniques,
+            vibe=vibe,
+            allow_safe_cuts=allow_safe_cuts,
+        )[0]
+
+    def _compile_energy_card(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        pair: EnergyHandoff,
+        family: Literal["long_blend", "bass_swap", "echo_exit"],
+        technique: str,
+        score: float,
+        reason: str,
+        use_incoming_vocal_stem: bool = False,
+    ) -> CompiledHandoff:
+        incoming_deck = 2 if outgoing_deck == 1 else 1
+        if pair.incoming_entry is not None:
+            launch = MusicalEvent(
+                bar_offset=0,
+                action="hot_cue",
+                parameters={"deck": incoming_deck, "cue": pair.incoming_entry.cue},
+            )
+            load = _load_spec(incoming, pair.incoming_entry)
+        else:
+            launch = MusicalEvent(
+                bar_offset=0,
+                action="play_pause",
+                parameters={"deck": incoming_deck},
+            )
+            load = _load_spec(incoming)
+        if family == "long_blend":
+            events = _progressive_house_events(
+                outgoing_deck=outgoing_deck,
+                incoming_deck=incoming_deck,
+                launch=launch,
+                audible_entry_offset=pair.audible_entry_offset,
+                critical_offset=pair.critical_offset,
+            )
+        else:
+            events = _compact_handoff_events(
+                outgoing_deck=outgoing_deck,
+                incoming_deck=incoming_deck,
+                launch=launch,
+                audible_entry_offset=pair.audible_entry_offset,
+                critical_offset=pair.critical_offset,
+                filter_exit=family == "echo_exit",
+            )
+        if use_incoming_vocal_stem:
+            events.extend(
+                [
+                    MusicalEvent(
+                        bar_offset=0,
+                        action="stem_vocal",
+                        parameters={"deck": incoming_deck},
+                    ),
+                    MusicalEvent(
+                        bar_offset=pair.critical_offset + 8,
+                        action="stem_vocal",
+                        parameters={"deck": incoming_deck},
+                    ),
+                ]
+            )
+            events = sorted(
+                events, key=lambda event: (event.bar_offset, event.beat_offset)
+            )
+        card = TransitionCard(
+            name=f"{outgoing.track_id}-{incoming.track_id}-{technique}",
+            outgoing_track_id=outgoing.track_id,
+            incoming_track_id=incoming.track_id,
+            anchor_deck=outgoing_deck,
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            transition_family=family,
+            start_quantum_bars=(
+                32
+                if pair.critical_offset >= 32
+                else 16
+                if pair.critical_offset >= 16
+                else 8
+            ),
+            minimum_lead_bars=16,
+            start_phrase_index=pair.outgoing_start.index,
+            beat_sync_required=True,
+            quantize_required=True,
+            phrase_alignment_verified=True,
+            vocal_plan_verified=True,
+            bass_plan_verified=True,
+            incoming_loaded_verified=True,
+            intended_vocal_owner=(
+                "outgoing" if use_incoming_vocal_stem else "intentional_overlap"
+            ),
+            critical_bar_offset=pair.critical_offset,
+            events=events,
+            abort_plan=(
+                "Keep the outgoing channel and bass full; mute and stop the "
+                "incoming deck, then hold the prepared rescue loop."
+            ),
+            notes=(
+                f"{reason} Audible incoming phrase begins at bar "
+                f"{pair.incoming_audible.start_bar}; exact energy transfer is "
+                f"outgoing bar {pair.outgoing_critical.start_bar} to incoming "
+                f"bar {pair.incoming_critical.start_bar}."
+            ),
+        )
+        self._validate(card, outgoing, incoming)
+        return CompiledHandoff(
+            card=card,
+            load=load,
+            technique=technique,
+            cue_landmark=pair.incoming_entry,
+            bass_landmark=pair.bass_landmark,
+            reason=reason,
+            suitability_score=score,
+        )
+
+    def _compile_loop_bridge(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+    ) -> CompiledHandoff | None:
+        anchored = _verified_bass_handoff(incoming)
+        if anchored is None or _energy_handoffs(outgoing, incoming):
+            return None
+        entry, bass, lead = anchored
+        outgoing_deck = int(outgoing_deck)
+        incoming_deck = 2 if outgoing_deck == 1 else 1
+        start = _outgoing_start_phrase(outgoing, required_bars=1)
+        events = _progressive_house_events(
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            launch=MusicalEvent(
+                bar_offset=0,
+                action="hot_cue",
+                parameters={"deck": incoming_deck, "cue": entry.cue},
+            ),
+            audible_entry_offset=0,
+            critical_offset=lead,
+        )
+        events.extend(
+            [
+                MusicalEvent(
+                    bar_offset=0,
+                    action="loop_16",
+                    parameters={"deck": outgoing_deck},
+                ),
+                MusicalEvent(
+                    bar_offset=lead + 8,
+                    action="loop_toggle",
+                    parameters={"deck": outgoing_deck},
+                ),
+            ]
+        )
+        events = sorted(events, key=lambda event: (event.bar_offset, event.beat_offset))
+        card = TransitionCard(
+            name=f"{outgoing.track_id}-{incoming.track_id}-loop-bridge",
+            outgoing_track_id=outgoing.track_id,
+            incoming_track_id=incoming.track_id,
+            anchor_deck=outgoing_deck,
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            transition_family="loop_bridge",
+            start_quantum_bars=16 if lead == 16 else 8,
+            minimum_lead_bars=1,
+            start_phrase_index=start.index,
+            beat_sync_required=True,
+            quantize_required=True,
+            phrase_alignment_verified=True,
+            vocal_plan_verified=True,
+            bass_plan_verified=True,
+            loop_plan_verified=True,
+            incoming_loaded_verified=True,
+            intended_vocal_owner="intentional_overlap",
+            critical_bar_offset=lead,
+            events=events,
+            abort_plan=(
+                "Keep the verified outgoing loop active and stop the muted "
+                "incoming deck."
+            ),
+            notes=(
+                "A verified four-bar outgoing loop supplies missing runway; "
+                f"bass transfers to incoming bar {bass.bar} before the loop releases."
+            ),
+        )
+        self._validate(card, outgoing, incoming)
+        return CompiledHandoff(
+            card=card,
+            load=_load_spec(incoming, entry),
+            technique="loop_bridge",
+            cue_landmark=entry,
+            bass_landmark=bass,
+            reason=(
+                "The phrase structures do not align naturally, so a verified "
+                "loop supplies runway."
+            ),
+            suitability_score=155.0,
+        )
+
+    def _compile_breakdown(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+        vibe: str,
+    ) -> CompiledHandoff | None:
+        entries = _automation_entries(incoming)
+        entry = next(
+            (
+                item
+                for item in entries
+                if _phrase_at(incoming, item.bar) is not None
+                and _phrase_at(incoming, item.bar).label.casefold() == "down"
+            ),
+            None,
+        )
+        file_start = next(
+            (
+                item
+                for item in incoming.landmarks
+                if item.kind in {"mix_in", "phrase_start"}
+                and item.bar == 1
+                and (item.beat or 1) == 1
+                and _confidence_ready(item.confidence)
+            ),
+            None,
+        )
+        if entry is None and file_start is None:
+            return None
+        phrase = (
+            _phrase_at(incoming, entry.bar)
+            if entry is not None
+            else _phrase_at(incoming, 1)
+        )
+        if phrase is None or phrase.label.casefold() not in {"down", "intro"}:
+            return None
+        incoming_deck = 2 if outgoing_deck == 1 else 1
+        start = _outgoing_start_phrase(outgoing, required_bars=8)
+        launch = MusicalEvent(
+            bar_offset=0,
+            action="hot_cue" if entry is not None else "play_pause",
+            parameters=(
+                {"deck": incoming_deck, "cue": entry.cue}
+                if entry is not None
+                else {"deck": incoming_deck}
+            ),
+        )
+        score = 112.0 + (30.0 if vibe in {"downtempo", "deeper"} else 0.0)
+        card = TransitionCard(
+            name=f"{outgoing.track_id}-{incoming.track_id}-breakdown-handoff",
+            outgoing_track_id=outgoing.track_id,
+            incoming_track_id=incoming.track_id,
+            anchor_deck=outgoing_deck,
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            transition_family="breakdown_handoff",
+            start_quantum_bars=8,
+            minimum_lead_bars=8,
+            start_phrase_index=start.index,
+            beat_sync_required=True,
+            quantize_required=True,
+            phrase_alignment_verified=True,
+            vocal_plan_verified=True,
+            bass_plan_verified=True,
+            intentional_energy_drop=True,
+            incoming_loaded_verified=True,
+            intended_vocal_owner="incoming",
+            critical_bar_offset=8,
+            events=_breakdown_events(
+                outgoing_deck=outgoing_deck,
+                incoming_deck=incoming_deck,
+                launch=launch,
+            ),
+            abort_plan=(
+                "Keep the outgoing deck full and stop the incoming deck before "
+                "its fader rises."
+            ),
+            notes="Deliberate breakdown handoff selected for an atmospheric reset.",
+        )
+        self._validate(card, outgoing, incoming)
+        return CompiledHandoff(
+            card=card,
+            load=_load_spec(incoming, entry)
+            if entry is not None
+            else _load_spec(incoming),
+            technique="breakdown_handoff",
+            cue_landmark=entry,
+            bass_landmark=None,
+            reason=(
+                "Incoming verified down/intro phrase supports a deliberate "
+                "emotional reset."
+            ),
+            suitability_score=score,
+        )
+
+    def _compile_phrase_cut(
+        self,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+        *,
+        outgoing_deck: int,
+    ) -> CompiledHandoff | None:
+        entry = next(iter(_automation_entries(incoming)), None)
+        file_start = next(
+            (
+                item
+                for item in incoming.landmarks
+                if item.kind in {"mix_in", "phrase_start"}
+                and item.bar == 1
+                and (item.beat or 1) == 1
+                and _confidence_ready(item.confidence)
+            ),
+            None,
+        )
+        if entry is None and file_start is None:
+            return None
+        incoming_deck = 2 if outgoing_deck == 1 else 1
+        start = _outgoing_start_phrase(outgoing, required_bars=1)
+        launch = MusicalEvent(
+            bar_offset=0,
+            action="hot_cue" if entry is not None else "play_pause",
+            parameters=(
+                {"deck": incoming_deck, "cue": entry.cue}
+                if entry is not None
+                else {"deck": incoming_deck}
+            ),
+        )
+        card = TransitionCard(
+            name=f"{outgoing.track_id}-{incoming.track_id}-phrase-cut",
+            outgoing_track_id=outgoing.track_id,
+            incoming_track_id=incoming.track_id,
+            anchor_deck=outgoing_deck,
+            outgoing_deck=outgoing_deck,
+            incoming_deck=incoming_deck,
+            transition_family="phrase_cut",
+            start_quantum_bars=1,
+            minimum_lead_bars=1,
+            start_phrase_index=start.index,
+            beat_sync_required=True,
+            quantize_required=True,
+            phrase_alignment_verified=True,
+            vocal_plan_verified=True,
+            bass_plan_verified=True,
+            incoming_loaded_verified=True,
+            intended_vocal_owner="incoming",
+            critical_bar_offset=0,
+            events=_phrase_cut_events(
+                outgoing_deck=outgoing_deck,
+                incoming_deck=incoming_deck,
+                launch=launch,
+            ),
+            abort_plan=(
+                "Do not cut; keep the outgoing channel full and stop the "
+                "incoming deck."
+            ),
+            notes="Verified phrase-boundary cut retained as a low-complexity fallback.",
+        )
+        self._validate(card, outgoing, incoming)
+        return CompiledHandoff(
+            card=card,
+            load=_load_spec(incoming, entry)
+            if entry is not None
+            else _load_spec(incoming),
+            technique="phrase_cut",
+            cue_landmark=entry,
+            bass_landmark=None,
+            reason="A decisive verified phrase cut is the safest non-overlap fallback.",
+            suitability_score=95.0,
+        )
+
+    @staticmethod
+    def _validate(
+        card: TransitionCard,
+        outgoing: TrackProfile,
+        incoming: TrackProfile,
+    ) -> None:
+        errors = validate_transition_card(card, outgoing, incoming)
+        if errors:
+            raise ValueError("; ".join(errors))
+
+
 class LocalDJPlanner:
     """Choose a repeatable route and compile every adjacent transition."""
 
-    def __init__(self, profiles: Iterable[TrackProfile]) -> None:
+    def __init__(
+        self,
+        profiles: Iterable[TrackProfile],
+        *,
+        proficient_techniques: Iterable[str] = (),
+    ) -> None:
         self.profiles = {
             profile.track_id: profile
             for profile in profiles
             if profile.readiness()["ready"]
         }
+        self.proficient_techniques = frozenset(proficient_techniques)
         self.compiler = TransitionKingCompiler()
 
     def build_plan(
@@ -544,6 +1549,7 @@ class LocalDJPlanner:
             target = self.profiles[brief.target_track_id]
         excluded = set(brief.excluded_track_ids) - {brief.start_track_id}
         route = [self.profiles[brief.start_track_id]]
+        route_handoffs: list[CompiledHandoff] = []
         while len(route) < brief.target_track_count:
             current = route[-1]
             used = {track.track_id for track in route}
@@ -563,41 +1569,46 @@ class LocalDJPlanner:
                 for profile in candidates
                 if abs(profile.bpm - current.bpm) <= brief.max_native_bpm_delta
             ]
-            ranked = sorted(
-                candidates,
-                key=lambda profile: self._score_candidate(
+            evaluated: list[
+                tuple[float, str, str, str, TrackProfile, CompiledHandoff]
+            ] = []
+            outgoing_deck = (
+                opening_deck if len(route) % 2 else (2 if opening_deck == 1 else 1)
+            )
+            recent = tuple(item.technique for item in route_handoffs[-3:])
+            for candidate in candidates:
+                selection_score = self._score_candidate(
                     current,
-                    profile,
+                    candidate,
                     depth=len(route),
                     total=brief.target_track_count,
                     target_bpm=brief.target_bpm,
                     target_track=target,
                     vibe=brief.vibe,
-                ),
-                reverse=True,
-            )
-            selected = None
-            for candidate in ranked:
-                if (
-                    not brief.allow_safe_cuts
-                    and _verified_bass_handoff(candidate) is None
-                ):
-                    continue
+                )
                 try:
-                    self.compiler.compile(
+                    handoff = self.compiler.compile(
                         current,
                         candidate,
-                        outgoing_deck=(
-                            opening_deck
-                            if len(route) % 2
-                            else (2 if opening_deck == 1 else 1)
-                        ),
+                        outgoing_deck=outgoing_deck,
+                        recent_techniques=recent,
+                        proficient_techniques=self.proficient_techniques,
+                        vibe=brief.vibe,
+                        allow_safe_cuts=brief.allow_safe_cuts,
                     )
                 except ValueError:
                     continue
-                selected = candidate
-                break
-            if selected is None:
+                evaluated.append(
+                    (
+                        selection_score[0] + handoff.suitability_score * 0.35,
+                        selection_score[1],
+                        selection_score[2],
+                        candidate.track_id,
+                        candidate,
+                        handoff,
+                    )
+                )
+            if not evaluated:
                 direction = (
                     f" while steering toward {target.title}"
                     if target is not None
@@ -606,24 +1617,23 @@ class LocalDJPlanner:
                 raise ValueError(
                     f"no safe prepared successor exists for {current.title}{direction}"
                 )
+            _, _, _, _, selected, selected_handoff = max(evaluated)
             route.append(selected)
+            route_handoffs.append(selected_handoff)
 
         transitions: list[TransitionOption] = []
-        for index, (outgoing, incoming) in enumerate(pairwise(route)):
-            outgoing_deck = (
-                opening_deck if index % 2 == 0 else (2 if opening_deck == 1 else 1)
-            )
-            handoff = self.compiler.compile(
-                outgoing,
-                incoming,
-                outgoing_deck=outgoing_deck,
-            )
+        for index, ((outgoing, incoming), handoff) in enumerate(
+            zip(pairwise(route), route_handoffs, strict=True)
+        ):
             transitions.append(
                 TransitionOption(
                     id=f"{index + 1}-{outgoing.track_id}-{incoming.track_id}",
                     card=handoff.card,
                     incoming=handoff.load,
                     priority=0,
+                    technique=handoff.technique,
+                    reason=handoff.reason,
+                    alternatives=list(handoff.alternatives),
                 )
             )
 

@@ -21,16 +21,26 @@ Rekordbox runtime. Codex is not consulted between tracks and can be closed
 without interrupting the set. RekordBot:
 
 - selects a complete route from Tier-A analyzed tracks before playback;
-- compiles each transition from verified phrase, cue, bass-energy, key, and
-  BPM evidence;
+- scores long blends, compact bass swaps, filter exits, breakdown handoffs,
+  loop bridges, phrase cuts, and proficiency-gated stem blends from verified
+  phrase, vocal, waveform-energy, key, and BPM evidence;
+- pairs the incoming chorus/drop with an outgoing energy release instead of
+  choosing a bass-swap bar from elapsed overlap length alone;
 - starts the opener at its own native BPM before enabling Beat Sync;
 - keeps the outgoing channel full while the incoming channel establishes,
   swaps bass only on a verified incoming bass phrase, and retires the outgoing
   deck afterward;
 - preloads the following track while a gradual tempo ramp is running;
 - protects 64/32/16-bar staging, reserve, and rescue deadlines locally; and
-- exposes a compact always-on-top window plus system-tray controls for status,
-  Hold Current, Stop After Current, and Emergency Stop.
+- exposes a modern expanded setup panel plus a compact, click-through live
+  overlay that stays visible without blocking Rekordbox controls or captures;
+  and provides system-tray controls for Hold Current, Stop After Current, and
+  Emergency Stop.
+
+The live runtime is deterministic and local. It does not call an LLM, Codex,
+OpenAI, or another cloud AI while a set is running. Rekordbox analysis and the
+local technique scorer provide the planning evidence; the live clock, MIDI
+events, safety checks, and recovery path remain ordinary repeatable code.
 
 Only one process may own the virtual MIDI port. Disconnect the Codex Performer
 before starting a live standalone set. Rekordbox must remain open in Performance
@@ -51,9 +61,11 @@ powershell -ExecutionPolicy Bypass -File .\build-app.ps1
 ```
 
 The executable is created at `dist\RekordBot\RekordBot.exe`. Closing the
-window sends it to the system tray, so the local engine continues running. The
-app refuses to exit from the tray while a set is active; use a normal or
-emergency stop first.
+expanded window sends it to the system tray, so the local engine continues
+running. During a set, RekordBot automatically uses its non-activating compact
+overlay. Use **Open** from the tray to expand steering controls temporarily;
+queueing a direction returns to the compact view. The app refuses to exit from
+the tray while a set is active; use a normal or emergency stop first.
 
 The existing `Codex Rekordbox Performer` virtual MIDI port, MIDI mapping file,
 and `%LOCALAPPDATA%\rekordbox-performer` profile store intentionally retain

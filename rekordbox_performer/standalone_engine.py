@@ -192,7 +192,8 @@ class StandaloneDJEngine:
         ]
         if len(matches) != 1:
             raise RuntimeError(
-                f"Deck {deck} title {record['title']!r} does not uniquely match a prepared profile"
+                f"Deck {deck} title {record['title']!r} does not uniquely "
+                "match a prepared profile"
             )
         profile = matches[0]
         readiness = profile.readiness()
@@ -217,9 +218,17 @@ class StandaloneDJEngine:
             action_in_bars=None,
             action_in_seconds=None,
             transition_name=None,
+            transition_family=None,
+            transition_technique=None,
+            transition_reason=None,
+            transition_alternatives=[],
+            critical_in_bars=None,
             failures=[],
         )
-        planner = LocalDJPlanner(self.profile_store.list_profiles(ready_only=True))
+        planner = LocalDJPlanner(
+            self.profile_store.list_profiles(ready_only=True),
+            proficient_techniques=self.profile_store.proficient_techniques(),
+        )
         try:
             plan = planner.build_plan(brief)
         except Exception as exc:
@@ -312,7 +321,10 @@ class StandaloneDJEngine:
         anchor_deck = active.card.incoming_deck
         target = self.resolve_track(target_query) if target_query.strip() else None
         excluded = list(runner.get("played_track_ids") or [])
-        planner = LocalDJPlanner(self.profile_store.list_profiles(ready_only=True))
+        planner = LocalDJPlanner(
+            self.profile_store.list_profiles(ready_only=True),
+            proficient_techniques=self.profile_store.proficient_techniques(),
+        )
         future = planner.build_plan(
             DJBrief(
                 start_track_id=anchor_id,
@@ -470,7 +482,9 @@ class StandaloneDJEngine:
                 and abs(elapsed - previous[1]) >= 0.5
             ):
                 self._manual_playing_until[deck] = now + 2.5
-            elif previous is not None and self._search_key(previous[0]) != self._search_key(title):
+            elif previous is not None and self._search_key(
+                previous[0]
+            ) != self._search_key(title):
                 self._manual_playing_until.pop(deck, None)
             self._manual_previous[deck] = (title, elapsed)
 
@@ -482,9 +496,7 @@ class StandaloneDJEngine:
         ]
         moving_decks = {int(record["deck"]) for record in moving}
         if self._manual_current_deck not in moving_decks:
-            self._manual_current_deck = (
-                int(moving[0]["deck"]) if moving else None
-            )
+            self._manual_current_deck = int(moving[0]["deck"]) if moving else None
 
         if self._manual_current_deck is None:
             loaded = [
@@ -624,6 +636,14 @@ class StandaloneDJEngine:
             if action_seconds is not None and live_bpm is not None
             else None
         )
+        critical_seconds = (
+            max(0.0, float(critical_at) - now) if critical_at is not None else None
+        )
+        critical_bars = (
+            critical_seconds * live_bpm / 240.0
+            if critical_seconds is not None and live_bpm is not None
+            else None
+        )
         status = runner.get("status")
         deadline = runner.get("deadline_phase")
         if status == "completed":
@@ -639,7 +659,10 @@ class StandaloneDJEngine:
         elif runner.get("rescue_loop_active"):
             phase = RuntimePhase.HOLDING_LOOP
             headline = "Holding the prepared rescue loop"
-            detail = "The next route is being recovered while the current deck remains audible."
+            detail = (
+                "The next route is being recovered while the current deck "
+                "remains audible."
+            )
             severity = "warning"
         elif critical_at is not None and now >= float(critical_at):
             phase = RuntimePhase.RETIRING
@@ -706,6 +729,19 @@ class StandaloneDJEngine:
             action_in_bars=action_bars,
             action_in_seconds=action_seconds,
             transition_name=active_option.card.name if active_option else None,
+            transition_family=(
+                active_option.card.transition_family if active_option else None
+            ),
+            transition_technique=(
+                active_option.technique or active_option.card.transition_family
+                if active_option
+                else None
+            ),
+            transition_reason=(active_option.reason if active_option else None),
+            transition_alternatives=(
+                active_option.alternatives if active_option else []
+            ),
+            critical_in_bars=critical_bars,
             failures=failures[-10:],
             health=RuntimeHealth(
                 midi="ok" if control.get("connected") else "down",

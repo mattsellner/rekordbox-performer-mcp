@@ -79,6 +79,9 @@ class TransitionOption(BaseModel):
     incoming: TrackLoadSpec
     priority: int = Field(default=100, ge=0)
     tempo_after: TempoPlan | None = None
+    technique: str = ""
+    reason: str = ""
+    alternatives: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def identity_matches(self) -> "TransitionOption":

@@ -184,6 +184,32 @@ def test_ready_profile_requires_vocal_map() -> None:
     assert profile.readiness()["tier"] == "B"
 
 
+def test_advanced_technique_requires_three_clean_passes_on_two_pairs(tmp_path) -> None:
+    store = ProfileStore(tmp_path)
+    reviews = [
+        RehearsalReview(
+            transition_name=f"stem_vocal_blend pass {index}",
+            outgoing_track_id="a" if index < 2 else "c",
+            incoming_track_id="b" if index < 2 else "d",
+            beat_phase_error_ms=10,
+            bar_error=0,
+            bass_swap_error_beats=0,
+            vocal_clash=False,
+            energy_continuity=8,
+            cleanliness=8,
+            user_rating=8,
+        )
+        for index in range(3)
+    ]
+    for review in reviews[:2]:
+        store.record_rehearsal(review)
+    assert "stem_vocal_blend" not in store.proficient_techniques()
+
+    store.record_rehearsal(reviews[2])
+
+    assert "stem_vocal_blend" in store.proficient_techniques()
+
+
 def test_card_requires_stem_toggle_to_be_restored() -> None:
     outgoing = prepared_profile("a", "A")
     incoming = prepared_profile("b", "B")
