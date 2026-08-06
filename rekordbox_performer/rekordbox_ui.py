@@ -456,6 +456,111 @@ class RekordboxUIAdapter:
         return controls[0]
 
     @staticmethod
+    def _collection_controls(samples: list[ControlSample]) -> list[Any]:
+        return [
+            sample.control
+            for sample in samples
+            if sample.control_type == "Text"
+            and normalize_title(sample.text) == "collection"
+        ]
+
+    @staticmethod
+    def _local_collection_switch(
+        samples: list[ControlSample],
+        window_height: int,
+    ) -> ControlSample | None:
+        """Find Rekordbox's icon-only local Collection source button.
+
+        Rekordbox 7 replaces the Collection tree with a streaming-service
+        browser when Spotify (or another service) is selected. UIA exposes the
+        local Collection switch as the first unnamed button in the narrow
+        source rail, while its tooltip is only painted after hover. Geometry is
+        therefore the stable observable identity.
+        """
+        candidates = [
+            sample
+            for sample in samples
+            if sample.control_type == "Button"
+            and not sample.text.strip()
+            and 45 <= sample.left <= 80
+            and 15 <= sample.right - sample.left <= 30
+            and 15 <= sample.bottom - sample.top <= 30
+            and sample.top >= window_height * 0.55
+        ]
+        return min(candidates, key=lambda sample: sample.top, default=None)
+
+    def _activate_collection_browser(
+        self,
+        root,
+        samples: list[ControlSample],
+        window_width: int,
+    ) -> tuple[Any, list[ControlSample], int]:
+        """Make the local Collection browser visible and select it.
+
+        The source rail is stateful: selecting Spotify removes the Text node
+        named ``Collection`` entirely. Treating that node as a permanent hard
+        requirement made an otherwise healthy set fail before the first load.
+        Reacquire once for transient UIA gaps, then explicitly switch back to
+        the local source rail and prove that Collection became visible.
+        """
+
+        collection_controls = self._collection_controls(samples)
+        if len(collection_controls) != 1:
+            root.set_focus()
+            time.sleep(0.15)
+            root = self._root()
+            descendants = root.descendants()
+            samples, window_width = self._sample_controls(root, descendants)
+            collection_controls = self._collection_controls(samples)
+
+        if not collection_controls:
+            window = root.rectangle()
+            source_switch = self._local_collection_switch(samples, window.height())
+            if source_switch is None:
+                tree_toggles = [
+                    sample
+                    for sample in samples
+                    if sample.control_type == "Button"
+                    and sample.text == "ShowHideTreeShortcutButton"
+                ]
+                if len(tree_toggles) == 1:
+                    tree_toggles[0].control.click_input()
+                    time.sleep(0.3)
+                    root = self._root()
+                    descendants = root.descendants()
+                    samples, window_width = self._sample_controls(root, descendants)
+                    window = root.rectangle()
+                    source_switch = self._local_collection_switch(
+                        samples,
+                        window.height(),
+                    )
+            if source_switch is not None:
+                root.set_focus()
+                root.click_input(
+                    coords=(
+                        (source_switch.left + source_switch.right) // 2,
+                        (source_switch.top + source_switch.bottom) // 2,
+                    )
+                )
+                time.sleep(0.6)
+                root = self._root()
+                descendants = root.descendants()
+                samples, window_width = self._sample_controls(root, descendants)
+                collection_controls = self._collection_controls(samples)
+
+        if len(collection_controls) != 1:
+            raise RuntimeError(
+                "Could not activate the local Rekordbox Collection browser; "
+                f"found {len(collection_controls)} Collection sources after recovery"
+            )
+        collection_controls[0].click_input()
+        time.sleep(0.3)
+        root = self._root()
+        descendants = root.descendants()
+        samples, window_width = self._sample_controls(root, descendants)
+        return root, samples, window_width
+
+    @staticmethod
     def _set_clipboard_text(value: str) -> str | None:
         previous = None
         win32clipboard.OpenClipboard()
@@ -618,25 +723,15 @@ class RekordboxUIAdapter:
             raise RuntimeError(
                 f"Rekordbox must be in Performance mode, found {mode!r}"
             )
-        collection_controls = [
-            sample.control
-            for sample in samples
-            if sample.control_type == "Text"
-            and normalize_title(sample.text) == "collection"
-        ]
-        if len(collection_controls) != 1:
-            raise RuntimeError(
-                "Expected one Rekordbox Collection browser source, "
-                f"found {len(collection_controls)}"
-            )
-        collection_controls[0].click_input()
-        # Clicking Collection can rebuild the entire browser pane. Any search
-        # wrapper captured before this click may still exist as a Python object
-        # while no longer receiving keyboard input.
-        time.sleep(0.3)
-        root = self._root()
-        descendants = root.descendants()
-        samples, window_width = self._sample_controls(root, descendants)
+        # Streaming services replace the local Collection Text node rather than
+        # merely selecting another tree row. Recover that state before every
+        # exact load, then reacquire the browser because either source click can
+        # rebuild the QML pane and invalidate captured wrappers.
+        root, samples, window_width = self._activate_collection_browser(
+            root,
+            samples,
+            window_width,
+        )
         search_controls = [
             sample.control
             for sample in samples
