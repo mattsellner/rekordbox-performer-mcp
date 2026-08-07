@@ -635,7 +635,15 @@ class AutonomousSetRunner:
                 self.state.plan.rescue_loop_beats,
             )
             if result.get("verified") is not True:
-                raise RuntimeError("rescue loop could not be verified")
+                errors = "; ".join(str(item) for item in result.get("errors", []))
+                warning = "rescue loop unavailable; continuing replacement planning"
+                if errors:
+                    warning += f": {errors}"
+                if not self.state.warnings or self.state.warnings[-1] != warning:
+                    self.state.warnings.append(warning)
+                self.state.status = "recovering"
+                self._write()
+                return
             self.state.rescue_loop_active = True
             self.state.rescue_loop_deck = self.state.current_deck
             self.state.status = "recovering"

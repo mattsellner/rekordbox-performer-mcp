@@ -120,10 +120,18 @@ def encode_action(
             note = 15 + cue
         else:
             note = DECK_NOTES[action]
+        # Rekordbox's LoopDouble/LoopHalf mappings use the ``Fast`` repeat
+        # flag.  An 80 ms button hold can therefore register several repeats
+        # (a requested 16-beat loop was observed expanding to 512 beats).
+        # Pulse repeatable controls briefly so one action is exactly one step.
+        hold_ms = min(note_hold_ms, 5) if action in {
+            "loop_double",
+            "loop_half",
+        } else note_hold_ms
         return [
             EncodedMessage(
                 Message("note_on", channel=channel, note=note, velocity=127),
-                delay_after_ms=note_hold_ms,
+                delay_after_ms=hold_ms,
             ),
             # Rekordbox controller mappings expect button release as Note On
             # velocity 0 on the same status byte, matching Pioneer hardware.

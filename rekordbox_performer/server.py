@@ -43,6 +43,7 @@ from .performance import (
     cue_preparation_plan,
     fx_recipe,
     observation_from_elapsed,
+    rescue_loop_window,
     sync_report,
     transition_qa,
     vocal_handoff,
@@ -261,6 +262,24 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
     if beats_to_bar < 0.08:
         beats_to_bar = 0.0
     delay_ms = round(beats_to_bar * 60_000.0 / float(state["bpm"]))
+    start_bar = int(state["bar"]) if beats_to_bar == 0.0 else int(state["bar"]) + 1
+    window = rescue_loop_window(
+        profile_store.get(str(state["track_id"])),
+        start_bar=start_bar,
+        requested_beats=beats,
+    )
+    if window.get("verified") is not True:
+        return {
+            "verified": False,
+            "errors": [str(window["error"])],
+            "deck": deck,
+            "title": title,
+            "beats": 0,
+            "requested_beats": beats,
+            "loop_window": window,
+            "scheduled_at_bar_boundary_ms": delay_ms,
+        }
+    effective_beats = int(window["beats"])
     events = [
         {
             "at_ms": delay_ms,
@@ -268,7 +287,7 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
             "parameters": {"deck": deck},
         }
     ]
-    doubles = {4: 0, 8: 1, 16: 2}[beats]
+    doubles = {4: 0, 8: 1, 16: 2}[effective_beats]
     for index in range(doubles):
         events.append(
             {
@@ -278,12 +297,12 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
             }
         )
     job = scheduler.start(
-        f"verified {beats}-beat rescue loop on deck {deck}",
+        f"verified {effective_beats}-beat rescue loop on deck {deck}",
         events,
         completion_verifier=lambda: _verify_rescue_loop(
             deck=deck,
             title=title,
-            beats=beats,
+            beats=effective_beats,
             bpm=float(state["bpm"]),
         ),
         execution_id=(
@@ -295,9 +314,39 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
         await task
     final = scheduler.get(job["id"])
     verification = final.get("verification") or {}
+    # Observation can occasionally miss the wrap even when Rekordbox accepted
+    # the command. Replace the uncertain loop with a direct 4-beat AutoLoop
+    # and verify again; never leave a huge or unknown loop armed.
+    fallback = None
+    if verification.get("verified") is not True and effective_beats != 4:
+        fallback_job = scheduler.start(
+            f"verified 4-beat rescue fallback on deck {deck}",
+            [{"at_ms": 0, "action": "loop_4", "parameters": {"deck": deck}}],
+            completion_verifier=lambda: _verify_rescue_loop(
+                deck=deck,
+                title=title,
+                beats=4,
+                bpm=float(state["bpm"]),
+            ),
+            execution_id=(
+                f"rescue-loop-fallback-{deck}-{state['track_id']}-"
+                f"{int(time.time() * 1000)}"
+            ),
+        )
+        fallback_task = scheduler.jobs[fallback_job["id"]].task
+        if fallback_task is not None:
+            await fallback_task
+        fallback = scheduler.get(fallback_job["id"])
+        fallback_verification = fallback.get("verification") or {}
+        if fallback_verification.get("verified") is True:
+            verification = fallback_verification
     return {
         **verification,
         "job": final,
+        "fallback_job": fallback,
+        "requested_beats": beats,
+        "effective_beats": verification.get("beats", effective_beats),
+        "loop_window": window,
         "scheduled_at_bar_boundary_ms": delay_ms,
     }
 

@@ -387,6 +387,57 @@ def test_autonomous_runner_engages_loop_and_releases_it_in_retry(tmp_path) -> No
     asyncio.run(scenario())
 
 
+def test_unverified_rescue_loop_does_not_terminate_the_set(tmp_path) -> None:
+    async def scenario() -> None:
+        plan = AutonomousSetPlan(
+            name="loop verification fallback",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[option("a-b", "a", "b", 1)],
+            target_track_count=2,
+            retry_limit=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "failed"}}
+
+        async def schedule(next_option, release_loop):
+            assert release_loop is False
+            jobs["recovered"] = {"id": "recovered", "status": "completed"}
+            return {"ready": True, "job": jobs["recovered"]}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "unverified-loop.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: (
+                {"passed": False, "faults": ["opening failed"]}
+                if job_id == "opening"
+                else {"passed": True, "faults": []}
+            ),
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=6),
+            engage_loop=lambda deck, beats: asyncio.sleep(
+                0,
+                result={"verified": False, "errors": ["transport read missed wrap"]},
+            ),
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        state = runner.public()
+        assert state["status"] == "completed"
+        assert state["rescue_loop_active"] is False
+        assert any(
+            "continuing replacement planning" in warning
+            for warning in state["warnings"]
+        )
+
+    asyncio.run(scenario())
+
+
 def test_tempo_plan_enforces_stretch_and_maps_slider() -> None:
     plan = TempoPlan(target_bpm=130, tempo_range_percent=10)
     plan.validate_start(native_bpm=130, live_bpm=127)

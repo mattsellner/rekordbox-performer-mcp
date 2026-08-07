@@ -180,6 +180,71 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
     }
 
 
+def rescue_loop_window(
+    profile: TrackProfile,
+    *,
+    start_bar: int,
+    requested_beats: int,
+) -> dict[str, Any]:
+    """Choose a short, analyzed beat loop that cannot cross into the outro.
+
+    Rescue loops are intentionally constrained to 4/8/16 beats.  The window
+    ends before the earliest analyzed mix-out or outro boundary, and a loop is
+    rejected if its low-band waveform has already collapsed.  This keeps a
+    recovery loop on the consistent beat section instead of repeatedly
+    replaying the track's fade to silence.
+    """
+    if requested_beats not in {4, 8, 16}:
+        raise ValueError("rescue loop must be 4, 8, or 16 beats")
+    signature = profile.time_signature
+    boundaries = [
+        item.bar
+        for item in profile.landmarks
+        if item.kind == "mix_out" and item.confidence in {"verified", "high"}
+    ]
+    boundaries.extend(
+        item.start_bar
+        for item in profile.phrase_boundaries
+        if item.label.casefold() == "outro"
+        and item.confidence in {"verified", "high"}
+    )
+    mix_out_bar = min((bar for bar in boundaries if bar >= start_bar), default=None)
+
+    energy = {item.bar: float(item.median) for item in profile.bass_energy_by_bar}
+    positive = sorted(value for value in energy.values() if value > 0)
+    typical = positive[len(positive) // 2] if positive else 0.0
+    minimum_energy = max(1.0, typical * 0.2) if positive else 0.0
+
+    choices = [beats for beats in (requested_beats, 8, 4) if beats <= requested_beats]
+    choices = list(dict.fromkeys(choices))
+    for beats in choices:
+        bars = max(1, beats // signature)
+        end_bar = start_bar + bars
+        if mix_out_bar is not None and end_bar > mix_out_bar:
+            continue
+        samples = [energy[bar] for bar in range(start_bar, end_bar) if bar in energy]
+        if samples and min(samples) < minimum_energy:
+            continue
+        return {
+            "verified": True,
+            "beats": beats,
+            "start_bar": start_bar,
+            "end_bar": end_bar,
+            "mix_out_bar": mix_out_bar,
+            "downgraded": beats != requested_beats,
+            "energy_median": round(sum(samples) / len(samples), 3) if samples else None,
+        }
+    return {
+        "verified": False,
+        "beats": 0,
+        "start_bar": start_bar,
+        "end_bar": start_bar,
+        "mix_out_bar": mix_out_bar,
+        "downgraded": False,
+        "error": "no steady analyzed beat section remains before mix-out",
+    }
+
+
 def sync_report(
     outgoing: dict[str, Any], incoming: dict[str, Any]
 ) -> dict[str, Any]:

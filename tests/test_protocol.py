@@ -84,3 +84,13 @@ def test_bar_repair_beat_jumps_have_stable_deck_scoped_notes() -> None:
 
     assert (back_one.channel, back_one.note) == (0, 47)
     assert (forward_two.channel, forward_two.note) == (1, 50)
+
+
+def test_repeatable_loop_buttons_are_single_step_pulses() -> None:
+    double = encode_action("loop_double", {"deck": 1})
+    half = encode_action("loop_half", {"deck": 2})
+
+    assert double[0].delay_after_ms == 5
+    assert half[0].delay_after_ms == 5
+    assert double[1].message.velocity == 0
+    assert half[1].message.velocity == 0
