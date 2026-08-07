@@ -666,65 +666,102 @@ def _breakdown_events(
     incoming_deck: int,
     launch: MusicalEvent,
 ) -> list[MusicalEvent]:
-    return [
+    def fader_ramp(
+        deck: int,
+        *,
+        start_bar: int,
+        end_bar: int,
+        start_value: float,
+        end_value: float,
+    ) -> list[MusicalEvent]:
+        duration_beats = (end_bar - start_bar) * 4
+        return [
+            MusicalEvent(
+                bar_offset=start_bar + beat_index // 4,
+                beat_offset=beat_index % 4,
+                action="channel_fader",
+                parameters={
+                    "deck": deck,
+                    "value": round(
+                        start_value
+                        + (end_value - start_value)
+                        * beat_index
+                        / duration_beats,
+                        3,
+                    ),
+                },
+            )
+            for beat_index in range(duration_beats + 1)
+        ]
+
+    events = [
         MusicalEvent(
             bar_offset=0,
-            action="channel_fader",
-            parameters={"deck": incoming_deck, "value": 0.2},
+            action="eq_low",
+            parameters={"deck": incoming_deck, "value": -1},
         ),
         launch,
         MusicalEvent(
-            bar_offset=2,
-            action="channel_fader",
-            parameters={"deck": incoming_deck, "value": 0.48},
+            bar_offset=8,
+            action="eq_low",
+            parameters={"deck": outgoing_deck, "value": -1},
         ),
         MusicalEvent(
-            bar_offset=4,
+            bar_offset=8,
+            action="eq_low",
+            parameters={"deck": incoming_deck, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=9,
             action="filter",
-            parameters={"deck": outgoing_deck, "value": 0.22},
+            parameters={"deck": outgoing_deck, "value": 0.2},
         ),
         MusicalEvent(
-            bar_offset=4,
-            action="channel_fader",
-            parameters={"deck": outgoing_deck, "value": 0.78},
-        ),
-        MusicalEvent(
-            bar_offset=4,
-            action="channel_fader",
-            parameters={"deck": incoming_deck, "value": 0.78},
-        ),
-        MusicalEvent(
-            bar_offset=6,
+            bar_offset=10,
             action="filter",
-            parameters={"deck": outgoing_deck, "value": 0.52},
-        ),
-        MusicalEvent(
-            bar_offset=6,
-            action="channel_fader",
             parameters={"deck": outgoing_deck, "value": 0.38},
         ),
         MusicalEvent(
-            bar_offset=8,
-            action="channel_fader",
-            parameters={"deck": incoming_deck, "value": 1},
+            bar_offset=11,
+            action="filter",
+            parameters={"deck": outgoing_deck, "value": 0.56},
         ),
         MusicalEvent(
-            bar_offset=8,
-            action="channel_fader",
-            parameters={"deck": outgoing_deck, "value": 0},
-        ),
-        MusicalEvent(
-            bar_offset=8,
+            bar_offset=12,
             action="filter",
             parameters={"deck": outgoing_deck, "value": 0},
         ),
         MusicalEvent(
-            bar_offset=8,
+            bar_offset=12,
+            action="eq_low",
+            parameters={"deck": outgoing_deck, "value": 0},
+        ),
+        MusicalEvent(
+            bar_offset=12,
             beat_offset=1,
             action="cue",
             parameters={"deck": outgoing_deck},
         ),
     ]
+    events.extend(
+        fader_ramp(
+            incoming_deck,
+            start_bar=0,
+            end_bar=8,
+            start_value=0.08,
+            end_value=1.0,
+        )
+    )
+    events.extend(
+        fader_ramp(
+            outgoing_deck,
+            start_bar=8,
+            end_bar=12,
+            start_value=1.0,
+            end_value=0.0,
+        )
+    )
+    return sorted(events, key=lambda event: (event.bar_offset, event.beat_offset))
 
 
 def _phrase_cut_events(

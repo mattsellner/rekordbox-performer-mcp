@@ -32,6 +32,7 @@ class PerformerAdapter(Protocol):
     def rekordbox_status(self) -> dict[str, Any]: ...
     def transport_status(self) -> dict[str, Any]: ...
     def queue_steering(self, plan: AutonomousSetPlan) -> dict[str, Any]: ...
+    def register_recovery_planner(self, callback: Any) -> None: ...
     async def hold_loop(self, deck: int, beats: int) -> dict[str, Any]: ...
     def stop_automation(self) -> dict[str, Any]: ...
     def emergency_stop(self) -> dict[str, Any]: ...
@@ -82,6 +83,9 @@ class InProcessPerformerAdapter:
 
     def queue_steering(self, plan: AutonomousSetPlan) -> dict[str, Any]:
         return self._server().queue_autonomous_steering(plan)
+
+    def register_recovery_planner(self, callback: Any) -> None:
+        self._server().register_autonomous_recovery_planner(callback)
 
     async def hold_loop(self, deck: int, beats: int) -> dict[str, Any]:
         return await self._server().engage_rescue_loop(deck, beats)
@@ -320,6 +324,7 @@ class StandaloneDJEngine:
 
     async def _launch_plan(self, plan: AutonomousSetPlan) -> dict[str, Any]:
         self.plan = plan
+        self._register_recovery_planner()
         queue = self._queue_roles(plan)
         self.status_store.publish(
             phase=RuntimePhase.PREFLIGHT,
@@ -481,6 +486,7 @@ class StandaloneDJEngine:
             excluded=excluded,
         )
         self._automation_active = True
+        self._register_recovery_planner()
         if endless is not None:
             self._endless = endless
         self._endless_vibe = vibe
@@ -518,6 +524,76 @@ class StandaloneDJEngine:
             "plan": future.model_dump(),
             "launch": started,
         }
+
+    def _register_recovery_planner(self) -> None:
+        register = getattr(self.adapter, "register_recovery_planner", None)
+        if callable(register):
+            register(self._build_replacement_route)
+
+    async def _build_replacement_route(
+        self,
+        runner: dict[str, Any],
+    ) -> AutonomousSetPlan | None:
+        """Replace an exhausted handoff without interrupting the audible deck."""
+        anchor_id = str(runner.get("current_track_id") or "")
+        anchor_deck = runner.get("current_deck")
+        if not anchor_id or anchor_deck not in {1, 2}:
+            raise RuntimeError("replacement planner has no authoritative live deck")
+        played = list(runner.get("played_track_ids") or [])
+        rejected = list(runner.get("exhausted_incoming_track_ids") or [])
+        remaining = max(
+            1,
+            int(runner.get("target_track_count") or len(played) + 1)
+            - len(played),
+        )
+        excluded = list(dict.fromkeys([*played, *rejected]))
+        rejected_titles = [
+            self.profile_store.get(track_id).title
+            for track_id in rejected
+            if track_id in {item.track_id for item in self.profile_store.list_profiles()}
+        ]
+        self.status_store.publish(
+            phase=RuntimePhase.SELECTING,
+            headline="Selecting a replacement transition",
+            detail=(
+                "Keeping the current deck audible while replacing "
+                + (", ".join(rejected_titles) if rejected_titles else "the failed route")
+                + "."
+            ),
+            severity="warning",
+            current=self._role(anchor_id, deck=int(anchor_deck), state="playing"),
+        )
+
+        restricted = self._candidate_track_ids
+        try:
+            future, _ = self._build_future_route(
+                anchor_id=anchor_id,
+                anchor_deck=int(anchor_deck),
+                target=None,
+                vibe=self._endless_vibe,
+                transition_count=remaining,
+                excluded=excluded,
+            )
+        except ValueError:
+            if restricted is None:
+                raise
+            # Playlist/set constraints are preferred, but uninterrupted audio
+            # has priority once every in-scope route is exhausted. Broaden to
+            # the complete prepared library only for this emergency branch.
+            self._candidate_track_ids = None
+            try:
+                future, _ = self._build_future_route(
+                    anchor_id=anchor_id,
+                    anchor_deck=int(anchor_deck),
+                    target=None,
+                    vibe=self._endless_vibe,
+                    transition_count=remaining,
+                    excluded=excluded,
+                )
+            finally:
+                self._candidate_track_ids = restricted
+        self.plan = future
+        return future
 
     def _build_future_route(
         self,
@@ -912,6 +988,14 @@ class StandaloneDJEngine:
             detail = (
                 "The next route is being recovered while the current deck "
                 "remains audible."
+            )
+            severity = "warning"
+        elif status == "recovering":
+            phase = RuntimePhase.RECOVERING
+            headline = "Recovering the next transition"
+            detail = (
+                runner.get("last_recovery_error")
+                or "The current deck remains audible while a replacement route is selected."
             )
             severity = "warning"
         elif critical_at is not None and now >= float(critical_at):

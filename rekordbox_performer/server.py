@@ -115,6 +115,7 @@ def _cancel_for_sync_guard(job_id: str, errors: list[str]) -> None:
         job.error = "; ".join(errors)
     scheduler.cancel(job_id)
 autonomous_runner: AutonomousSetRunner | None = None
+autonomous_recovery_planner: Any = None
 track_title_aliases: dict[str, str] = {}
 preflighted_set_fingerprints: set[str] = set()
 
@@ -3170,8 +3171,17 @@ def _get_autonomous_runner() -> AutonomousSetRunner:
             run_tempo=_execute_tempo_plan,
             advance=_runner_advance,
             finish=lambda _status: engine.release_set_control(),
+            recover_route=autonomous_recovery_planner,
         )
     return autonomous_runner
+
+
+def register_autonomous_recovery_planner(callback: Any) -> None:
+    """Install the standalone app's local replacement-route planner."""
+    global autonomous_recovery_planner
+    autonomous_recovery_planner = callback
+    if autonomous_runner is not None:
+        autonomous_runner.recover_route = callback
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})

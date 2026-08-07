@@ -15,6 +15,7 @@ from rekordbox_performer.standalone_planner import (
     DJBrief,
     LocalDJPlanner,
     TransitionKingCompiler,
+    _breakdown_events,
 )
 from rekordbox_performer.standalone_status import (
     RuntimePhase,
@@ -529,6 +530,7 @@ def test_status_store_is_atomic_and_formats_corner_view(tmp_path) -> None:
 class FakeAdapter:
     def __init__(self) -> None:
         self.armed_seconds = None
+        self.recovery_planner = None
         self.statuses = [
             {
                 "active": True,
@@ -608,6 +610,9 @@ class FakeAdapter:
     def queue_steering(self, plan):
         return {"queued": True, "projected_plan": plan.model_dump()}
 
+    def register_recovery_planner(self, callback):
+        self.recovery_planner = callback
+
     async def hold_loop(self, deck, beats):
         return {"verified": True}
 
@@ -638,12 +643,55 @@ def test_standalone_engine_runs_without_codex_round_trips(tmp_path) -> None:
 
         assert result["ready"] is True
         assert engine.adapter.armed_seconds == 30 * 60
+        assert callable(engine.adapter.recovery_planner)
         assert statuses.read().phase == RuntimePhase.COMPLETE
         assert any(
             event.phase == RuntimePhase.PREFLIGHT for event in statuses.recent_events()
         )
 
     asyncio.run(scenario())
+
+
+def test_breakdown_handoff_establishes_incoming_before_smooth_retirement() -> None:
+    from rekordbox_performer.intelligence import MusicalEvent
+
+    events = _breakdown_events(
+        outgoing_deck=1,
+        incoming_deck=2,
+        launch=MusicalEvent(
+            bar_offset=0,
+            action="play_pause",
+            parameters={"deck": 2},
+        ),
+    )
+    outgoing_faders = [
+        event
+        for event in events
+        if event.action == "channel_fader" and event.parameters.get("deck") == 1
+    ]
+    incoming_faders = [
+        event
+        for event in events
+        if event.action == "channel_fader" and event.parameters.get("deck") == 2
+    ]
+
+    assert min(event.bar_offset for event in outgoing_faders) == 8
+    assert incoming_faders[0].parameters["value"] == 0.08
+    assert incoming_faders[-1].parameters["value"] == 1.0
+    assert len(incoming_faders) == 33
+    assert len(outgoing_faders) == 17
+    assert any(
+        event.action == "eq_low"
+        and event.bar_offset == 8
+        and event.parameters == {"deck": 1, "value": -1}
+        for event in events
+    )
+    assert any(
+        event.action == "eq_low"
+        and event.bar_offset == 8
+        and event.parameters == {"deck": 2, "value": 0}
+        for event in events
+    )
 
 
 def test_playlist_planner_uses_every_track_once() -> None:
@@ -739,6 +787,41 @@ def test_endless_route_reuses_an_exhausted_small_pool_safely(tmp_path) -> None:
     assert len({future.opening.track_id, *[
         option.incoming.track_id for option in future.transitions
     ]}) == 6
+
+
+def test_embedded_replacement_planner_excludes_exhausted_track(tmp_path) -> None:
+    async def scenario() -> None:
+        profiles = ProfileStore(tmp_path / "profiles")
+        for item in (
+            profile("a", "Current", 126, "9A"),
+            profile("b", "Failed", 126, "9A"),
+            profile("c", "Replacement One", 127, "10A"),
+            profile("d", "Replacement Two", 128, "11A"),
+        ):
+            profiles.upsert(item)
+        statuses = StandaloneStatusStore(tmp_path / "status")
+        engine = StandaloneDJEngine(
+            profile_store=profiles,
+            status_store=statuses,
+            adapter=FakeAdapter(),
+        )
+
+        future = await engine._build_replacement_route(
+            {
+                "current_track_id": "a",
+                "current_deck": 1,
+                "played_track_ids": ["a"],
+                "exhausted_incoming_track_ids": ["b"],
+                "target_track_count": 3,
+            }
+        )
+
+        assert future is not None
+        assert future.opening.track_id == "a"
+        assert "b" not in [item.incoming.track_id for item in future.transitions]
+        assert statuses.read().headline == "Selecting a replacement transition"
+
+    asyncio.run(scenario())
 
 
 def test_engine_resolves_accent_insensitive_search_and_loaded_deck(tmp_path) -> None:
