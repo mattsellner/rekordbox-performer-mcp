@@ -429,7 +429,9 @@ def test_local_planner_builds_repeatable_harmonic_tempo_route() -> None:
     assert first.opening.track_id == "a"
     assert [item.incoming.track_id for item in first.transitions] == ["b", "c"]
     assert first.transitions[-1].tempo_after.target_bpm == 130
-    assert first.rescue_loop_trigger_bars == 16
+    assert first.reserve_deadline_bars == 48
+    assert first.rescue_loop_trigger_bars == 32
+    assert first.rescue_loop_beats == 4
 
 
 def test_local_planner_compiles_an_eight_track_rising_set() -> None:
@@ -598,7 +600,6 @@ class FakeAdapter:
                 ]
             },
         }
-
     def rekordbox_status(self):
         return {
             "decks": [
@@ -621,6 +622,55 @@ class FakeAdapter:
 
     def emergency_stop(self):
         return {"status": "stopped"}
+
+
+def test_recovery_status_keeps_selected_next_track_visible(tmp_path) -> None:
+    store = ProfileStore(tmp_path)
+    first = profile("a", "A", 128, "9A")
+    second = profile("b", "B", 129, "10A")
+    store.upsert(first)
+    store.upsert(second)
+    status = StandaloneStatusStore(tmp_path)
+    engine = StandaloneDJEngine(profile_store=store, status_store=status)
+    engine.plan = LocalDJPlanner([first, second]).build_plan(
+        DJBrief(start_track_id="a", target_track_count=2)
+    )
+
+    engine._publish_runner_state(
+        {
+            "status": "recovering",
+            "current_track_id": "a",
+            "current_deck": 1,
+            "active_option_id": None,
+            "staged_option_id": None,
+            "active_job_id": None,
+            "transition_start_at": None,
+            "transition_critical_at": None,
+            "deadline_phase": "reserve",
+            "rescue_loop_active": False,
+            "failures": [],
+        },
+        {
+            "connected": True,
+            "live_state": {
+                "decks": [
+                    {
+                        "deck": 1,
+                        "bpm": 128,
+                        "bar": 97,
+                        "beat": 1,
+                        "playing": True,
+                        "observation_age_ms": 25,
+                    }
+                ]
+            },
+        },
+    )
+
+    snapshot = status.read()
+    assert snapshot.staged.track_id == "b"
+    assert snapshot.staged.state == "selected"
+    assert format_snapshot(snapshot).next_track.startswith("Next: B")
 
 
 def test_standalone_engine_runs_without_codex_round_trips(tmp_path) -> None:

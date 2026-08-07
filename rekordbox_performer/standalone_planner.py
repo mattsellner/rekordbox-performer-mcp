@@ -1957,9 +1957,9 @@ class LocalDJPlanner:
             transitions=transitions,
             target_track_count=len(route),
             stage_deadline_bars=64,
-            reserve_deadline_bars=32,
-            rescue_loop_trigger_bars=16,
-            rescue_loop_beats=16,
+            reserve_deadline_bars=48,
+            rescue_loop_trigger_bars=32,
+            rescue_loop_beats=4,
             retry_limit=3,
             tempo_strategy="auto",
             tempo_target_bpm=(

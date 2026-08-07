@@ -941,13 +941,23 @@ class StandaloneDJEngine:
         staged_option = self._option(
             runner.get("staged_option_id") or runner.get("active_option_id")
         )
+        selected_option = staged_option or next(
+            (
+                item
+                for item in sorted(
+                    self.plan.transitions, key=lambda value: value.priority
+                )
+                if item.card.outgoing_track_id == current_id
+            ),
+            None,
+        )
         staged = (
             self._role(
-                staged_option.incoming.track_id,
-                deck=staged_option.card.incoming_deck,
-                state="staged",
+                selected_option.incoming.track_id,
+                deck=selected_option.card.incoming_deck,
+                state="staged" if staged_option is not None else "selected",
             )
-            if staged_option is not None
+            if selected_option is not None
             else TrackRole()
         )
         following = self._following(staged.track_id)
@@ -1089,7 +1099,7 @@ class StandaloneDJEngine:
     async def hold_current(self) -> dict[str, Any]:
         runner = self.adapter.runner_status()
         deck = int(runner["current_deck"])
-        result = await self.adapter.hold_loop(deck, 16)
+        result = await self.adapter.hold_loop(deck, 4)
         if result.get("verified") is not True:
             raise RuntimeError("prepared hold loop could not be verified")
         self.adapter.stop_automation()

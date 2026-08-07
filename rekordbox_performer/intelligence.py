@@ -1991,17 +1991,137 @@ def compile_transition_card(
         }
     minimum_lead_beats = card.minimum_lead_bars * beats_per_bar
     earliest = current_beat + minimum_lead_beats
-    candidates = list(phrases)
-    if card.start_phrase_index is not None:
-        candidates = [
-            phrase for phrase in candidates if phrase.index == card.start_phrase_index
-        ]
+    candidates = [
+        phrase
+        for phrase in phrases
+        if phrase.start_beat >= earliest
+    ]
     if card.start_phrase_label:
         label = card.start_phrase_label.casefold()
         candidates = [
             phrase for phrase in candidates if phrase.label.casefold() == label
         ]
-    candidates = [phrase for phrase in candidates if phrase.start_beat >= earliest]
+
+    mix_out_bars = [
+        landmark.bar
+        for landmark in anchor_profile.landmarks
+        if landmark.kind == "mix_out"
+        and landmark.confidence in {"verified", "high"}
+    ]
+    if mix_out_bars:
+        mix_out_bar = min(mix_out_bars)
+        candidates = [phrase for phrase in candidates if phrase.start_bar < mix_out_bar]
+
+    outgoing_stops = [
+        event
+        for event in card.events
+        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck
+    ]
+    final_stop = (
+        max(outgoing_stops, key=lambda event: (event.bar_offset, event.beat_offset))
+        if outgoing_stops
+        else None
+    )
+    requested_phrase = next(
+        (
+            phrase
+            for phrase in phrases
+            if card.start_phrase_index is not None
+            and phrase.index == card.start_phrase_index
+        ),
+        None,
+    )
+    if (
+        requested_phrase is not None
+        and requested_phrase.start_beat >= earliest
+        and requested_phrase.beat_in_bar != 1
+    ):
+        return {
+            "ready": False,
+            "errors": [
+                "selected outgoing phrase must start on beat 1; "
+                f"analysis reports beat {requested_phrase.beat_in_bar}"
+            ],
+            "events": [],
+        }
+    exact_candidates = [
+        phrase
+        for phrase in candidates
+        if card.start_phrase_index is not None
+        and phrase.index == card.start_phrase_index
+    ]
+    retargeted = False
+    if exact_candidates:
+        candidates = exact_candidates
+    elif card.start_phrase_index is not None and candidates:
+        # A card is planned before the set starts, but an incoming track has
+        # already advanced through the preceding overlap by the time it owns
+        # the room. Treat the stored phrase index as the preferred structural
+        # template, not an impossible absolute timestamp. Retarget to the next
+        # live phrase whose critical handoff lands on the same phrase type.
+        candidates = [phrase for phrase in candidates if phrase.beat_in_bar == 1]
+        if (
+            anchor_profile.beat_count
+            and final_stop is not None
+            and not card.loop_plan_verified
+        ):
+            viable = [
+                phrase
+                for phrase in candidates
+                if (
+                    phrase.start_beat
+                    + final_stop.bar_offset * beats_per_bar
+                    + final_stop.beat_offset
+                    <= anchor_profile.beat_count
+                )
+            ]
+            if viable:
+                candidates = viable
+
+        original_critical = None
+        if requested_phrase is not None:
+            original_critical_bar = (
+                requested_phrase.start_bar + card.critical_bar_offset
+            )
+            original_critical = next(
+                (
+                    phrase
+                    for phrase in phrases
+                    if phrase.start_bar == original_critical_bar
+                    and phrase.beat_in_bar == 1
+                ),
+                None,
+            )
+
+        def structural_score(phrase: PhraseBoundary) -> tuple[int, int, int]:
+            critical_bar = phrase.start_bar + card.critical_bar_offset
+            critical = next(
+                (
+                    item
+                    for item in phrases
+                    if item.start_bar == critical_bar and item.beat_in_bar == 1
+                ),
+                None,
+            )
+            critical_match = int(
+                critical is not None
+                and original_critical is not None
+                and critical.label.casefold() == original_critical.label.casefold()
+            )
+            critical_boundary = int(critical is not None)
+            start_match = int(
+                requested_phrase is not None
+                and phrase.label.casefold() == requested_phrase.label.casefold()
+            )
+            return critical_match, critical_boundary, start_match
+
+        best_structure = max(structural_score(phrase) for phrase in candidates)
+        candidates = [
+            phrase
+            for phrase in candidates
+            if structural_score(phrase) == best_structure
+        ]
+        retargeted = True
     if not candidates:
         return {
             "ready": False,
@@ -2024,16 +2144,11 @@ def compile_transition_card(
     start_beat = chosen_phrase.start_beat
     start_delay_ms = round((start_beat - current_beat) * beat_ms)
 
-    outgoing_stops = [
-        event
-        for event in card.events
-        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck
-    ]
-    if anchor_profile.beat_count and outgoing_stops:
-        final_stop = max(
-            outgoing_stops,
-            key=lambda event: (event.bar_offset, event.beat_offset),
-        )
+    if (
+        anchor_profile.beat_count
+        and final_stop is not None
+        and not card.loop_plan_verified
+    ):
         retirement_beat = (
             start_beat + final_stop.bar_offset * beats_per_bar + final_stop.beat_offset
         )
@@ -2094,6 +2209,8 @@ def compile_transition_card(
         "start_bar": chosen_phrase.start_bar,
         "start_beat_in_bar": chosen_phrase.beat_in_bar,
         "start_phrase": chosen_phrase.model_dump(),
+        "start_phrase_retargeted": retargeted,
+        "requested_start_phrase_index": card.start_phrase_index,
         "incoming_bass_handoff": incoming_bass_handoff_evidence(card, incoming),
         "quantized_transport_lead_ms": quantized_transport_lead_ms,
         "events": events,

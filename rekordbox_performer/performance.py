@@ -208,7 +208,10 @@ def rescue_loop_window(
         if item.label.casefold() == "outro"
         and item.confidence in {"verified", "high"}
     )
-    mix_out_bar = min((bar for bar in boundaries if bar >= start_bar), default=None)
+    # Keep the absolute analyzed exit boundary even after the playhead passes
+    # it. Filtering to only future boundaries made the guard disappear one
+    # bar into the outro and allowed a new loop to be created in silence.
+    mix_out_bar = min(boundaries, default=None)
 
     energy = {item.bar: float(item.median) for item in profile.bass_energy_by_bar}
     positive = sorted(value for value in energy.values() if value > 0)
@@ -220,7 +223,9 @@ def rescue_loop_window(
     for beats in choices:
         bars = max(1, beats // signature)
         end_bar = start_bar + bars
-        if mix_out_bar is not None and end_bar > mix_out_bar:
+        if mix_out_bar is not None and (
+            start_bar >= mix_out_bar or end_bar > mix_out_bar
+        ):
             continue
         samples = [energy[bar] for bar in range(start_bar, end_bar) if bar in energy]
         if samples and min(samples) < minimum_energy:
@@ -242,6 +247,63 @@ def rescue_loop_window(
         "mix_out_bar": mix_out_bar,
         "downgraded": False,
         "error": "no steady analyzed beat section remains before mix-out",
+    }
+
+
+def rescue_loop_target(
+    profile: TrackProfile,
+    *,
+    earliest_start_bar: int,
+    requested_beats: int,
+    lookahead_bars: int = 8,
+) -> dict[str, Any]:
+    """Pick the strongest safe bar just ahead for an emergency hold loop."""
+    energy = {item.bar: item for item in profile.bass_energy_by_bar}
+    options = []
+    for start_bar in range(earliest_start_bar, earliest_start_bar + lookahead_bars):
+        window = rescue_loop_window(
+            profile,
+            start_bar=start_bar,
+            requested_beats=requested_beats,
+        )
+        if window.get("verified") is not True:
+            continue
+        sample = energy.get(start_bar)
+        waveform_score = (
+            float(sample.median) * 4.0
+            + float(sample.mean)
+            + float(sample.peak) * 0.05
+            if sample is not None
+            else 0.0
+        )
+        phrase = next(
+            (
+                item
+                for item in profile.phrase_boundaries
+                if item.start_bar == start_bar and item.beat_in_bar == 1
+            ),
+            None,
+        )
+        phrase_bonus = (
+            12.0
+            if phrase is not None and phrase.label.casefold() in {"chorus", "up"}
+            else -20.0
+            if phrase is not None and phrase.label.casefold() == "outro"
+            else 0.0
+        )
+        options.append((waveform_score + phrase_bonus, -start_bar, window))
+    if not options:
+        return rescue_loop_window(
+            profile,
+            start_bar=earliest_start_bar,
+            requested_beats=requested_beats,
+        )
+    _, _, selected = max(options, key=lambda item: (item[0], item[1]))
+    return {
+        **selected,
+        "earliest_start_bar": earliest_start_bar,
+        "lookahead_bars": lookahead_bars,
+        "selection_reason": "strongest analyzed stable bar before mix-out",
     }
 
 

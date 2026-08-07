@@ -43,7 +43,7 @@ from .performance import (
     cue_preparation_plan,
     fx_recipe,
     observation_from_elapsed,
-    rescue_loop_window,
+    rescue_loop_target,
     sync_report,
     transition_qa,
     vocal_handoff,
@@ -263,10 +263,20 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
         beats_to_bar = 0.0
     delay_ms = round(beats_to_bar * 60_000.0 / float(state["bpm"]))
     start_bar = int(state["bar"]) if beats_to_bar == 0.0 else int(state["bar"]) + 1
-    window = rescue_loop_window(
+    window = rescue_loop_target(
         profile_store.get(str(state["track_id"])),
-        start_bar=start_bar,
-        requested_beats=beats,
+        earliest_start_bar=start_bar,
+        # Only the direct four-beat AutoLoop mapping is deterministic in the
+        # installed profile. Never synthesize longer rescue loops through the
+        # repeatable Loop Double control.
+        requested_beats=4,
+    )
+    target_bar = int(window.get("start_bar", start_bar))
+    delay_ms += round(
+        max(0, target_bar - start_bar)
+        * 4
+        * 60_000.0
+        / float(state["bpm"])
     )
     if window.get("verified") is not True:
         return {

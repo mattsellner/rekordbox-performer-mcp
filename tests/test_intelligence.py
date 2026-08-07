@@ -587,6 +587,85 @@ def test_card_compiles_to_next_phrase_boundary() -> None:
     )
 
 
+def test_card_retargets_a_planned_phrase_that_passed_during_prior_overlap() -> None:
+    outgoing = prepared_profile("a", "A")
+    outgoing.phrase_boundaries.extend(
+        [
+            PhraseBoundary(
+                index=3,
+                start_beat=129,
+                end_beat=192,
+                start_bar=33,
+                beat_in_bar=1,
+                length_beats=64,
+                length_bars=16,
+                kind_code=5,
+                label="chorus",
+                confidence="verified",
+            ),
+            PhraseBoundary(
+                index=4,
+                start_beat=193,
+                end_beat=256,
+                start_bar=49,
+                beat_in_bar=1,
+                length_beats=64,
+                length_bars=16,
+                kind_code=5,
+                label="chorus",
+                confidence="verified",
+            ),
+        ]
+    )
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=17,
+            beat=1,
+            track_beat=65,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            track_beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    card = valid_card()
+    card.start_phrase_index = 1
+
+    compiled = compile_transition_card(
+        card,
+        outgoing,
+        prepared_profile("b", "B"),
+        state,
+    )
+
+    assert compiled["ready"] is True
+    assert compiled["requested_start_phrase_index"] == 1
+    assert compiled["start_phrase_retargeted"] is True
+    assert compiled["start_bar"] == 33
+
+
 def test_card_rejects_unverified_vocal_plan() -> None:
     state = LiveState()
     state.update(

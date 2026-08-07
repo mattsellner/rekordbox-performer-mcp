@@ -116,9 +116,12 @@ class AutonomousSetPlan(BaseModel):
     # at house tempos for a rescue loop and reproduced exactly the dead-air
     # failure this runner exists to prevent.
     stage_deadline_bars: int = Field(default=64, ge=16, le=128)
-    reserve_deadline_bars: int = Field(default=32, ge=8, le=64)
-    rescue_loop_trigger_bars: int = Field(default=16, ge=4, le=32)
-    rescue_loop_beats: Literal[4, 8, 16] = 16
+    reserve_deadline_bars: int = Field(default=48, ge=8, le=64)
+    rescue_loop_trigger_bars: int = Field(default=32, ge=4, le=32)
+    # The imported Rekordbox mapping has one deterministic direct AutoLoop:
+    # four beats. Longer rescue loops previously depended on the repeatable
+    # Loop Double button and expanded unpredictably as far as 512 beats.
+    rescue_loop_beats: Literal[4, 8, 16] = 4
     retry_limit: int = Field(default=3, ge=1, le=10)
     tempo_strategy: Literal["auto", "manual", "hold"] = "auto"
     tempo_target_bpm: float | None = Field(default=None, gt=0)
@@ -725,6 +728,11 @@ class AutonomousSetRunner:
                         self.state.played_track_ids.append(option.incoming.track_id)
                         self.state.active_job_id = None
                         self.state.active_option_id = None
+                        # The just-completed incoming deck is now current, not
+                        # staged. Clear the old role immediately so the UI can
+                        # show the following selected candidate even while its
+                        # early load is still in progress or being retried.
+                        self.state.staged_option_id = None
                         self.state.transition_start_at = None
                         self.state.transition_critical_at = None
                         self.state.rescue_loop_active = False
