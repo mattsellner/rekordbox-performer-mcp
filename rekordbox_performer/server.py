@@ -1828,19 +1828,7 @@ async def launch_staged_track(
     if deck not in (1, 2):
         raise ValueError("deck must be 1 or 2")
     profile = profile_store.get(track_id)
-    entry = next(
-        (
-            item
-            for item in profile.landmarks
-            if item.kind in {"mix_in", "phrase_start"}
-            and item.bar == 1
-            and (item.beat or 1) == 1
-            and item.confidence in {"verified", "high"}
-        ),
-        None,
-    )
-    if entry is None:
-        raise RuntimeError("Track has no high-confidence file-start phrase landmark")
+    entry = _opening_file_start_landmark(profile)
     with deck_observer.exclusive_adapter():
         initial = rekordbox_ui.deck_snapshot(deck)
         if normalize_title(initial.title) != normalize_title(title):
@@ -1868,18 +1856,27 @@ async def launch_staged_track(
         raise RuntimeError("Rekordbox did not start the staged track")
 
     elapsed_beats = (time.monotonic() - launched_at) * profile.bpm / 60.0
-    total = elapsed_beats
-    bar = int(total // profile.time_signature) + 1
-    within_bar = total % profile.time_signature
+    entry_offset_beats = (entry.time_ms or 0) * profile.bpm / 60_000.0
+    track_total = max(0.0, elapsed_beats - entry_offset_beats)
+    grid_total = max(
+        0.0,
+        (entry.bar - 1) * profile.time_signature
+        + entry.beat
+        - 1
+        + elapsed_beats
+        - entry_offset_beats,
+    )
+    grid_whole = int(grid_total)
+    within_bar = grid_total % profile.time_signature
     observation = DeckObservation(
         deck=deck,
         track_id=track_id,
         title=title,
         bpm=second.bpm or profile.bpm,
         playing=True,
-        bar=bar,
+        bar=grid_whole // profile.time_signature + 1,
         beat=int(within_bar) + 1,
-        track_beat=int(total) + 1,
+        track_beat=int(track_total) + 1,
         beat_phase=within_bar - int(within_bar),
         sync_enabled=second.beat_sync_enabled,
         quantize_enabled=second.quantize_enabled,
@@ -1895,6 +1892,32 @@ async def launch_staged_track(
         "live_state": live_state.update(observation),
         "effect_verified": True,
     }
+
+
+def _opening_file_start_landmark(profile: TrackProfile):
+    """Return a proven phrase start at the beginning of an opening track.
+
+    An opener may contain a short pickup before its first downbeat. Incoming
+    transition launches remain governed by the stricter beat-one contract in
+    transition-card validation.
+    """
+    entry = next(
+        (
+            item
+            for item in profile.landmarks
+            if item.kind in {"mix_in", "phrase_start"}
+            and item.bar == 1
+            and item.confidence in {"verified", "high"}
+            and (
+                (item.time_ms is not None and item.time_ms <= 1_000)
+                or (item.time_ms is None and item.beat == 1)
+            )
+        ),
+        None,
+    )
+    if entry is None:
+        raise RuntimeError("Track has no high-confidence file-start phrase landmark")
+    return entry
 
 
 async def _establish_opening_mixer_contract(*, audible_deck: int) -> dict[str, Any]:
@@ -3201,6 +3224,12 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     except (KeyError, ValueError) as exc:
         return {"ready": False, "errors": [f"tempo arc: {exc}"]}
     unique_track_ids = {resolved_plan.opening.track_id}
+    try:
+        _opening_file_start_landmark(
+            profile_store.get(resolved_plan.opening.track_id)
+        )
+    except (KeyError, RuntimeError) as exc:
+        errors.append(f"opening: {exc}")
     for option in resolved_plan.transitions:
         unique_track_ids.add(option.incoming.track_id)
         try:

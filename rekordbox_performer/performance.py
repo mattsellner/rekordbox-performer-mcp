@@ -38,13 +38,21 @@ def observation_from_elapsed(
         anchor = min(grid, key=lambda point: abs(point.time_ms - elapsed_ms))
         bpm = anchor.bpm
         beat_delta = (elapsed_ms - anchor.time_ms) * bpm / 60_000.0
-        total = max(0.0, anchor.index - 1 + beat_delta)
+        track_total = max(0.0, anchor.index - 1 + beat_delta)
+        grid_total = max(
+            0.0,
+            (anchor.bar - 1) * profile.time_signature
+            + (anchor.beat - 1)
+            + beat_delta,
+        )
     else:
         bpm = profile.bpm
-        total = elapsed_ms * bpm / 60_000.0
-    whole = int(total)
-    phase = min(0.9999, max(0.0, total - whole))
-    beat_in_bar = whole % profile.time_signature + 1
+        track_total = elapsed_ms * bpm / 60_000.0
+        grid_total = track_total
+    track_whole = int(track_total)
+    grid_whole = int(grid_total)
+    phase = min(0.9999, max(0.0, grid_total - grid_whole))
+    beat_in_bar = grid_whole % profile.time_signature + 1
     return DeckObservation(
         deck=deck,
         track_id=profile.track_id,
@@ -53,9 +61,9 @@ def observation_from_elapsed(
         # is the actual scheduler clock after tempo/master-sync changes.
         bpm=playback_bpm if playback_bpm is not None else bpm,
         playing=playing,
-        bar=whole // profile.time_signature + 1,
+        bar=grid_whole // profile.time_signature + 1,
         beat=beat_in_bar,
-        track_beat=whole + 1,
+        track_beat=track_whole + 1,
         beat_phase=phase,
         sync_enabled=sync_enabled,
         quantize_enabled=quantize_enabled,

@@ -75,6 +75,41 @@ def opening_card() -> TransitionCard:
     return transition
 
 
+def test_opening_landmark_accepts_a_verified_pickup_at_file_start() -> None:
+    profile = SimpleNamespace(
+        landmarks=[
+            SimpleNamespace(
+                kind="phrase_start",
+                bar=1,
+                beat=3,
+                time_ms=22,
+                confidence="high",
+            )
+        ]
+    )
+
+    landmark = server._opening_file_start_landmark(profile)
+
+    assert landmark.beat == 3
+
+
+def test_opening_landmark_rejects_a_late_pickup() -> None:
+    profile = SimpleNamespace(
+        landmarks=[
+            SimpleNamespace(
+                kind="phrase_start",
+                bar=1,
+                beat=3,
+                time_ms=5_000,
+                confidence="high",
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="file-start phrase landmark"):
+        server._opening_file_start_landmark(profile)
+
+
 def hot_cue_opening_card() -> TransitionCard:
     transition = card()
     transition.start_phrase_index = 2

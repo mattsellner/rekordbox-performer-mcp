@@ -483,6 +483,31 @@ def test_live_state_rolls_rounded_phase_into_next_beat() -> None:
     assert current["beat_phase"] == 0.0
 
 
+def test_live_state_preserves_pickup_grid_offset() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="pickup",
+            title="Pickup",
+            bpm=130,
+            playing=False,
+            bar=1,
+            beat=3,
+            track_beat=1,
+            beat_phase=0.25,
+            source="native",
+            confidence="high",
+        )
+    )
+
+    current = state.get(1)
+    assert current["track_beat"] == 1
+    assert current["bar"] == 1
+    assert current["beat"] == 3
+    assert current["beat_phase"] == 0.25
+
+
 def test_phrase_cut_can_launch_verified_file_start_without_hot_cue() -> None:
     outgoing = prepared_profile("a", "A")
     incoming = prepared_profile("b", "B")

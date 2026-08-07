@@ -105,6 +105,27 @@ def test_elapsed_reconciliation_uses_absolute_grid_position() -> None:
     assert observed.source == "native"
 
 
+def test_elapsed_reconciliation_preserves_pickup_grid_position() -> None:
+    candidate = profile("a")
+    candidate.beat_grid = [
+        AnalysisBeatGridPoint(index=1, bar=1, beat=3, bpm=120, time_ms=0),
+        AnalysisBeatGridPoint(index=3, bar=2, beat=1, bpm=120, time_ms=1000),
+    ]
+
+    observed = observation_from_elapsed(
+        deck=1,
+        profile=candidate,
+        elapsed_seconds=0,
+        playing=True,
+        sync_enabled=True,
+        quantize_enabled=True,
+    )
+
+    assert observed.track_beat == 1
+    assert observed.bar == 1
+    assert observed.beat == 3
+
+
 def test_vocal_overlap_is_soft_and_measured() -> None:
     report = vocal_handoff(
         profile("a"), profile("b"),

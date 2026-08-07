@@ -321,19 +321,30 @@ class LiveState:
         base_track_beat = observation.track_beat or (
             (observation.bar - 1) * 4 + observation.beat
         )
-        total_beats = base_track_beat - 1 + observation.beat_phase
+        elapsed_beats = 0.0
         if observation.playing:
-            total_beats += age * observation.bpm / 60.0
+            elapsed_beats = age * observation.bpm / 60.0
+        track_total = (
+            base_track_beat - 1 + observation.beat_phase + elapsed_beats
+        )
+        grid_total = (
+            (observation.bar - 1) * 4
+            + observation.beat
+            - 1
+            + observation.beat_phase
+            + elapsed_beats
+        )
         # Normalize before deriving beat/bar fields.  Rounding only the final
         # fractional phase can produce the impossible value 1.0 immediately
         # before a beat rollover, which then fails DeckObservation validation
         # during a live refresh.
-        total_beats = round(total_beats, 4)
-        bar = int(total_beats // 4) + 1
-        within_bar = total_beats % 4
+        track_total = round(track_total, 4)
+        grid_total = round(grid_total, 4)
+        bar = int(grid_total // 4) + 1
+        within_bar = grid_total % 4
         beat = int(within_bar) + 1
         beat_phase = within_bar - int(within_bar)
-        track_beat = int(total_beats) + 1
+        track_beat = int(track_total) + 1
         return {
             **observation.model_dump(),
             "bar": bar,
