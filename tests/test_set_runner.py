@@ -215,6 +215,118 @@ def test_stale_observations_do_not_exhaust_transition_retry_budget(tmp_path) -> 
     asyncio.run(scenario())
 
 
+def test_exhausted_transition_is_replaced_without_stopping_set(tmp_path) -> None:
+    async def scenario() -> None:
+        original = AutonomousSetPlan(
+            name="replace failed route",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[
+                option("a-b", "a", "b", 1),
+                option("b-c", "b", "c", 2),
+            ],
+            target_track_count=3,
+            retry_limit=3,
+        )
+        replacement = AutonomousSetPlan(
+            name="replacement",
+            opening=TrackLoadSpec(track_id="b", title="B"),
+            transitions=[option("replacement-b-d", "b", "d", 2)],
+            target_track_count=2,
+        )
+        jobs = {"opening": {"id": "opening", "status": "completed"}}
+        scheduled = []
+        recovery_calls = []
+
+        async def schedule(next_option, release_loop):
+            scheduled.append(next_option.id)
+            if next_option.incoming.track_id == "c":
+                raise RuntimeError("exact load route failed")
+            jobs["replacement"] = {"id": "replacement", "status": "completed"}
+            return {"ready": True, "job": jobs["replacement"]}
+
+        async def recover(status):
+            recovery_calls.append(status)
+            assert status["current_track_id"] == "b"
+            assert status["exhausted_incoming_track_ids"] == ["c"]
+            return replacement
+
+        runner = AutonomousSetRunner(
+            tmp_path / "replacement.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: {"passed": True, "faults": []},
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            recover_route=recover,
+            poll_seconds=0.001,
+            recovery_retry_seconds=0.001,
+        )
+        runner.prepare(original, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        state = runner.public()
+        assert state["status"] == "completed"
+        assert state["played_track_ids"] == ["a", "b", "d"]
+        assert scheduled == ["b-c", "b-c", "b-c", "replacement-b-d"]
+        assert len(recovery_calls) == 1
+        assert state["recovery_attempts"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_title_repaint_does_not_consume_retry_budget(tmp_path) -> None:
+    async def scenario() -> None:
+        plan = AutonomousSetPlan(
+            name="title repaint",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[option("a-b", "a", "b", 1)],
+            target_track_count=2,
+            retry_limit=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "failed"}}
+        calls = 0
+
+        async def schedule(next_option, release_loop):
+            nonlocal calls
+            calls += 1
+            if calls <= 5:
+                raise RuntimeError("Deck title changed during transport observation")
+            jobs["recovered"] = {"id": "recovered", "status": "completed"}
+            return {"ready": True, "job": jobs["recovered"]}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "title-repaint.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: (
+                {"passed": False, "faults": ["opening failed"]}
+                if job_id == "opening"
+                else {"passed": True, "faults": []}
+            ),
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=64),
+            engage_loop=lambda deck, beats: asyncio.sleep(0, result={"verified": True}),
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        assert calls == 6
+        assert runner.public()["status"] == "completed"
+        assert runner.public()["attempted_options"]["a-b"] == 2
+
+    asyncio.run(scenario())
+
+
 def test_autonomous_runner_engages_loop_and_releases_it_in_retry(tmp_path) -> None:
     async def scenario() -> None:
         plan = AutonomousSetPlan(
@@ -260,7 +372,7 @@ def test_autonomous_runner_engages_loop_and_releases_it_in_retry(tmp_path) -> No
         runner.start_with_job("a-b", "failed-opening")
         await runner.task
 
-        assert loop_calls == [(1, 16)]
+        assert loop_calls == [(1, 4)]
         # With only six bars remaining, the runner loops before the first
         # retry attempt, so every accepted retry card carries the bar-0 loop
         # release instead of waiting for a staging failure to discover danger.
@@ -271,6 +383,57 @@ def test_autonomous_runner_engages_loop_and_releases_it_in_retry(tmp_path) -> No
         # The adopted opening job counts toward the retry budget; it must not
         # silently grant one more attempt than the plan allows.
         assert runner.public()["attempted_options"]["a-b"] == 3
+
+    asyncio.run(scenario())
+
+
+def test_unverified_rescue_loop_does_not_terminate_the_set(tmp_path) -> None:
+    async def scenario() -> None:
+        plan = AutonomousSetPlan(
+            name="loop verification fallback",
+            opening=TrackLoadSpec(track_id="a", title="A"),
+            transitions=[option("a-b", "a", "b", 1)],
+            target_track_count=2,
+            retry_limit=3,
+        )
+        jobs = {"opening": {"id": "opening", "status": "failed"}}
+
+        async def schedule(next_option, release_loop):
+            assert release_loop is False
+            jobs["recovered"] = {"id": "recovered", "status": "completed"}
+            return {"ready": True, "job": jobs["recovered"]}
+
+        runner = AutonomousSetRunner(
+            tmp_path / "unverified-loop.json",
+            schedule=schedule,
+            job_status=lambda job_id: jobs[job_id],
+            job_qa=lambda job_id: (
+                {"passed": False, "faults": ["opening failed"]}
+                if job_id == "opening"
+                else {"passed": True, "faults": []}
+            ),
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=6),
+            engage_loop=lambda deck, beats: asyncio.sleep(
+                0,
+                result={"verified": False, "errors": ["transport read missed wrap"]},
+            ),
+            run_tempo=lambda plan, deck, track_id: asyncio.sleep(
+                0, result={"status": "completed"}
+            ),
+            advance=lambda job_id, succeeded, error: {},
+            poll_seconds=0.001,
+        )
+        runner.prepare(plan, opening_deck=1)
+        runner.start_with_job("a-b", "opening")
+        await runner.task
+
+        state = runner.public()
+        assert state["status"] == "completed"
+        assert state["rescue_loop_active"] is False
+        assert any(
+            "continuing replacement planning" in warning
+            for warning in state["warnings"]
+        )
 
     asyncio.run(scenario())
 
@@ -468,7 +631,9 @@ def test_runner_prestages_next_track_while_tempo_ramp_is_running(tmp_path) -> No
 
         assert timeline.index("prestage:b-c") < timeline.index("tempo:finish")
         assert timeline.index("tempo:finish") < timeline.index("schedule:b-c")
-        assert runner.public()["staged_option_id"] == "b-c"
+        # Once C becomes current, it is no longer incorrectly reported as a
+        # staged deck. During the ramp it was staged before scheduling.
+        assert runner.public()["staged_option_id"] is None
         assert runner.public()["status"] == "completed"
 
     asyncio.run(scenario())
@@ -522,10 +687,10 @@ def test_runner_continues_when_noncritical_tempo_ramp_is_rejected(tmp_path) -> N
     asyncio.run(scenario())
 
 
-def test_runner_engages_rescue_loop_at_sixteen_bar_boundary(tmp_path) -> None:
+def test_runner_engages_rescue_loop_at_thirty_two_bar_boundary(tmp_path) -> None:
     async def scenario() -> None:
         plan = AutonomousSetPlan(
-            name="sixteen bar rescue",
+            name="thirty-two bar rescue",
             opening=TrackLoadSpec(track_id="a", title="A"),
             transitions=[option("a-b", "a", "b", 1)],
             target_track_count=2,
@@ -543,7 +708,7 @@ def test_runner_engages_rescue_loop_at_sixteen_bar_boundary(tmp_path) -> None:
             return {"verified": True}
 
         runner = AutonomousSetRunner(
-            tmp_path / "sixteen-bar-rescue.json",
+            tmp_path / "thirty-two-bar-rescue.json",
             schedule=schedule,
             job_status=lambda job_id: jobs[job_id],
             job_qa=lambda job_id: (
@@ -551,7 +716,7 @@ def test_runner_engages_rescue_loop_at_sixteen_bar_boundary(tmp_path) -> None:
                 if job_id == "opening"
                 else {"passed": True, "faults": []}
             ),
-            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=16),
+            remaining_bars=lambda track_id, deck: asyncio.sleep(0, result=32),
             engage_loop=engage,
             run_tempo=lambda plan, deck, track_id: asyncio.sleep(
                 0, result={"status": "completed"}
@@ -563,7 +728,7 @@ def test_runner_engages_rescue_loop_at_sixteen_bar_boundary(tmp_path) -> None:
         runner.start_with_job("a-b", "opening")
         await runner.task
 
-        assert loops == [(1, 16)]
+        assert loops == [(1, 4)]
         assert runner.public()["deadline_phase"] == "rescue"
         assert runner.public()["status"] == "completed"
 

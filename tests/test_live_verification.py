@@ -11,7 +11,11 @@ from rekordbox_performer.intelligence import (
     MusicalEvent,
     TransitionCard,
 )
-from rekordbox_performer.set_runner import TempoPlan
+from rekordbox_performer.set_runner import (
+    TempoPlan,
+    TrackLoadSpec,
+    TransitionOption,
+)
 
 
 def card() -> TransitionCard:
@@ -71,6 +75,41 @@ def opening_card() -> TransitionCard:
     return transition
 
 
+def test_opening_landmark_accepts_a_verified_pickup_at_file_start() -> None:
+    profile = SimpleNamespace(
+        landmarks=[
+            SimpleNamespace(
+                kind="phrase_start",
+                bar=1,
+                beat=3,
+                time_ms=22,
+                confidence="high",
+            )
+        ]
+    )
+
+    landmark = server._opening_file_start_landmark(profile)
+
+    assert landmark.beat == 3
+
+
+def test_opening_landmark_rejects_a_late_pickup() -> None:
+    profile = SimpleNamespace(
+        landmarks=[
+            SimpleNamespace(
+                kind="phrase_start",
+                bar=1,
+                beat=3,
+                time_ms=5_000,
+                confidence="high",
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="file-start phrase landmark"):
+        server._opening_file_start_landmark(profile)
+
+
 def hot_cue_opening_card() -> TransitionCard:
     transition = card()
     transition.start_phrase_index = 2
@@ -80,6 +119,45 @@ def hot_cue_opening_card() -> TransitionCard:
         parameters={"deck": 2, "cue": 7},
     )
     return transition
+
+
+def test_optional_fx_failure_cannot_block_runner_transition(monkeypatch) -> None:
+    transition = card()
+    option = TransitionOption(
+        id="a-b",
+        card=transition,
+        incoming=TrackLoadSpec(
+            track_id="b",
+            title="Incoming",
+            cue=1,
+            cue_time_ms=0,
+        ),
+        technique="vocal_safe_loop_blend",
+        fx_effect="spiral",
+    )
+    staged = []
+
+    async def fail_fx(_card, _effect):
+        raise RuntimeError("Deck 1 first-slot FX selector is not visible")
+
+    async def schedule_dry(**kwargs):
+        staged.append(kwargs)
+        return {"ready": True, "schedule": {"job": {"id": "dry-job"}}}
+
+    monkeypatch.setattr(server, "_prepare_option_fx", fail_fx)
+    monkeypatch.setattr(server, "stage_and_schedule_transition_card", schedule_dry)
+
+    result = asyncio.run(server._runner_schedule(option, False))
+
+    assert result["ready"] is True
+    assert result["job"]["id"] == "dry-job"
+    assert staged[0]["card"] == transition
+    assert result["fx_preparation"] == {
+        "verified": False,
+        "desired": "spiral",
+        "error": "Deck 1 first-slot FX selector is not visible",
+        "fallback": "dry transition card",
+    }
 
 
 class OpeningProfileStore:

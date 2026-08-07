@@ -94,6 +94,96 @@ def test_select_exact_track_reacquires_search_after_collection_rebuild(
     assert result["result_count"] == 1
 
 
+def test_select_exact_track_recovers_from_streaming_browser(monkeypatch) -> None:
+    class WindowRect:
+        left = 0
+        top = 0
+        right = 1920
+        bottom = 1009
+
+        @staticmethod
+        def width():
+            return 1920
+
+        @staticmethod
+        def height():
+            return 1009
+
+    class Control:
+        def __init__(self) -> None:
+            self.clicked = False
+
+        def click_input(self) -> None:
+            self.clicked = True
+
+    class Root:
+        def __init__(self) -> None:
+            self.focused = False
+            self.clicked_at = None
+
+        @staticmethod
+        def descendants():
+            return []
+
+        @staticmethod
+        def rectangle():
+            return WindowRect()
+
+        def set_focus(self) -> None:
+            self.focused = True
+
+        def click_input(self, *, coords) -> None:
+            self.clicked_at = coords
+
+    source_root = Root()
+    focused_source_root = Root()
+    collection_root = Root()
+    browser_root = Root()
+    collection = Control()
+    fresh_search = Control()
+    adapter = RekordboxUIAdapter()
+    roots = iter((source_root, focused_source_root, collection_root, browser_root))
+    adapter._root = lambda: next(roots)
+    streaming_samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(None, "Button", "", 53, 731, 73, 751),
+        ControlSample(None, "Edit", "", 1696, 741, 1845, 759),
+    ]
+    collection_samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(collection, "Text", "Collection", 85, 728, 366, 746),
+    ]
+    browser_samples = [
+        ControlSample(None, "ComboBox", "PERFORMANCE", 0, 10, 100, 40),
+        ControlSample(fresh_search, "Edit", "", 1696, 741, 1845, 759),
+    ]
+    sampled = iter(
+        (
+            (streaming_samples, 1920),
+            (streaming_samples, 1920),
+            (collection_samples, 1920),
+            (browser_samples, 1920),
+        )
+    )
+    adapter._sample_controls = lambda *_args: next(sampled)
+    row_samples = [
+        ControlSample(None, "Custom", "header", 334, 763, 1900, 785),
+        ControlSample(None, "Custom", "Blow Ya Faces Off", 334, 785, 1900, 807),
+    ]
+    adapter._sample_browser_rows = lambda *_args: (row_samples, 1920)
+    adapter._set_clipboard_text = lambda _query: None
+    adapter._restore_clipboard_text = lambda _previous: None
+    monkeypatch.setattr(rekordbox_ui.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(rekordbox_ui, "send_keys", lambda _keys: None)
+
+    result = adapter.select_exact_track("Blow Ya Faces Off", result_index=0)
+
+    assert focused_source_root.clicked_at == (63, 741)
+    assert collection.clicked is True
+    assert fresh_search.clicked is True
+    assert result["result_count"] == 1
+
+
 def test_single_browser_result_is_not_mistaken_for_header() -> None:
     samples = [
         ControlSample(None, "Custom", "", 334, 785, 1895, 807),
@@ -155,6 +245,34 @@ def test_deck_snapshot_prefers_live_jog_bpm_over_native_metadata_bpm() -> None:
         window_width=1920,
     )
     assert snapshot.bpm == 123.44
+
+
+def test_fx_effect_reads_first_slot_for_each_deck() -> None:
+    class WindowRect:
+        left = 0
+        top = 0
+
+        @staticmethod
+        def width():
+            return 1920
+
+    class Root:
+        @staticmethod
+        def rectangle():
+            return WindowRect()
+
+    samples = [
+        ControlSample(None, "Button", "REVERB", 334, 53, 438, 71),
+        ControlSample(None, "Button", "ECHO", 477, 53, 581, 71),
+        ControlSample(None, "Button", "SPIRAL", 1175, 53, 1279, 71),
+        ControlSample(None, "Button", "VINYL BRAKE", 1318, 53, 1422, 71),
+    ]
+    adapter = RekordboxUIAdapter()
+    adapter._root = lambda: Root()
+    adapter._sample_controls = lambda _root: (samples, 1920)
+
+    assert adapter.fx_effect(1) == "reverb"
+    assert adapter.fx_effect(2) == "spiral"
 
 
 def test_deck_snapshot_does_not_overwrite_right_jog_bpm_with_file_bpm() -> None:

@@ -321,19 +321,30 @@ class LiveState:
         base_track_beat = observation.track_beat or (
             (observation.bar - 1) * 4 + observation.beat
         )
-        total_beats = base_track_beat - 1 + observation.beat_phase
+        elapsed_beats = 0.0
         if observation.playing:
-            total_beats += age * observation.bpm / 60.0
+            elapsed_beats = age * observation.bpm / 60.0
+        track_total = (
+            base_track_beat - 1 + observation.beat_phase + elapsed_beats
+        )
+        grid_total = (
+            (observation.bar - 1) * 4
+            + observation.beat
+            - 1
+            + observation.beat_phase
+            + elapsed_beats
+        )
         # Normalize before deriving beat/bar fields.  Rounding only the final
         # fractional phase can produce the impossible value 1.0 immediately
         # before a beat rollover, which then fails DeckObservation validation
         # during a live refresh.
-        total_beats = round(total_beats, 4)
-        bar = int(total_beats // 4) + 1
-        within_bar = total_beats % 4
+        track_total = round(track_total, 4)
+        grid_total = round(grid_total, 4)
+        bar = int(grid_total // 4) + 1
+        within_bar = grid_total % 4
         beat = int(within_bar) + 1
         beat_phase = within_bar - int(within_bar)
-        track_beat = int(total_beats) + 1
+        track_beat = int(track_total) + 1
         return {
             **observation.model_dump(),
             "bar": bar,
@@ -576,6 +587,101 @@ def bass_phrase_evidence(
     }
 
 
+def energy_phrase_evidence(
+    profile: TrackProfile,
+    start_bar: int,
+    window_bars: int = 8,
+) -> dict[str, Any]:
+    """Measure whether a phrase can take ownership of the room's energy.
+
+    Sustained sub energy is only one kind of useful handoff.  A chorus can have
+    a lighter continuous low-band median while still landing with much stronger
+    kick/transient energy.  Rekordbox PWV7 exposes median, mean, and peak curves;
+    this combines all three and only promotes transient-led evidence on a
+    verified chorus/drop phrase boundary.
+    """
+    bass = bass_phrase_evidence(profile, start_bar, window_bars=window_bars)
+    curve = {item.bar: item for item in profile.bass_energy_by_bar}
+    phrase = next(
+        (
+            item
+            for item in profile.phrase_boundaries
+            if item.start_bar == start_bar
+            and item.beat_in_bar == 1
+            and item.confidence in {"verified", "high"}
+        ),
+        None,
+    )
+    if not curve or phrase is None:
+        return {
+            **bass,
+            "verified": bool(bass.get("verified")),
+            "energy_verified": False,
+            "energy_source": "sustained_bass" if bass.get("verified") else None,
+            "phrase_label": phrase.label if phrase is not None else None,
+        }
+
+    bars = [curve.get(bar) for bar in range(start_bar, start_bar + window_bars)]
+    available = [item for item in bars if item is not None]
+    coverage_ratio = len(available) / window_bars
+    track_means = [float(item.mean) for item in curve.values() if item.mean > 0]
+    track_peaks = [float(item.peak) for item in curve.values() if item.peak > 0]
+    mean_reference = _percentile(track_means, 0.60)
+    peak_reference = _percentile(track_peaks, 0.60)
+    phrase_means = [float(item.mean) for item in available]
+    phrase_peaks = [float(item.peak) for item in available]
+    downbeat_mean = float(bars[0].mean) if bars[0] is not None else 0.0
+    downbeat_peak = float(bars[0].peak) if bars[0] is not None else 0.0
+    phrase_mean = sum(phrase_means) / len(phrase_means) if phrase_means else 0.0
+    phrase_peak = _percentile(phrase_peaks, 0.50)
+    mean_ratio = phrase_mean / mean_reference if mean_reference > 0 else 0.0
+    peak_ratio = phrase_peak / peak_reference if peak_reference > 0 else 0.0
+    downbeat_mean_ratio = downbeat_mean / mean_reference if mean_reference > 0 else 0.0
+    downbeat_peak_ratio = downbeat_peak / peak_reference if peak_reference > 0 else 0.0
+    transient_phrase = phrase.label.casefold() in {"chorus", "drop"}
+    transient_verified = (
+        coverage_ratio >= 0.75
+        and transient_phrase
+        and downbeat_mean_ratio >= 0.90
+        and downbeat_peak_ratio >= 0.95
+        and mean_ratio >= 0.85
+        and peak_ratio >= 0.95
+    )
+    verified = bool(bass.get("verified")) or transient_verified
+    transient_score = max(
+        0.0,
+        min(
+            100.0,
+            25.0 * min(1.2, downbeat_mean_ratio)
+            + 25.0 * min(1.2, downbeat_peak_ratio)
+            + 25.0 * min(1.2, mean_ratio)
+            + 25.0 * min(1.2, peak_ratio),
+        ),
+    )
+    return {
+        **bass,
+        "verified": verified,
+        "energy_verified": transient_verified,
+        "energy_source": (
+            "sustained_bass"
+            if bass.get("verified")
+            else "chorus_transient_energy"
+            if transient_verified
+            else None
+        ),
+        "phrase_label": phrase.label,
+        "mean_reference": round(mean_reference, 3),
+        "peak_reference": round(peak_reference, 3),
+        "downbeat_mean_ratio": round(downbeat_mean_ratio, 3),
+        "downbeat_peak_ratio": round(downbeat_peak_ratio, 3),
+        "phrase_mean_ratio": round(mean_ratio, 3),
+        "phrase_peak_ratio": round(peak_ratio, 3),
+        "transient_score": round(transient_score, 1),
+        "score": round(max(float(bass.get("score", 0)), transient_score), 1),
+        "reason": None if verified else bass.get("reason"),
+    }
+
+
 def incoming_bass_handoff_evidence(
     card: TransitionCard,
     incoming: TrackProfile,
@@ -641,7 +747,7 @@ def incoming_bass_handoff_evidence(
             "reason": "incoming launch has no verified phrase landmark",
         }
     target_bar = entry.bar + card.critical_bar_offset
-    evidence = bass_phrase_evidence(
+    evidence = energy_phrase_evidence(
         incoming,
         target_bar,
         window_bars=8,
@@ -1196,6 +1302,43 @@ class ProfileStore:
         )
         return {"count": len(records), "average_score": average, "reviews": records}
 
+    def proficient_techniques(self) -> set[str]:
+        """Return advanced techniques promoted by clean rehearsal evidence.
+
+        Promotion requires three clean passes across two materially different
+        track pairs.  Foundational dry blends/cuts are handled by the compiler;
+        this registry gates techniques whose failure depends on extra mutable
+        state such as stems or double-drop ownership.
+        """
+        records = self.rehearsal_summary()["reviews"]
+        aliases = {
+            "stem_vocal_blend": ("stem", "acapella"),
+            "double_drop": ("double-drop", "double_drop", "double drop"),
+        }
+        proficient: set[str] = set()
+        for technique, markers in aliases.items():
+            clean = [
+                item
+                for item in records
+                if any(
+                    marker in str(item.get("transition_name", "")).casefold()
+                    for marker in markers
+                )
+                and int(item.get("bar_error", 1)) == 0
+                and float(item.get("bass_swap_error_beats", 9)) <= 0.15
+                and not bool(item.get("vocal_clash"))
+                and int(item.get("energy_continuity", 0)) >= 7
+                and int(item.get("cleanliness", 0)) >= 7
+                and int(item.get("user_rating", 0)) >= 7
+            ]
+            pairs = {
+                (item.get("outgoing_track_id"), item.get("incoming_track_id"))
+                for item in clean
+            }
+            if len(clean) >= 3 and len(pairs) >= 2:
+                proficient.add(technique)
+        return proficient
+
 
 def _profile_live_ready(
     profile: TrackProfile,
@@ -1343,14 +1486,9 @@ def validate_transition_card(
         and event.parameters.get("deck") == card.incoming_deck
         and float(event.parameters.get("value", 0)) > 0
     ]
-    audible_entry_position = (
-        min(
-            (
-                (event.bar_offset, event.beat_offset)
-                for event in incoming_audible_events
-            ),
-            default=None,
-        )
+    audible_entry_position = min(
+        ((event.bar_offset, event.beat_offset) for event in incoming_audible_events),
+        default=None,
     )
     audible_lead_bars = (
         None
@@ -1517,6 +1655,19 @@ def validate_transition_card(
                     and landmark.confidence in {"verified", "high"}
                     and (landmark.bar, landmark.beat or 1) in verified_phrase_starts
                 }
+                if any(
+                    landmark.kind in {"drop", "bass_in", "bass_out"}
+                    for landmark in incoming.landmarks
+                ) or any(segment.kind == "bass" for segment in incoming.segments):
+                    verified_bass_phrase_starts.update(
+                        (phrase.start_bar - 1) * incoming.time_signature
+                        + phrase.beat_in_bar
+                        for phrase in incoming.phrase_boundaries
+                        if phrase.confidence in {"verified", "high"}
+                        and energy_phrase_evidence(incoming, phrase.start_bar).get(
+                            "verified"
+                        )
+                    )
                 if critical_beat not in verified_bass_phrase_starts:
                     errors.append(
                         "critical bass swap does not land on the downbeat of "
@@ -1529,11 +1680,16 @@ def validate_transition_card(
         ):
             entry = file_start_entries[0]
             if audible_entry_position is None:
-                errors.append("file-start bass handoff never opens the incoming channel")
+                errors.append(
+                    "file-start bass handoff never opens the incoming channel"
+                )
             else:
                 reveal_bar_offset, reveal_beat_offset = audible_entry_position
                 audible_bar = entry.bar + reveal_bar_offset
-                if reveal_beat_offset != 0 or (audible_bar, 1) not in verified_phrase_starts:
+                if (
+                    reveal_beat_offset != 0
+                    or (audible_bar, 1) not in verified_phrase_starts
+                ):
                     errors.append(
                         "file-start pre-roll must become audible on beat 1 of a "
                         "verified incoming phrase"
@@ -1586,8 +1742,7 @@ def validate_transition_card(
             if event.action == "channel_fader"
             and event.parameters.get("deck") == card.outgoing_deck
             and 0 < float(event.parameters.get("value", 1)) < 0.9
-            and (event.bar_offset, event.beat_offset)
-            > (card.critical_bar_offset, 0)
+            and (event.bar_offset, event.beat_offset) > (card.critical_bar_offset, 0)
         ]
         if len(progressive_retirement) < 3:
             errors.append(
@@ -1608,8 +1763,7 @@ def validate_transition_card(
             if event.action == "filter"
             and event.parameters.get("deck") == card.outgoing_deck
             and float(event.parameters.get("value", 0)) != 0
-            and (event.bar_offset, event.beat_offset)
-            > (card.critical_bar_offset, 0)
+            and (event.bar_offset, event.beat_offset) > (card.critical_bar_offset, 0)
         ]
         filter_reset = any(
             event.action == "filter"
@@ -1837,17 +1991,137 @@ def compile_transition_card(
         }
     minimum_lead_beats = card.minimum_lead_bars * beats_per_bar
     earliest = current_beat + minimum_lead_beats
-    candidates = list(phrases)
-    if card.start_phrase_index is not None:
-        candidates = [
-            phrase for phrase in candidates if phrase.index == card.start_phrase_index
-        ]
+    candidates = [
+        phrase
+        for phrase in phrases
+        if phrase.start_beat >= earliest
+    ]
     if card.start_phrase_label:
         label = card.start_phrase_label.casefold()
         candidates = [
             phrase for phrase in candidates if phrase.label.casefold() == label
         ]
-    candidates = [phrase for phrase in candidates if phrase.start_beat >= earliest]
+
+    mix_out_bars = [
+        landmark.bar
+        for landmark in anchor_profile.landmarks
+        if landmark.kind == "mix_out"
+        and landmark.confidence in {"verified", "high"}
+    ]
+    if mix_out_bars:
+        mix_out_bar = min(mix_out_bars)
+        candidates = [phrase for phrase in candidates if phrase.start_bar < mix_out_bar]
+
+    outgoing_stops = [
+        event
+        for event in card.events
+        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck
+    ]
+    final_stop = (
+        max(outgoing_stops, key=lambda event: (event.bar_offset, event.beat_offset))
+        if outgoing_stops
+        else None
+    )
+    requested_phrase = next(
+        (
+            phrase
+            for phrase in phrases
+            if card.start_phrase_index is not None
+            and phrase.index == card.start_phrase_index
+        ),
+        None,
+    )
+    if (
+        requested_phrase is not None
+        and requested_phrase.start_beat >= earliest
+        and requested_phrase.beat_in_bar != 1
+    ):
+        return {
+            "ready": False,
+            "errors": [
+                "selected outgoing phrase must start on beat 1; "
+                f"analysis reports beat {requested_phrase.beat_in_bar}"
+            ],
+            "events": [],
+        }
+    exact_candidates = [
+        phrase
+        for phrase in candidates
+        if card.start_phrase_index is not None
+        and phrase.index == card.start_phrase_index
+    ]
+    retargeted = False
+    if exact_candidates:
+        candidates = exact_candidates
+    elif card.start_phrase_index is not None and candidates:
+        # A card is planned before the set starts, but an incoming track has
+        # already advanced through the preceding overlap by the time it owns
+        # the room. Treat the stored phrase index as the preferred structural
+        # template, not an impossible absolute timestamp. Retarget to the next
+        # live phrase whose critical handoff lands on the same phrase type.
+        candidates = [phrase for phrase in candidates if phrase.beat_in_bar == 1]
+        if (
+            anchor_profile.beat_count
+            and final_stop is not None
+            and not card.loop_plan_verified
+        ):
+            viable = [
+                phrase
+                for phrase in candidates
+                if (
+                    phrase.start_beat
+                    + final_stop.bar_offset * beats_per_bar
+                    + final_stop.beat_offset
+                    <= anchor_profile.beat_count
+                )
+            ]
+            if viable:
+                candidates = viable
+
+        original_critical = None
+        if requested_phrase is not None:
+            original_critical_bar = (
+                requested_phrase.start_bar + card.critical_bar_offset
+            )
+            original_critical = next(
+                (
+                    phrase
+                    for phrase in phrases
+                    if phrase.start_bar == original_critical_bar
+                    and phrase.beat_in_bar == 1
+                ),
+                None,
+            )
+
+        def structural_score(phrase: PhraseBoundary) -> tuple[int, int, int]:
+            critical_bar = phrase.start_bar + card.critical_bar_offset
+            critical = next(
+                (
+                    item
+                    for item in phrases
+                    if item.start_bar == critical_bar and item.beat_in_bar == 1
+                ),
+                None,
+            )
+            critical_match = int(
+                critical is not None
+                and original_critical is not None
+                and critical.label.casefold() == original_critical.label.casefold()
+            )
+            critical_boundary = int(critical is not None)
+            start_match = int(
+                requested_phrase is not None
+                and phrase.label.casefold() == requested_phrase.label.casefold()
+            )
+            return critical_match, critical_boundary, start_match
+
+        best_structure = max(structural_score(phrase) for phrase in candidates)
+        candidates = [
+            phrase
+            for phrase in candidates
+            if structural_score(phrase) == best_structure
+        ]
+        retargeted = True
     if not candidates:
         return {
             "ready": False,
@@ -1870,16 +2144,11 @@ def compile_transition_card(
     start_beat = chosen_phrase.start_beat
     start_delay_ms = round((start_beat - current_beat) * beat_ms)
 
-    outgoing_stops = [
-        event
-        for event in card.events
-        if event.action == "cue" and event.parameters.get("deck") == card.outgoing_deck
-    ]
-    if anchor_profile.beat_count and outgoing_stops:
-        final_stop = max(
-            outgoing_stops,
-            key=lambda event: (event.bar_offset, event.beat_offset),
-        )
+    if (
+        anchor_profile.beat_count
+        and final_stop is not None
+        and not card.loop_plan_verified
+    ):
         retirement_beat = (
             start_beat + final_stop.bar_offset * beats_per_bar + final_stop.beat_offset
         )
@@ -1940,6 +2209,8 @@ def compile_transition_card(
         "start_bar": chosen_phrase.start_bar,
         "start_beat_in_bar": chosen_phrase.beat_in_bar,
         "start_phrase": chosen_phrase.model_dump(),
+        "start_phrase_retargeted": retargeted,
+        "requested_start_phrase_index": card.start_phrase_index,
         "incoming_bass_handoff": incoming_bass_handoff_evidence(card, incoming),
         "quantized_transport_lead_ms": quantized_transport_lead_ms,
         "events": events,

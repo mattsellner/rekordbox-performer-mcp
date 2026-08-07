@@ -79,6 +79,10 @@ class TransitionOption(BaseModel):
     incoming: TrackLoadSpec
     priority: int = Field(default=100, ge=0)
     tempo_after: TempoPlan | None = None
+    technique: str = ""
+    reason: str = ""
+    alternatives: list[str] = Field(default_factory=list)
+    fx_effect: Literal["echo", "reverb", "spiral", "vinyl_brake"] | None = None
 
     @model_validator(mode="after")
     def identity_matches(self) -> "TransitionOption":
@@ -112,9 +116,12 @@ class AutonomousSetPlan(BaseModel):
     # at house tempos for a rescue loop and reproduced exactly the dead-air
     # failure this runner exists to prevent.
     stage_deadline_bars: int = Field(default=64, ge=16, le=128)
-    reserve_deadline_bars: int = Field(default=32, ge=8, le=64)
-    rescue_loop_trigger_bars: int = Field(default=16, ge=4, le=32)
-    rescue_loop_beats: Literal[4, 8, 16] = 16
+    reserve_deadline_bars: int = Field(default=48, ge=8, le=64)
+    rescue_loop_trigger_bars: int = Field(default=32, ge=4, le=32)
+    # The imported Rekordbox mapping has one deterministic direct AutoLoop:
+    # four beats. Longer rescue loops previously depended on the repeatable
+    # Loop Double button and expanded unpredictably as far as 512 beats.
+    rescue_loop_beats: Literal[4, 8, 16] = 4
     retry_limit: int = Field(default=3, ge=1, le=10)
     tempo_strategy: Literal["auto", "manual", "hold"] = "auto"
     tempo_target_bpm: float | None = Field(default=None, gt=0)
@@ -267,6 +274,8 @@ class AutonomousSetState(BaseModel):
     transition_jobs: list[str] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    recovery_attempts: int = 0
+    last_recovery_error: str | None = None
     rescue_loop_active: bool = False
     rescue_loop_deck: int | None = None
     last_remaining_bars: float | None = None
@@ -283,6 +292,7 @@ LoopCallback = Callable[[int, int], Awaitable[dict[str, Any]]]
 TempoCallback = Callable[[TempoPlan, int, str], Awaitable[dict[str, Any]]]
 AdvanceCallback = Callable[[str, bool, str | None], dict[str, Any]]
 FinishCallback = Callable[[str], None]
+RecoveryCallback = Callable[[dict[str, Any]], Awaitable[AutonomousSetPlan | None]]
 
 
 class AutonomousSetRunner:
@@ -301,7 +311,9 @@ class AutonomousSetRunner:
         run_tempo: TempoCallback,
         advance: AdvanceCallback,
         finish: FinishCallback | None = None,
+        recover_route: RecoveryCallback | None = None,
         poll_seconds: float = 0.25,
+        recovery_retry_seconds: float = 2.0,
     ) -> None:
         self.path = path
         self.schedule = schedule
@@ -313,7 +325,9 @@ class AutonomousSetRunner:
         self.run_tempo = run_tempo
         self.advance = advance
         self.finish = finish or (lambda _status: None)
+        self.recover_route = recover_route
         self.poll_seconds = poll_seconds
+        self.recovery_retry_seconds = recovery_retry_seconds
         self.task: asyncio.Task[None] | None = None
         self.state: AutonomousSetState | None = self._read()
 
@@ -411,6 +425,8 @@ class AutonomousSetRunner:
             **self.state.model_dump(exclude={"plan", "pending_redirect"}),
             "plan_name": self.state.plan.name,
             "target_track_count": self.state.plan.target_track_count,
+            "retry_limit": self.state.plan.retry_limit,
+            "exhausted_incoming_track_ids": self._exhausted_incoming_track_ids(),
             "steering_queued": self.state.pending_redirect is not None,
             "steering_target_track_id": (
                 self._primary_path_ids(self.state.pending_redirect)[-1]
@@ -419,6 +435,19 @@ class AutonomousSetRunner:
             ),
             "task_running": bool(self.task and not self.task.done()),
         }
+
+    def _exhausted_incoming_track_ids(self) -> list[str]:
+        if self.state is None:
+            return []
+        return list(
+            dict.fromkeys(
+                option.incoming.track_id
+                for option in self.state.plan.transitions
+                if option.card.outgoing_track_id == self.state.current_track_id
+                and self.state.attempted_options.get(option.id, 0)
+                >= self.state.plan.retry_limit
+            )
+        )
 
     @staticmethod
     def _primary_path_ids(plan: AutonomousSetPlan) -> list[str]:
@@ -569,15 +598,27 @@ class AutonomousSetRunner:
                 "deck observation is stale",
                 "observation unavailable",
                 "could not observe",
+                "deck title changed during transport observation",
+                "result_index must be between",
             )
         )
 
     async def _recover_if_late(self) -> None:
         assert self.state is not None
-        remaining = await self.remaining_bars(
-            self.state.current_track_id,
-            self.state.current_deck,
-        )
+        try:
+            remaining = await self.remaining_bars(
+                self.state.current_track_id,
+                self.state.current_deck,
+            )
+        except Exception as exc:
+            if not self._is_transient_observer_failure(exc):
+                raise
+            warning = f"deadline observation retrying: {exc}"
+            if not self.state.warnings or self.state.warnings[-1] != warning:
+                self.state.warnings.append(warning)
+            self.state.status = "recovering"
+            self._write()
+            return
         self.state.last_remaining_bars = remaining
         if remaining <= self.state.plan.rescue_loop_trigger_bars:
             self.state.deadline_phase = "rescue"
@@ -597,11 +638,68 @@ class AutonomousSetRunner:
                 self.state.plan.rescue_loop_beats,
             )
             if result.get("verified") is not True:
-                raise RuntimeError("rescue loop could not be verified")
+                errors = "; ".join(str(item) for item in result.get("errors", []))
+                warning = "rescue loop unavailable; continuing replacement planning"
+                if errors:
+                    warning += f": {errors}"
+                if not self.state.warnings or self.state.warnings[-1] != warning:
+                    self.state.warnings.append(warning)
+                self.state.status = "recovering"
+                self._write()
+                return
             self.state.rescue_loop_active = True
             self.state.rescue_loop_deck = self.state.current_deck
             self.state.status = "recovering"
             self._write()
+
+    async def _request_replacement_route(self) -> bool:
+        assert self.state is not None
+        if self.recover_route is None:
+            return False
+        self.state.status = "recovering"
+        self.state.recovery_attempts += 1
+        self._write()
+        try:
+            future = await self.recover_route(self.public())
+            if future is None:
+                raise RuntimeError("replacement planner returned no route")
+            projected = self._project_redirect(future)
+        except Exception as exc:
+            message = str(exc)
+            self.state.last_recovery_error = message
+            warning = (
+                f"replacement planning attempt {self.state.recovery_attempts}: "
+                f"{message}"
+            )
+            if not self.state.warnings or self.state.warnings[-1] != warning:
+                self.state.warnings.append(warning)
+            self._write()
+            return False
+
+        self.state.plan = projected
+        self.state.pending_redirect = None
+        self.state.staged_option_id = None
+        valid_ids = {item.id for item in projected.transitions}
+        self.state.attempted_options = {
+            option_id: attempts
+            for option_id, attempts in self.state.attempted_options.items()
+            if option_id in valid_ids
+        }
+        self.state.last_recovery_error = None
+        first = min(
+            (
+                item
+                for item in projected.transitions
+                if item.card.outgoing_track_id == self.state.current_track_id
+            ),
+            key=lambda item: item.priority,
+        )
+        self.state.warnings.append(
+            "replacement route selected: "
+            f"{self.state.current_track_id} -> {first.incoming.track_id}"
+        )
+        self._write()
+        return True
 
     async def _run(self) -> None:
         assert self.state is not None
@@ -630,6 +728,11 @@ class AutonomousSetRunner:
                         self.state.played_track_ids.append(option.incoming.track_id)
                         self.state.active_job_id = None
                         self.state.active_option_id = None
+                        # The just-completed incoming deck is now current, not
+                        # staged. Clear the old role immediately so the UI can
+                        # show the following selected candidate even while its
+                        # early load is still in progress or being retried.
+                        self.state.staged_option_id = None
                         self.state.transition_start_at = None
                         self.state.transition_critical_at = None
                         self.state.rescue_loop_active = False
@@ -706,9 +809,21 @@ class AutonomousSetRunner:
 
                 choices = self._choices()
                 if not choices:
-                    raise RuntimeError(
-                        f"no safe transition remains from {self.state.current_track_id}"
-                    )
+                    # A failed browser route or transition candidate is not a
+                    # reason to end an audible set. Ask the embedded local DJ
+                    # planner for a replacement graph. If planning is briefly
+                    # unavailable, keep the current track alive and move into
+                    # the verified rescue loop as its deadline approaches.
+                    await self._recover_if_late()
+                    if await self._request_replacement_route():
+                        continue
+                    if self.recover_route is None:
+                        raise RuntimeError(
+                            "no safe transition remains from "
+                            f"{self.state.current_track_id}"
+                        )
+                    await asyncio.sleep(self.recovery_retry_seconds)
+                    continue
                 # Check the live runway before every staging attempt, not only
                 # after an error.  This makes a verified rescue loop the
                 # proactive deadline response when a prior handoff or UI scan

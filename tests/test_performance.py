@@ -15,10 +15,90 @@ from rekordbox_performer.performance import (
     cue_preparation_plan,
     fx_recipe,
     observation_from_elapsed,
+    rescue_loop_target,
+    rescue_loop_window,
     sync_report,
     transition_qa,
     vocal_handoff,
 )
+
+
+def test_rescue_loop_stays_before_analyzed_outro_and_shrinks_if_needed() -> None:
+    analyzed = profile("sumatra")
+    analyzed.landmarks.append(
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=209,
+            beat=1,
+            confidence="high",
+        )
+    )
+    analyzed.phrase_boundaries.append(
+        PhraseBoundary(
+            index=99,
+            start_beat=833,
+            end_beat=850,
+            start_bar=209,
+            beat_in_bar=1,
+            length_beats=18,
+            kind_code=6,
+            label="outro",
+            confidence="high",
+        )
+    )
+    analyzed.bass_energy_by_bar = [
+        BassEnergyBar(bar=bar, median=11, mean=23, peak=109)
+        for bar in range(201, 209)
+    ] + [
+        BassEnergyBar(bar=209, median=2, mean=2.3, peak=12),
+        BassEnergyBar(bar=210, median=0, mean=0, peak=0),
+    ]
+
+    full = rescue_loop_window(analyzed, start_bar=201, requested_beats=16)
+    shrunk = rescue_loop_window(analyzed, start_bar=207, requested_beats=16)
+    too_late = rescue_loop_window(analyzed, start_bar=209, requested_beats=16)
+    after_outro = rescue_loop_window(analyzed, start_bar=210, requested_beats=4)
+
+    assert (full["beats"], full["end_bar"]) == (16, 205)
+    assert (shrunk["beats"], shrunk["end_bar"]) == (8, 209)
+    assert shrunk["downgraded"] is True
+    assert too_late["verified"] is False
+    assert after_outro["verified"] is False
+    assert "before mix-out" in too_late["error"]
+
+
+def test_rescue_loop_targets_the_strongest_upcoming_stable_bar() -> None:
+    analyzed = profile("rescue")
+    analyzed.landmarks.append(
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=17,
+            beat=1,
+            confidence="high",
+        )
+    )
+    analyzed.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=20 if bar == 13 else 4,
+            mean=30 if bar == 13 else 12,
+            peak=110 if bar == 13 else 70,
+        )
+        for bar in range(9, 17)
+    ]
+
+    target = rescue_loop_target(
+        analyzed,
+        earliest_start_bar=9,
+        requested_beats=4,
+        lookahead_bars=8,
+    )
+
+    assert target["verified"] is True
+    assert target["start_bar"] == 13
+    assert target["end_bar"] == 14
 
 
 def profile(track_id: str) -> TrackProfile:
@@ -103,6 +183,27 @@ def test_elapsed_reconciliation_uses_absolute_grid_position() -> None:
     assert observed.track_beat == 241
     assert observed.bar == 61
     assert observed.source == "native"
+
+
+def test_elapsed_reconciliation_preserves_pickup_grid_position() -> None:
+    candidate = profile("a")
+    candidate.beat_grid = [
+        AnalysisBeatGridPoint(index=1, bar=1, beat=3, bpm=120, time_ms=0),
+        AnalysisBeatGridPoint(index=3, bar=2, beat=1, bpm=120, time_ms=1000),
+    ]
+
+    observed = observation_from_elapsed(
+        deck=1,
+        profile=candidate,
+        elapsed_seconds=0,
+        playing=True,
+        sync_enabled=True,
+        quantize_enabled=True,
+    )
+
+    assert observed.track_beat == 1
+    assert observed.bar == 1
+    assert observed.beat == 3
 
 
 def test_vocal_overlap_is_soft_and_measured() -> None:

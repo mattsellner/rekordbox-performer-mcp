@@ -38,13 +38,21 @@ def observation_from_elapsed(
         anchor = min(grid, key=lambda point: abs(point.time_ms - elapsed_ms))
         bpm = anchor.bpm
         beat_delta = (elapsed_ms - anchor.time_ms) * bpm / 60_000.0
-        total = max(0.0, anchor.index - 1 + beat_delta)
+        track_total = max(0.0, anchor.index - 1 + beat_delta)
+        grid_total = max(
+            0.0,
+            (anchor.bar - 1) * profile.time_signature
+            + (anchor.beat - 1)
+            + beat_delta,
+        )
     else:
         bpm = profile.bpm
-        total = elapsed_ms * bpm / 60_000.0
-    whole = int(total)
-    phase = min(0.9999, max(0.0, total - whole))
-    beat_in_bar = whole % profile.time_signature + 1
+        track_total = elapsed_ms * bpm / 60_000.0
+        grid_total = track_total
+    track_whole = int(track_total)
+    grid_whole = int(grid_total)
+    phase = min(0.9999, max(0.0, grid_total - grid_whole))
+    beat_in_bar = grid_whole % profile.time_signature + 1
     return DeckObservation(
         deck=deck,
         track_id=profile.track_id,
@@ -53,9 +61,9 @@ def observation_from_elapsed(
         # is the actual scheduler clock after tempo/master-sync changes.
         bpm=playback_bpm if playback_bpm is not None else bpm,
         playing=playing,
-        bar=whole // profile.time_signature + 1,
+        bar=grid_whole // profile.time_signature + 1,
         beat=beat_in_bar,
-        track_beat=whole + 1,
+        track_beat=track_whole + 1,
         beat_phase=phase,
         sync_enabled=sync_enabled,
         quantize_enabled=quantize_enabled,
@@ -169,6 +177,133 @@ def cue_preparation_plan(profile: TrackProfile) -> dict[str, Any]:
         "ready": bool(suggestions),
         "mutated_rekordbox": False,
         "cue_policy": "automation uses Hot Cue G/H only",
+    }
+
+
+def rescue_loop_window(
+    profile: TrackProfile,
+    *,
+    start_bar: int,
+    requested_beats: int,
+) -> dict[str, Any]:
+    """Choose a short, analyzed beat loop that cannot cross into the outro.
+
+    Rescue loops are intentionally constrained to 4/8/16 beats.  The window
+    ends before the earliest analyzed mix-out or outro boundary, and a loop is
+    rejected if its low-band waveform has already collapsed.  This keeps a
+    recovery loop on the consistent beat section instead of repeatedly
+    replaying the track's fade to silence.
+    """
+    if requested_beats not in {4, 8, 16}:
+        raise ValueError("rescue loop must be 4, 8, or 16 beats")
+    signature = profile.time_signature
+    boundaries = [
+        item.bar
+        for item in profile.landmarks
+        if item.kind == "mix_out" and item.confidence in {"verified", "high"}
+    ]
+    boundaries.extend(
+        item.start_bar
+        for item in profile.phrase_boundaries
+        if item.label.casefold() == "outro"
+        and item.confidence in {"verified", "high"}
+    )
+    # Keep the absolute analyzed exit boundary even after the playhead passes
+    # it. Filtering to only future boundaries made the guard disappear one
+    # bar into the outro and allowed a new loop to be created in silence.
+    mix_out_bar = min(boundaries, default=None)
+
+    energy = {item.bar: float(item.median) for item in profile.bass_energy_by_bar}
+    positive = sorted(value for value in energy.values() if value > 0)
+    typical = positive[len(positive) // 2] if positive else 0.0
+    minimum_energy = max(1.0, typical * 0.2) if positive else 0.0
+
+    choices = [beats for beats in (requested_beats, 8, 4) if beats <= requested_beats]
+    choices = list(dict.fromkeys(choices))
+    for beats in choices:
+        bars = max(1, beats // signature)
+        end_bar = start_bar + bars
+        if mix_out_bar is not None and (
+            start_bar >= mix_out_bar or end_bar > mix_out_bar
+        ):
+            continue
+        samples = [energy[bar] for bar in range(start_bar, end_bar) if bar in energy]
+        if samples and min(samples) < minimum_energy:
+            continue
+        return {
+            "verified": True,
+            "beats": beats,
+            "start_bar": start_bar,
+            "end_bar": end_bar,
+            "mix_out_bar": mix_out_bar,
+            "downgraded": beats != requested_beats,
+            "energy_median": round(sum(samples) / len(samples), 3) if samples else None,
+        }
+    return {
+        "verified": False,
+        "beats": 0,
+        "start_bar": start_bar,
+        "end_bar": start_bar,
+        "mix_out_bar": mix_out_bar,
+        "downgraded": False,
+        "error": "no steady analyzed beat section remains before mix-out",
+    }
+
+
+def rescue_loop_target(
+    profile: TrackProfile,
+    *,
+    earliest_start_bar: int,
+    requested_beats: int,
+    lookahead_bars: int = 8,
+) -> dict[str, Any]:
+    """Pick the strongest safe bar just ahead for an emergency hold loop."""
+    energy = {item.bar: item for item in profile.bass_energy_by_bar}
+    options = []
+    for start_bar in range(earliest_start_bar, earliest_start_bar + lookahead_bars):
+        window = rescue_loop_window(
+            profile,
+            start_bar=start_bar,
+            requested_beats=requested_beats,
+        )
+        if window.get("verified") is not True:
+            continue
+        sample = energy.get(start_bar)
+        waveform_score = (
+            float(sample.median) * 4.0
+            + float(sample.mean)
+            + float(sample.peak) * 0.05
+            if sample is not None
+            else 0.0
+        )
+        phrase = next(
+            (
+                item
+                for item in profile.phrase_boundaries
+                if item.start_bar == start_bar and item.beat_in_bar == 1
+            ),
+            None,
+        )
+        phrase_bonus = (
+            12.0
+            if phrase is not None and phrase.label.casefold() in {"chorus", "up"}
+            else -20.0
+            if phrase is not None and phrase.label.casefold() == "outro"
+            else 0.0
+        )
+        options.append((waveform_score + phrase_bonus, -start_bar, window))
+    if not options:
+        return rescue_loop_window(
+            profile,
+            start_bar=earliest_start_bar,
+            requested_beats=requested_beats,
+        )
+    _, _, selected = max(options, key=lambda item: (item[0], item[1]))
+    return {
+        **selected,
+        "earliest_start_bar": earliest_start_bar,
+        "lookahead_bars": lookahead_bars,
+        "selection_reason": "strongest analyzed stable bar before mix-out",
     }
 
 

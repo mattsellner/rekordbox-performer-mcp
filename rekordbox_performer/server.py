@@ -23,6 +23,7 @@ from .engine import MidiEngine
 from .intelligence import (
     DeckObservation,
     LiveState,
+    MusicalEvent,
     PlaylistTrackMetadata,
     ProfileStore,
     RekordboxAnalysisImport,
@@ -42,6 +43,7 @@ from .performance import (
     cue_preparation_plan,
     fx_recipe,
     observation_from_elapsed,
+    rescue_loop_target,
     sync_report,
     transition_qa,
     vocal_handoff,
@@ -114,6 +116,7 @@ def _cancel_for_sync_guard(job_id: str, errors: list[str]) -> None:
         job.error = "; ".join(errors)
     scheduler.cancel(job_id)
 autonomous_runner: AutonomousSetRunner | None = None
+autonomous_recovery_planner: Any = None
 track_title_aliases: dict[str, str] = {}
 preflighted_set_fingerprints: set[str] = set()
 
@@ -259,6 +262,34 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
     if beats_to_bar < 0.08:
         beats_to_bar = 0.0
     delay_ms = round(beats_to_bar * 60_000.0 / float(state["bpm"]))
+    start_bar = int(state["bar"]) if beats_to_bar == 0.0 else int(state["bar"]) + 1
+    window = rescue_loop_target(
+        profile_store.get(str(state["track_id"])),
+        earliest_start_bar=start_bar,
+        # Only the direct four-beat AutoLoop mapping is deterministic in the
+        # installed profile. Never synthesize longer rescue loops through the
+        # repeatable Loop Double control.
+        requested_beats=4,
+    )
+    target_bar = int(window.get("start_bar", start_bar))
+    delay_ms += round(
+        max(0, target_bar - start_bar)
+        * 4
+        * 60_000.0
+        / float(state["bpm"])
+    )
+    if window.get("verified") is not True:
+        return {
+            "verified": False,
+            "errors": [str(window["error"])],
+            "deck": deck,
+            "title": title,
+            "beats": 0,
+            "requested_beats": beats,
+            "loop_window": window,
+            "scheduled_at_bar_boundary_ms": delay_ms,
+        }
+    effective_beats = int(window["beats"])
     events = [
         {
             "at_ms": delay_ms,
@@ -266,7 +297,7 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
             "parameters": {"deck": deck},
         }
     ]
-    doubles = {4: 0, 8: 1, 16: 2}[beats]
+    doubles = {4: 0, 8: 1, 16: 2}[effective_beats]
     for index in range(doubles):
         events.append(
             {
@@ -276,12 +307,12 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
             }
         )
     job = scheduler.start(
-        f"verified {beats}-beat rescue loop on deck {deck}",
+        f"verified {effective_beats}-beat rescue loop on deck {deck}",
         events,
         completion_verifier=lambda: _verify_rescue_loop(
             deck=deck,
             title=title,
-            beats=beats,
+            beats=effective_beats,
             bpm=float(state["bpm"]),
         ),
         execution_id=(
@@ -293,9 +324,39 @@ async def _engage_rescue_loop(deck: int, beats: int) -> dict[str, Any]:
         await task
     final = scheduler.get(job["id"])
     verification = final.get("verification") or {}
+    # Observation can occasionally miss the wrap even when Rekordbox accepted
+    # the command. Replace the uncertain loop with a direct 4-beat AutoLoop
+    # and verify again; never leave a huge or unknown loop armed.
+    fallback = None
+    if verification.get("verified") is not True and effective_beats != 4:
+        fallback_job = scheduler.start(
+            f"verified 4-beat rescue fallback on deck {deck}",
+            [{"at_ms": 0, "action": "loop_4", "parameters": {"deck": deck}}],
+            completion_verifier=lambda: _verify_rescue_loop(
+                deck=deck,
+                title=title,
+                beats=4,
+                bpm=float(state["bpm"]),
+            ),
+            execution_id=(
+                f"rescue-loop-fallback-{deck}-{state['track_id']}-"
+                f"{int(time.time() * 1000)}"
+            ),
+        )
+        fallback_task = scheduler.jobs[fallback_job["id"]].task
+        if fallback_task is not None:
+            await fallback_task
+        fallback = scheduler.get(fallback_job["id"])
+        fallback_verification = fallback.get("verification") or {}
+        if fallback_verification.get("verified") is True:
+            verification = fallback_verification
     return {
         **verification,
         "job": final,
+        "fallback_job": fallback,
+        "requested_beats": beats,
+        "effective_beats": verification.get("beats", effective_beats),
+        "loop_window": window,
         "scheduled_at_bar_boundary_ms": delay_ms,
     }
 
@@ -1827,19 +1888,7 @@ async def launch_staged_track(
     if deck not in (1, 2):
         raise ValueError("deck must be 1 or 2")
     profile = profile_store.get(track_id)
-    entry = next(
-        (
-            item
-            for item in profile.landmarks
-            if item.kind in {"mix_in", "phrase_start"}
-            and item.bar == 1
-            and (item.beat or 1) == 1
-            and item.confidence in {"verified", "high"}
-        ),
-        None,
-    )
-    if entry is None:
-        raise RuntimeError("Track has no high-confidence file-start phrase landmark")
+    entry = _opening_file_start_landmark(profile)
     with deck_observer.exclusive_adapter():
         initial = rekordbox_ui.deck_snapshot(deck)
         if normalize_title(initial.title) != normalize_title(title):
@@ -1867,18 +1916,27 @@ async def launch_staged_track(
         raise RuntimeError("Rekordbox did not start the staged track")
 
     elapsed_beats = (time.monotonic() - launched_at) * profile.bpm / 60.0
-    total = elapsed_beats
-    bar = int(total // profile.time_signature) + 1
-    within_bar = total % profile.time_signature
+    entry_offset_beats = (entry.time_ms or 0) * profile.bpm / 60_000.0
+    track_total = max(0.0, elapsed_beats - entry_offset_beats)
+    grid_total = max(
+        0.0,
+        (entry.bar - 1) * profile.time_signature
+        + entry.beat
+        - 1
+        + elapsed_beats
+        - entry_offset_beats,
+    )
+    grid_whole = int(grid_total)
+    within_bar = grid_total % profile.time_signature
     observation = DeckObservation(
         deck=deck,
         track_id=track_id,
         title=title,
         bpm=second.bpm or profile.bpm,
         playing=True,
-        bar=bar,
+        bar=grid_whole // profile.time_signature + 1,
         beat=int(within_bar) + 1,
-        track_beat=int(total) + 1,
+        track_beat=int(track_total) + 1,
         beat_phase=within_bar - int(within_bar),
         sync_enabled=second.beat_sync_enabled,
         quantize_enabled=second.quantize_enabled,
@@ -1894,6 +1952,32 @@ async def launch_staged_track(
         "live_state": live_state.update(observation),
         "effect_verified": True,
     }
+
+
+def _opening_file_start_landmark(profile: TrackProfile):
+    """Return a proven phrase start at the beginning of an opening track.
+
+    An opener may contain a short pickup before its first downbeat. Incoming
+    transition launches remain governed by the stricter beat-one contract in
+    transition-card validation.
+    """
+    entry = next(
+        (
+            item
+            for item in profile.landmarks
+            if item.kind in {"mix_in", "phrase_start"}
+            and item.bar == 1
+            and item.confidence in {"verified", "high"}
+            and (
+                (item.time_ms is not None and item.time_ms <= 1_000)
+                or (item.time_ms is None and item.beat == 1)
+            )
+        ),
+        None,
+    )
+    if entry is None:
+        raise RuntimeError("Track has no high-confidence file-start phrase landmark")
+    return entry
 
 
 async def _establish_opening_mixer_contract(*, audible_deck: int) -> dict[str, Any]:
@@ -2844,6 +2928,20 @@ async def _runner_schedule(
     card = (
         _with_rescue_loop_release(option.card) if release_rescue_loop else option.card
     )
+    fx_preparation = None
+    if option.fx_effect is not None:
+        try:
+            card, fx_preparation = await _prepare_option_fx(card, option.fx_effect)
+        except Exception as exc:  # noqa: BLE001 - optional live decoration
+            # Beat FX are never allowed to own transport continuity.  Any UI
+            # observation, selector, or MIDI-preparation failure preserves the
+            # already validated dry card and proceeds with the handoff.
+            fx_preparation = {
+                "verified": False,
+                "desired": option.fx_effect,
+                "error": str(exc),
+                "fallback": "dry transition card",
+            }
     result = await stage_and_schedule_transition_card(
         card=card,
         incoming_title=option.incoming.title,
@@ -2861,7 +2959,86 @@ async def _runner_schedule(
     scheduled = dict(result.get("schedule") or {})
     scheduled["ready"] = True
     scheduled["atomic_stage"] = result
+    scheduled["fx_preparation"] = fx_preparation
     return scheduled
+
+
+async def _prepare_option_fx(
+    card: TransitionCard,
+    desired_effect: str,
+) -> tuple[TransitionCard, dict[str, Any]]:
+    """Select and verify one outgoing Beat FX, or preserve the dry card."""
+    deck = card.outgoing_deck
+    await engine.send_action("fx_wet_dry", {"deck": deck, "value": 0})
+    try:
+        with deck_observer.exclusive_adapter():
+            observed = rekordbox_ui.fx_effect(deck)
+    except Exception as exc:  # noqa: BLE001 - optional effect observation
+        return card, {
+            "verified": False,
+            "desired": desired_effect,
+            "error": str(exc),
+            "fallback": "dry transition card",
+        }
+    visited = [observed]
+    for _ in range(24):
+        if observed == desired_effect:
+            break
+        await engine.send_action("fx_select_next", {"deck": deck})
+        await asyncio.sleep(0.12)
+        try:
+            with deck_observer.exclusive_adapter():
+                observed = rekordbox_ui.fx_effect(deck)
+        except Exception as exc:  # noqa: BLE001 - optional effect observation
+            return card, {
+                "verified": False,
+                "desired": desired_effect,
+                "error": str(exc),
+                "visited": visited,
+                "fallback": "dry transition card",
+            }
+        if observed in visited:
+            break
+        visited.append(observed)
+    if observed != desired_effect:
+        return card, {
+            "verified": False,
+            "desired": desired_effect,
+            "observed": observed,
+            "visited": visited,
+            "fallback": "dry transition card",
+        }
+    recipe = fx_recipe(card)
+    if recipe["effect"] != desired_effect:
+        return card, {
+            "verified": False,
+            "desired": desired_effect,
+            "observed": observed,
+            "fallback": "recipe mismatch; dry transition card",
+        }
+    fx_events = [MusicalEvent.model_validate(item) for item in recipe["events"]]
+    updated = sorted(
+        [*card.events, *fx_events],
+        key=lambda event: (event.bar_offset, event.beat_offset),
+    )
+    prepared = card.model_copy(update={"events": updated})
+    outgoing = profile_store.get(card.outgoing_track_id)
+    incoming = profile_store.get(card.incoming_track_id)
+    errors = validate_transition_card(prepared, outgoing, incoming)
+    if errors:
+        return card, {
+            "verified": False,
+            "desired": desired_effect,
+            "observed": observed,
+            "errors": errors,
+            "fallback": "FX card validation failed; dry transition card",
+        }
+    return prepared, {
+        "verified": True,
+        "desired": desired_effect,
+        "observed": observed,
+        "visited": visited,
+    }
 
 
 async def _runner_prestage(option: TransitionOption) -> dict[str, Any]:
@@ -3053,8 +3230,17 @@ def _get_autonomous_runner() -> AutonomousSetRunner:
             run_tempo=_execute_tempo_plan,
             advance=_runner_advance,
             finish=lambda _status: engine.release_set_control(),
+            recover_route=autonomous_recovery_planner,
         )
     return autonomous_runner
+
+
+def register_autonomous_recovery_planner(callback: Any) -> None:
+    """Install the standalone app's local replacement-route planner."""
+    global autonomous_recovery_planner
+    autonomous_recovery_planner = callback
+    if autonomous_runner is not None:
+        autonomous_runner.recover_route = callback
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
@@ -3107,6 +3293,12 @@ async def preflight_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
     except (KeyError, ValueError) as exc:
         return {"ready": False, "errors": [f"tempo arc: {exc}"]}
     unique_track_ids = {resolved_plan.opening.track_id}
+    try:
+        _opening_file_start_landmark(
+            profile_store.get(resolved_plan.opening.track_id)
+        )
+    except (KeyError, RuntimeError) as exc:
+        errors.append(f"opening: {exc}")
     for option in resolved_plan.transitions:
         unique_track_ids.add(option.incoming.track_id)
         try:
@@ -3270,6 +3462,63 @@ async def start_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
         "runner": runner_state,
         "tempo_arc": resolved_plan.tempo_arc_summary(),
         "set_fingerprint": fingerprint,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def continue_autonomous_set(plan: AutonomousSetPlan) -> dict[str, Any]:
+    """Attach a new locally scheduled route to the currently playing final track."""
+    resolved_plan = _materialize_autonomous_plan(plan)
+    primary = min(
+        (
+            option
+            for option in resolved_plan.transitions
+            if option.card.outgoing_track_id == resolved_plan.opening.track_id
+        ),
+        key=lambda option: option.priority,
+    )
+    for option in resolved_plan.transitions:
+        errors = validate_transition_card(
+            option.card,
+            profile_store.get(option.card.outgoing_track_id),
+            profile_store.get(option.card.incoming_track_id),
+        )
+        if errors:
+            raise RuntimeError(f"{option.id}: {'; '.join(errors)}")
+    observed = await _observe_live_deck(
+        deck=primary.card.outgoing_deck,
+        track_id=resolved_plan.opening.track_id,
+        title=resolved_plan.opening.title,
+    )
+    if observed.get("playing") is not True:
+        raise RuntimeError("the continuation anchor deck is not playing")
+    runner = _get_autonomous_runner()
+    runner.prepare(resolved_plan, opening_deck=primary.card.outgoing_deck)
+    set_sessions.create(
+        resolved_plan.name,
+        [resolved_plan.opening.track_id]
+        + [option.incoming.track_id for option in _primary_path(resolved_plan)],
+    )
+    estimated_seconds = sum(
+        (profile_store.get(track_id).duration_ms or 6 * 60_000) / 1000.0
+        for track_id in [resolved_plan.opening.track_id]
+        + [option.incoming.track_id for option in _primary_path(resolved_plan)]
+    ) + 20 * 60
+    engine.authorize_set(min(4 * 60 * 60, estimated_seconds))
+    scheduled = await _runner_schedule(primary, False)
+    if scheduled.get("ready") is not True:
+        engine.release_set_control()
+        return scheduled
+    runner_state = runner.start_with_job(
+        primary.id,
+        scheduled["job"]["id"],
+        scheduled,
+    )
+    return {
+        "ready": True,
+        "continuation": scheduled,
+        "runner": runner_state,
+        "tempo_arc": resolved_plan.tempo_arc_summary(),
     }
 
 

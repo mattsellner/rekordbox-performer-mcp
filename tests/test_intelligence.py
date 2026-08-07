@@ -184,6 +184,32 @@ def test_ready_profile_requires_vocal_map() -> None:
     assert profile.readiness()["tier"] == "B"
 
 
+def test_advanced_technique_requires_three_clean_passes_on_two_pairs(tmp_path) -> None:
+    store = ProfileStore(tmp_path)
+    reviews = [
+        RehearsalReview(
+            transition_name=f"stem_vocal_blend pass {index}",
+            outgoing_track_id="a" if index < 2 else "c",
+            incoming_track_id="b" if index < 2 else "d",
+            beat_phase_error_ms=10,
+            bar_error=0,
+            bass_swap_error_beats=0,
+            vocal_clash=False,
+            energy_continuity=8,
+            cleanliness=8,
+            user_rating=8,
+        )
+        for index in range(3)
+    ]
+    for review in reviews[:2]:
+        store.record_rehearsal(review)
+    assert "stem_vocal_blend" not in store.proficient_techniques()
+
+    store.record_rehearsal(reviews[2])
+
+    assert "stem_vocal_blend" in store.proficient_techniques()
+
+
 def test_card_requires_stem_toggle_to_be_restored() -> None:
     outgoing = prepared_profile("a", "A")
     incoming = prepared_profile("b", "B")
@@ -457,6 +483,31 @@ def test_live_state_rolls_rounded_phase_into_next_beat() -> None:
     assert current["beat_phase"] == 0.0
 
 
+def test_live_state_preserves_pickup_grid_offset() -> None:
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="pickup",
+            title="Pickup",
+            bpm=130,
+            playing=False,
+            bar=1,
+            beat=3,
+            track_beat=1,
+            beat_phase=0.25,
+            source="native",
+            confidence="high",
+        )
+    )
+
+    current = state.get(1)
+    assert current["track_beat"] == 1
+    assert current["bar"] == 1
+    assert current["beat"] == 3
+    assert current["beat_phase"] == 0.25
+
+
 def test_phrase_cut_can_launch_verified_file_start_without_hot_cue() -> None:
     outgoing = prepared_profile("a", "A")
     incoming = prepared_profile("b", "B")
@@ -534,6 +585,85 @@ def test_card_compiles_to_next_phrase_boundary() -> None:
         event["at_ms"] > compiled["events"][0]["at_ms"]
         for event in compiled["events"][1:]
     )
+
+
+def test_card_retargets_a_planned_phrase_that_passed_during_prior_overlap() -> None:
+    outgoing = prepared_profile("a", "A")
+    outgoing.phrase_boundaries.extend(
+        [
+            PhraseBoundary(
+                index=3,
+                start_beat=129,
+                end_beat=192,
+                start_bar=33,
+                beat_in_bar=1,
+                length_beats=64,
+                length_bars=16,
+                kind_code=5,
+                label="chorus",
+                confidence="verified",
+            ),
+            PhraseBoundary(
+                index=4,
+                start_beat=193,
+                end_beat=256,
+                start_bar=49,
+                beat_in_bar=1,
+                length_beats=64,
+                length_bars=16,
+                kind_code=5,
+                label="chorus",
+                confidence="verified",
+            ),
+        ]
+    )
+    state = LiveState()
+    state.update(
+        DeckObservation(
+            deck=1,
+            track_id="a",
+            title="A",
+            bpm=128,
+            playing=True,
+            bar=17,
+            beat=1,
+            track_beat=65,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    state.update(
+        DeckObservation(
+            deck=2,
+            track_id="b",
+            title="B",
+            bpm=128,
+            playing=False,
+            bar=1,
+            beat=1,
+            track_beat=1,
+            source="native",
+            confidence="verified",
+            sync_enabled=True,
+            quantize_enabled=True,
+        )
+    )
+    card = valid_card()
+    card.start_phrase_index = 1
+
+    compiled = compile_transition_card(
+        card,
+        outgoing,
+        prepared_profile("b", "B"),
+        state,
+    )
+
+    assert compiled["ready"] is True
+    assert compiled["requested_start_phrase_index"] == 1
+    assert compiled["start_phrase_retargeted"] is True
+    assert compiled["start_bar"] == 33
 
 
 def test_card_rejects_unverified_vocal_plan() -> None:

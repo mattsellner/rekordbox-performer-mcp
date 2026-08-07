@@ -15,6 +15,7 @@ from rekordbox_performer.standalone_planner import (
     DJBrief,
     LocalDJPlanner,
     TransitionKingCompiler,
+    _breakdown_events,
 )
 from rekordbox_performer.standalone_status import (
     RuntimePhase,
@@ -129,7 +130,7 @@ def test_transition_compiler_preserves_energy_until_verified_bass_swap() -> None
         outgoing_deck=1,
     )
 
-    assert handoff.technique == "verified_bass_swap"
+    assert handoff.technique == "long_blend"
     assert handoff.load.cue == 7
     assert handoff.card.critical_bar_offset == 16
     assert validate_transition_card(handoff.card, outgoing, incoming) == []
@@ -177,7 +178,7 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
         outgoing_deck=1,
     )
 
-    assert handoff.technique == "file_start_bass_swap"
+    assert handoff.technique == "long_blend"
     assert handoff.card.transition_family == "long_blend"
     assert handoff.card.critical_bar_offset == 16
     assert validate_transition_card(handoff.card, outgoing, incoming) == []
@@ -203,8 +204,7 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
     outgoing_fades = [
         event.parameters["value"]
         for event in handoff.card.events
-        if event.action == "channel_fader"
-        and event.parameters.get("deck") == 1
+        if event.action == "channel_fader" and event.parameters.get("deck") == 1
     ]
     assert outgoing_fades == [0.86, 0.62, 0.32, 0]
     outgoing_filter = [
@@ -213,6 +213,132 @@ def test_file_start_fallback_uses_low_eq_swap_and_progressive_cfx_tail() -> None
         if event.action == "filter" and event.parameters.get("deck") == 1
     ]
     assert outgoing_filter == [0.12, 0.22, 0.38, 0.58, 0]
+
+
+def test_energy_router_aligns_outgoing_down_with_incoming_chorus() -> None:
+    outgoing = profile("ocean", "Lost In The Ocean", 125, "3A")
+    outgoing.phrase_boundaries = [
+        PhraseBoundary(
+            index=index,
+            start_beat=(bar - 1) * 4 + 1,
+            end_beat=(bar - 1) * 4 + 32,
+            start_bar=bar,
+            beat_in_bar=1,
+            length_beats=32,
+            length_bars=8,
+            kind_code=3 if label == "down" else 5,
+            label=label,
+            confidence="verified",
+        )
+        for index, (bar, label) in enumerate(
+            [(1, "intro"), (89, "up"), (113, "chorus"), (121, "down")],
+            start=1,
+        )
+    ]
+    outgoing.landmarks = [
+        TrackLandmark(
+            name="file start",
+            kind="phrase_start",
+            bar=1,
+            time_ms=0,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="bass",
+            kind="bass_in",
+            bar=113,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=145,
+            confidence="verified",
+        ),
+    ]
+    outgoing.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=8 if 113 <= bar < 121 else 2,
+            mean=14 if 113 <= bar < 121 else 7,
+            peak=80,
+        )
+        for bar in range(1, 153)
+    ]
+
+    incoming = profile("faces", "Blow Ya Faces Off", 125, "4A")
+    incoming.phrase_boundaries = [
+        PhraseBoundary(
+            index=index,
+            start_beat=(bar - 1) * 4 + 1,
+            end_beat=(bar - 1) * 4 + length * 4,
+            start_bar=bar,
+            beat_in_bar=1,
+            length_beats=length * 4,
+            length_bars=length,
+            kind_code=5 if label == "chorus" else 2,
+            label=label,
+            confidence="verified",
+        )
+        for index, (bar, label, length) in enumerate(
+            [
+                (1, "intro", 16),
+                (17, "up", 4),
+                (21, "up", 4),
+                (25, "up", 8),
+                (33, "chorus", 16),
+            ],
+            start=1,
+        )
+    ]
+    incoming.landmarks = [
+        TrackLandmark(
+            name="file start",
+            kind="phrase_start",
+            bar=1,
+            time_ms=0,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="strong early bass",
+            kind="bass_in",
+            bar=21,
+            confidence="verified",
+        ),
+        TrackLandmark(
+            name="outro",
+            kind="mix_out",
+            bar=65,
+            confidence="verified",
+        ),
+    ]
+    incoming.bass_energy_by_bar = [
+        BassEnergyBar(
+            bar=bar,
+            median=20 if 21 <= bar < 33 else 7,
+            mean=21 if 33 <= bar < 41 else 18,
+            peak=105 if 33 <= bar < 41 else 75,
+        )
+        for bar in range(1, 81)
+    ]
+
+    handoff = TransitionKingCompiler().compile(
+        outgoing,
+        incoming,
+        outgoing_deck=1,
+    )
+
+    assert handoff.technique == "long_blend"
+    assert handoff.card.start_phrase_index == 2
+    assert handoff.card.critical_bar_offset == 32
+    assert "down bar 121" in handoff.reason
+    assert "chorus bar 33" in handoff.reason
+    assert any(
+        event.action == "channel_fader"
+        and event.parameters == {"deck": 2, "value": 0.18}
+        and event.bar_offset == 24
+        for event in handoff.card.events
+    )
 
 
 def test_user_verified_four_bar_drop_gets_blend_not_hard_cut() -> None:
@@ -264,9 +390,24 @@ def test_user_verified_four_bar_drop_gets_blend_not_hard_cut() -> None:
     assert [
         event.parameters["value"]
         for event in handoff.card.events
-        if event.action == "channel_fader"
-        and event.parameters.get("deck") == 2
+        if event.action == "channel_fader" and event.parameters.get("deck") == 2
     ] == [0.18, 0.35, 0.72, 0.86, 1]
+
+
+def test_incompatible_keys_fall_through_to_nonoverlap_phrase_cut() -> None:
+    outgoing = profile("a", "A", 128, "9A")
+    incoming = profile("b", "B", 128, "6A")
+
+    handoff = TransitionKingCompiler().compile(
+        outgoing,
+        incoming,
+        outgoing_deck=1,
+    )
+
+    assert handoff.technique == "phrase_cut"
+    assert handoff.card.harmonic_risk_accepted is True
+    assert handoff.card.transition_family == "phrase_cut"
+    assert validate_transition_card(handoff.card, outgoing, incoming) == []
 
 
 def test_local_planner_builds_repeatable_harmonic_tempo_route() -> None:
@@ -288,7 +429,9 @@ def test_local_planner_builds_repeatable_harmonic_tempo_route() -> None:
     assert first.opening.track_id == "a"
     assert [item.incoming.track_id for item in first.transitions] == ["b", "c"]
     assert first.transitions[-1].tempo_after.target_bpm == 130
-    assert first.rescue_loop_trigger_bars == 16
+    assert first.reserve_deadline_bars == 48
+    assert first.rescue_loop_trigger_bars == 32
+    assert first.rescue_loop_beats == 4
 
 
 def test_local_planner_compiles_an_eight_track_rising_set() -> None:
@@ -389,6 +532,7 @@ def test_status_store_is_atomic_and_formats_corner_view(tmp_path) -> None:
 class FakeAdapter:
     def __init__(self) -> None:
         self.armed_seconds = None
+        self.recovery_planner = None
         self.statuses = [
             {
                 "active": True,
@@ -433,6 +577,10 @@ class FakeAdapter:
     async def start(self, plan):
         return {"ready": True}
 
+    async def continue_set(self, plan):
+        self.continued_plan = plan
+        return {"ready": True}
+
     def runner_status(self):
         return self.statuses.pop(0)
 
@@ -452,7 +600,6 @@ class FakeAdapter:
                 ]
             },
         }
-
     def rekordbox_status(self):
         return {
             "decks": [
@@ -464,6 +611,9 @@ class FakeAdapter:
     def queue_steering(self, plan):
         return {"queued": True, "projected_plan": plan.model_dump()}
 
+    def register_recovery_planner(self, callback):
+        self.recovery_planner = callback
+
     async def hold_loop(self, deck, beats):
         return {"verified": True}
 
@@ -472,6 +622,55 @@ class FakeAdapter:
 
     def emergency_stop(self):
         return {"status": "stopped"}
+
+
+def test_recovery_status_keeps_selected_next_track_visible(tmp_path) -> None:
+    store = ProfileStore(tmp_path)
+    first = profile("a", "A", 128, "9A")
+    second = profile("b", "B", 129, "10A")
+    store.upsert(first)
+    store.upsert(second)
+    status = StandaloneStatusStore(tmp_path)
+    engine = StandaloneDJEngine(profile_store=store, status_store=status)
+    engine.plan = LocalDJPlanner([first, second]).build_plan(
+        DJBrief(start_track_id="a", target_track_count=2)
+    )
+
+    engine._publish_runner_state(
+        {
+            "status": "recovering",
+            "current_track_id": "a",
+            "current_deck": 1,
+            "active_option_id": None,
+            "staged_option_id": None,
+            "active_job_id": None,
+            "transition_start_at": None,
+            "transition_critical_at": None,
+            "deadline_phase": "reserve",
+            "rescue_loop_active": False,
+            "failures": [],
+        },
+        {
+            "connected": True,
+            "live_state": {
+                "decks": [
+                    {
+                        "deck": 1,
+                        "bpm": 128,
+                        "bar": 97,
+                        "beat": 1,
+                        "playing": True,
+                        "observation_age_ms": 25,
+                    }
+                ]
+            },
+        },
+    )
+
+    snapshot = status.read()
+    assert snapshot.staged.track_id == "b"
+    assert snapshot.staged.state == "selected"
+    assert format_snapshot(snapshot).next_track.startswith("Next: B")
 
 
 def test_standalone_engine_runs_without_codex_round_trips(tmp_path) -> None:
@@ -494,10 +693,183 @@ def test_standalone_engine_runs_without_codex_round_trips(tmp_path) -> None:
 
         assert result["ready"] is True
         assert engine.adapter.armed_seconds == 30 * 60
+        assert callable(engine.adapter.recovery_planner)
         assert statuses.read().phase == RuntimePhase.COMPLETE
         assert any(
             event.phase == RuntimePhase.PREFLIGHT for event in statuses.recent_events()
         )
+
+    asyncio.run(scenario())
+
+
+def test_breakdown_handoff_establishes_incoming_before_smooth_retirement() -> None:
+    from rekordbox_performer.intelligence import MusicalEvent
+
+    events = _breakdown_events(
+        outgoing_deck=1,
+        incoming_deck=2,
+        launch=MusicalEvent(
+            bar_offset=0,
+            action="play_pause",
+            parameters={"deck": 2},
+        ),
+    )
+    outgoing_faders = [
+        event
+        for event in events
+        if event.action == "channel_fader" and event.parameters.get("deck") == 1
+    ]
+    incoming_faders = [
+        event
+        for event in events
+        if event.action == "channel_fader" and event.parameters.get("deck") == 2
+    ]
+
+    assert min(event.bar_offset for event in outgoing_faders) == 8
+    assert incoming_faders[0].parameters["value"] == 0.08
+    assert incoming_faders[-1].parameters["value"] == 1.0
+    assert len(incoming_faders) == 33
+    assert len(outgoing_faders) == 17
+    assert any(
+        event.action == "eq_low"
+        and event.bar_offset == 8
+        and event.parameters == {"deck": 1, "value": -1}
+        for event in events
+    )
+    assert any(
+        event.action == "eq_low"
+        and event.bar_offset == 8
+        and event.parameters == {"deck": 2, "value": 0}
+        for event in events
+    )
+
+
+def test_playlist_planner_uses_every_track_once() -> None:
+    profiles = [
+        profile("a", "A", 124, "9A"),
+        profile("b", "B", 125, "10A"),
+        profile("c", "C", 126, "11A"),
+        profile("d", "D", 127, "12A"),
+    ]
+
+    plan = LocalDJPlanner(profiles).build_playlist_plan(
+        ["c", "a", "d", "b"],
+        opening_track_id="a",
+    )
+    route = [plan.opening.track_id] + [
+        option.incoming.track_id for option in plan.transitions
+    ]
+
+    assert route[0] == "a"
+    assert len(route) == 4
+    assert set(route) == {"a", "b", "c", "d"}
+
+
+def test_completed_set_can_attach_to_the_still_playing_final_track(tmp_path) -> None:
+    class ContinuationAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.statuses = []
+            self.continued_plan = None
+
+        def runner_status(self):
+            return {
+                "active": False,
+                "status": "completed",
+                "current_track_id": "a",
+                "current_deck": 1,
+                "played_track_ids": ["a"],
+                "active_option_id": None,
+            }
+
+    async def scenario() -> None:
+        profiles = ProfileStore(tmp_path / "profiles")
+        for item in (
+            profile("a", "A", 124, "9A"),
+            profile("b", "B", 125, "10A"),
+            profile("c", "C", 126, "11A"),
+        ):
+            profiles.upsert(item)
+        adapter = ContinuationAdapter()
+        engine = StandaloneDJEngine(
+            profile_store=profiles,
+            status_store=StandaloneStatusStore(tmp_path / "status"),
+            adapter=adapter,
+            monitor_seconds=60,
+        )
+
+        result = await engine.continue_set(
+            target_query="C",
+            transition_count=2,
+        )
+
+        assert result["continued"] is True
+        assert adapter.continued_plan.opening.track_id == "a"
+        assert adapter.continued_plan.transitions[-1].incoming.track_id == "c"
+        engine.monitor_task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_endless_route_reuses_an_exhausted_small_pool_safely(tmp_path) -> None:
+    profiles = ProfileStore(tmp_path / "profiles")
+    track_ids = [str(index) for index in range(6)]
+    for index, track_id in enumerate(track_ids):
+        profiles.upsert(profile(track_id, f"Track {index}", 124 + index, "9A"))
+    engine = StandaloneDJEngine(
+        profile_store=profiles,
+        status_store=StandaloneStatusStore(tmp_path / "status"),
+        adapter=FakeAdapter(),
+    )
+    engine._candidate_track_ids = set(track_ids)
+
+    future, transitions = engine._build_future_route(
+        anchor_id="5",
+        anchor_deck=2,
+        target=None,
+        vibe="maintain",
+        transition_count=5,
+        excluded=track_ids,
+    )
+
+    assert transitions == 5
+    assert future.target_track_count == 6
+    assert len({future.opening.track_id, *[
+        option.incoming.track_id for option in future.transitions
+    ]}) == 6
+
+
+def test_embedded_replacement_planner_excludes_exhausted_track(tmp_path) -> None:
+    async def scenario() -> None:
+        profiles = ProfileStore(tmp_path / "profiles")
+        for item in (
+            profile("a", "Current", 126, "9A"),
+            profile("b", "Failed", 126, "9A"),
+            profile("c", "Replacement One", 127, "10A"),
+            profile("d", "Replacement Two", 128, "11A"),
+        ):
+            profiles.upsert(item)
+        statuses = StandaloneStatusStore(tmp_path / "status")
+        engine = StandaloneDJEngine(
+            profile_store=profiles,
+            status_store=statuses,
+            adapter=FakeAdapter(),
+        )
+
+        future = await engine._build_replacement_route(
+            {
+                "current_track_id": "a",
+                "current_deck": 1,
+                "played_track_ids": ["a"],
+                "exhausted_incoming_track_ids": ["b"],
+                "target_track_count": 3,
+            }
+        )
+
+        assert future is not None
+        assert future.opening.track_id == "a"
+        assert "b" not in [item.incoming.track_id for item in future.transitions]
+        assert statuses.read().headline == "Selecting a replacement transition"
 
     asyncio.run(scenario())
 
